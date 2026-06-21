@@ -75,5 +75,11 @@
   "cline": [
     "cline",
     "cline-cli"
+  ],
+  "grok": [
+    "grok",
+    "grok-build",
+    "grok-cli",
+    "xai-grok"
   ]
 }

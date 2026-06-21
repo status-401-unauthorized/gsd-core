@@ -56,7 +56,7 @@ function withEnv(overrides, fn) {
 // All env vars for all runtimes — cleared in each test that calls getGlobalConfigDir directly
 const ALL_ENV_KEYS = [
   'CLAUDE_CONFIG_DIR', 'CURSOR_CONFIG_DIR', 'GEMINI_CONFIG_DIR', 'CODEX_HOME',
-  'GROK_AGENTS_HOME', 'COPILOT_CONFIG_DIR', 'COPILOT_HOME', 'ANTIGRAVITY_CONFIG_DIR',
+  'GROK_HOME', 'GROK_AGENTS_HOME', 'COPILOT_CONFIG_DIR', 'COPILOT_HOME', 'ANTIGRAVITY_CONFIG_DIR',
   'WINDSURF_CONFIG_DIR', 'AUGMENT_CONFIG_DIR', 'TRAE_CONFIG_DIR', 'QWEN_CONFIG_DIR',
   'HERMES_HOME', 'CODEBUDDY_CONFIG_DIR', 'CLINE_CONFIG_DIR', 'KIMI_CONFIG_DIR',
   'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'KILO_CONFIG_DIR', 'KILO_CONFIG',
@@ -90,7 +90,7 @@ const GOLDEN_DEFAULTS = {
   cursor:      path.join(HOME, '.cursor'),
   gemini:      path.join(HOME, '.gemini'),
   codex:       path.join(HOME, '.codex'),
-  grok:        path.join(HOME, '.agents'),
+  grok:        path.join(HOME, '.grok'),
   copilot:     path.join(HOME, '.copilot'),
   antigravity: path.join(HOME, '.gemini', 'antigravity'),  // probe-miss → first candidate
   windsurf:    path.join(HOME, '.codeium', 'windsurf'),
@@ -146,7 +146,7 @@ describe('descriptor-driven equivalence: env-var overrides', () => {
     { runtime: 'cursor',    envKey: 'CURSOR_CONFIG_DIR',    value: '/custom/cursor' },
     { runtime: 'gemini',    envKey: 'GEMINI_CONFIG_DIR',    value: '/custom/gemini' },
     { runtime: 'codex',     envKey: 'CODEX_HOME',           value: '/custom/codex' },
-    { runtime: 'grok',      envKey: 'GROK_AGENTS_HOME',     value: '/custom/grok' },
+    { runtime: 'grok',      envKey: 'GROK_HOME',            value: '/custom/grok' },
     { runtime: 'augment',   envKey: 'AUGMENT_CONFIG_DIR',   value: '/custom/augment' },
     { runtime: 'trae',      envKey: 'TRAE_CONFIG_DIR',      value: '/custom/trae' },
     { runtime: 'qwen',      envKey: 'QWEN_CONFIG_DIR',      value: '/custom/qwen' },
@@ -755,27 +755,27 @@ describe('descriptor-driven equivalence: explicitDir short-circuit', () => {
   });
 });
 
-// ── GOLDEN GROK (not in registry, hardcoded) ──────────────────────────────────
+// ── GOLDEN GROK (descriptor-driven ~/.grok, legacy GROK_AGENTS_HOME fallback) ──
 
-describe('descriptor-driven equivalence: grok (not in registry)', () => {
-  test('grok default → ~/.agents', () => {
+describe('descriptor-driven equivalence: grok', () => {
+  test('grok default → ~/.grok', () => {
     const saved = clearAllEnvKeys();
     try {
-      assert.strictEqual(getGlobalConfigDir('grok'), path.join(HOME, '.agents'));
+      assert.strictEqual(getGlobalConfigDir('grok'), path.join(HOME, '.grok'));
     } finally {
       restoreEnvKeys(saved);
     }
   });
 
-  test('grok: GROK_AGENTS_HOME override', () => {
-    withEnv({ GROK_AGENTS_HOME: '/custom/grok-agents' }, () => {
-      assert.strictEqual(getGlobalConfigDir('grok'), '/custom/grok-agents');
+  test('grok: GROK_HOME override', () => {
+    withEnv({ GROK_HOME: '/custom/grok-home' }, () => {
+      assert.strictEqual(getGlobalConfigDir('grok'), '/custom/grok-home');
     });
   });
 
-  test('grok: GROK_AGENTS_HOME tilde expansion', () => {
-    withEnv({ GROK_AGENTS_HOME: '~/grok' }, () => {
-      assert.strictEqual(getGlobalConfigDir('grok'), path.join(HOME, 'grok'));
+  test('grok: GROK_HOME tilde expansion', () => {
+    withEnv({ GROK_HOME: '~/grok-alt' }, () => {
+      assert.strictEqual(getGlobalConfigDir('grok'), path.join(HOME, 'grok-alt'));
     });
   });
 });

@@ -1417,6 +1417,93 @@ function convertClaudeCommandToCodexSkill(content, skillName) {
   return `---\nname: ${yamlQuote(skillName)}\ndescription: ${yamlQuote(description)}\nmetadata:\n  short-description: ${yamlQuote(shortDescription)}\n---\n\n${adapter}\n\n${body.trimStart()}`;
 }
 
+/**
+ * Grok Build skill adapter — maps Claude/Codex invocation patterns to Grok tools.
+ * Shorter than the Codex adapter: Grok has first-class spawn_subagent and skills
+ * are invoked by name (no Skill(gsd:*) prefix noise).
+ */
+function getGrokSkillAdapterHeader(skillName) {
+  return `<grok_skill_adapter>
+Skill: ${skillName}
+
+Runtime mapping (Claude / Codex → Grok Build):
+- Task(subagent_type=..., prompt=...) / spawn_agent(...) → spawn_subagent(subagent_type=..., prompt=..., description=...)
+- Agent(type) / typed agent roles → spawn_subagent with subagent_type matching the agent name when installed under ~/.grok/agents/gsd-*.md, else general-purpose + role preamble
+- AskUserQuestion / request_user_input → ask_user_question
+- TodoWrite / update_plan → keep as structured steps in your reply; Grok tracks goals via update_goal when available
+- SlashCommand /skill:gsd-* → invoke the matching gsd-* skill by name (already installed as ~/.grok/skills/gsd-*/SKILL.md)
+- CLAUDE.md / AGENTS.md project rules → AGENTS.md (repo root or .grok/ project rules)
+- ~/.claude/ and ~/.codex/ paths in instructions → ~/.grok/ (or $GROK_HOME)
+
+Subagent depth: Grok allows one level of spawn_subagent nesting. Orchestrator skills (plan-phase, execute-phase, autonomous) run at depth 0 and spawn executors/verifiers; do not nest another spawner inside a child.
+
+When a typed GSD agent is unavailable as a subagent_type, inject its agent file role/purpose as a preamble and spawn general-purpose. Label results as "generic-agent workaround".
+</grok_skill_adapter>`;
+}
+
+function convertClaudeToGrokMarkdown(content) {
+  let converted = content;
+  // Claude / Codex tool names → Grok Build tools
+  converted = converted.replace(/\bAskUserQuestion\b/g, 'ask_user_question');
+  converted = converted.replace(/\brequest_user_input\b/g, 'ask_user_question');
+  converted = converted.replace(/\bTodoWrite\b/g, 'update_goal');
+  converted = converted.replace(/\bSlashCommand\b/g, 'skill');
+  converted = converted.replace(/\bTask\(/g, 'spawn_subagent(');
+  converted = converted.replace(/\bspawn_agent\(/g, 'spawn_subagent(');
+  converted = converted.replace(/\bAgent\(/g, 'spawn_subagent(');
+  // Path + branding rewrites
+  converted = converted.replace(/\$HOME\/\.claude\//g, '$HOME/.grok/');
+  converted = converted.replace(/~\/\.claude\//g, '~/.grok/');
+  converted = converted.replace(/\.\/\.claude\//g, './.grok/');
+  converted = converted.replace(/\$HOME\/\.claude\b/g, '$HOME/.grok');
+  converted = converted.replace(/~\/\.claude\b/g, '~/.grok');
+  converted = converted.replace(/\$HOME\/\.codex\//g, '$HOME/.grok/');
+  converted = converted.replace(/~\/\.codex\//g, '~/.grok/');
+  converted = converted.replace(/CLAUDE\.md/g, 'AGENTS.md');
+  converted = neutralizeAgentReferences(converted, 'AGENTS.md');
+  // Claude Code product name → Grok Build
+  converted = converted.replace(/\bClaude Code\b/g, 'Grok Build');
+  return converted;
+}
+
+function convertClaudeCommandToGrokSkill(content, skillName) {
+  const converted = convertClaudeToGrokMarkdown(content);
+  const { frontmatter, body } = extractFrontmatterAndBody(converted);
+  let description = `Run GSD workflow ${skillName}.`;
+  if (frontmatter) {
+    const maybeDescription = extractFrontmatterField(frontmatter, 'description');
+    if (maybeDescription) {
+      description = maybeDescription;
+    }
+  }
+  description = toSingleLine(description);
+  const shortDescription = description.length > 180 ? `${description.slice(0, 177)}...` : description;
+  const adapter = getGrokSkillAdapterHeader(skillName);
+
+  return `---\nname: ${yamlQuote(skillName)}\ndescription: ${yamlQuote(description)}\nmetadata:\n  short-description: ${yamlQuote(shortDescription)}\n---\n\n${adapter}\n\n${body.trimStart()}`;
+}
+
+function convertClaudeAgentToGrokAgent(content) {
+  let converted = convertClaudeToGrokMarkdown(content);
+  const { frontmatter, body } = extractFrontmatterAndBody(converted);
+  if (!frontmatter) return converted;
+
+  const name = extractFrontmatterField(frontmatter, 'name') || 'unknown';
+  const description = extractFrontmatterField(frontmatter, 'description') || '';
+  const tools = extractFrontmatterField(frontmatter, 'tools') || '';
+
+  const roleHeader = `<grok_agent_role>
+role: ${name}
+tools: ${tools}
+purpose: ${toSingleLine(description)}
+spawn_hint: spawn_subagent(subagent_type="${name}", prompt=..., description=...)
+</grok_agent_role>`;
+
+  const cleanFrontmatter = `---\nname: ${yamlQuote(name)}\ndescription: ${yamlQuote(toSingleLine(description))}\nprompt_mode: full\n---`;
+
+  return `${cleanFrontmatter}\n\n${roleHeader}\n${body}`;
+}
+
 function neutralizeAgentReferences(content, instructionFile) {
   let c = content;
   // Replace standalone "Claude" (the agent) but preserve product/model names.
@@ -2281,6 +2368,24 @@ function _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal = false, a
       content = processAttribution(content, attribution);
       break;
 
+    case 'grok':
+      content = content.replace(/CLAUDE\.md/g, 'AGENTS.md');
+      content = content.replace(/\bClaude Code\b/g, 'Grok Build');
+      content = content.replace(/~\/\.claude\//g, pathPrefix);
+      content = content.replace(/\$HOME\/\.claude\//g, pathPrefix);
+      content = content.replace(/\.\/\.claude\//g, `./${dirName}/`);
+      content = content.replace(/~\/\.grok\//g, pathPrefix);
+      content = content.replace(/\$HOME\/\.grok\//g, pathPrefix);
+      content = content.replace(/~\/\.claude(?![\w-])/g, normalizedPathPrefix);
+      content = content.replace(/\$HOME\/\.claude(?![\w-])/g, normalizedPathPrefix);
+      content = content.replace(/~\/\.grok(?![\w-])/g, normalizedPathPrefix);
+      content = content.replace(/\$HOME\/\.grok(?![\w-])/g, normalizedPathPrefix);
+      content = content.replace(/\.claude\//g, '.grok/');
+      content = content.replace(/\.\/\.claude\//g, `./${dirName}/`);
+      content = content.replace(/\.\/\.grok\//g, `./${dirName}/`);
+      content = processAttribution(content, attribution);
+      break;
+
     default:
       // Unknown runtime — no rewrites (OpenCode/Kilo handled by their own install path).
       break;
@@ -2489,6 +2594,10 @@ export = {
   getCodexSkillAdapterHeader,
   convertClaudeToCodexMarkdown,
   convertClaudeCommandToCodexSkill,
+  getGrokSkillAdapterHeader,
+  convertClaudeToGrokMarkdown,
+  convertClaudeCommandToGrokSkill,
+  convertClaudeAgentToGrokAgent,
   neutralizeAgentReferences,
   convertClaudeCommandToOpencodeSkill,
   convertClaudeCommandToKiloSkill,

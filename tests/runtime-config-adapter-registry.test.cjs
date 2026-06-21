@@ -37,6 +37,7 @@ const EXPECTED_TABLE = [
   { runtime: 'windsurf',    installSurface: 'profile-marker-only',  writesSharedSettings: false, finishPermissionWriter: null       },
   { runtime: 'trae',        installSurface: 'profile-marker-only',  writesSharedSettings: false, finishPermissionWriter: null       },
   { runtime: 'kimi',        installSurface: 'profile-marker-only',  writesSharedSettings: false, finishPermissionWriter: null       },
+  { runtime: 'grok',        installSurface: 'profile-marker-only',  writesSharedSettings: false, finishPermissionWriter: null       },
 ];
 
 // ---------------------------------------------------------------------------
@@ -62,10 +63,6 @@ describe('resolveRuntimeConfigIntent — table-lock', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolveRuntimeConfigIntent — unknown runtime throws TypeError', () => {
-  test('throws TypeError for unknown string "grok"', () => {
-    assert.throws(() => resolveRuntimeConfigIntent('grok'), TypeError);
-  });
-
   test('throws TypeError for unknown string "xyzunknown"', () => {
     assert.throws(() => resolveRuntimeConfigIntent('xyzunknown'), TypeError);
   });
@@ -100,7 +97,7 @@ describe('resolveRuntimeConfigIntent — unknown runtime throws TypeError', () =
 // ---------------------------------------------------------------------------
 
 describe('writesSharedSettings exclusion equivalence', () => {
-  const EXPECTED_FALSE_SET = new Set(['codex', 'copilot', 'kilo', 'cursor', 'windsurf', 'trae', 'cline', 'kimi']);
+  const EXPECTED_FALSE_SET = new Set(['codex', 'copilot', 'kilo', 'cursor', 'windsurf', 'trae', 'cline', 'kimi', 'grok']);
 
   test('runtimes with writesSharedSettings===false are exactly the exclusion set', () => {
     const falseRuntimes = EXPECTED_TABLE
@@ -212,15 +209,15 @@ describe('resolveRuntimeConfigIntent — fresh object each call', () => {
 // ---------------------------------------------------------------------------
 
 describe('ALLOWED_CONFIG_RUNTIMES completeness', () => {
-  const EXPECTED_16 = new Set([
+  const EXPECTED_RUNTIMES = new Set([
     'claude', 'gemini', 'antigravity', 'augment', 'qwen', 'hermes', 'codebuddy',
     'opencode', 'kilo', 'codex', 'copilot', 'cline', 'cursor', 'windsurf', 'trae',
-    'kimi',
+    'kimi', 'grok',
   ]);
 
-  test('ALLOWED_CONFIG_RUNTIMES contains exactly the 16 expected runtimes', () => {
+  test('ALLOWED_CONFIG_RUNTIMES contains exactly the expected runtimes', () => {
     const runtimeSet = new Set(ALLOWED_CONFIG_RUNTIMES);
-    assert.deepStrictEqual(runtimeSet, EXPECTED_16);
+    assert.deepStrictEqual(runtimeSet, EXPECTED_RUNTIMES);
   });
 
   test('every member of ALLOWED_CONFIG_RUNTIMES resolves without throwing', () => {
@@ -229,8 +226,8 @@ describe('ALLOWED_CONFIG_RUNTIMES completeness', () => {
     }
   });
 
-  test('ALLOWED_CONFIG_RUNTIMES has exactly 16 entries', () => {
-    assert.strictEqual([...ALLOWED_CONFIG_RUNTIMES].length, 16);
+  test('ALLOWED_CONFIG_RUNTIMES has exactly 17 entries', () => {
+    assert.strictEqual([...ALLOWED_CONFIG_RUNTIMES].length, 17);
   });
 });
 

@@ -665,6 +665,7 @@ const VALID_CONVERTER_NAMES = new Set([
   'convertClaudeCommandToOpencodeSkill',
   'convertClaudeCommandToTraeSkill',
   'convertClaudeCommandToWindsurfSkill',
+  'convertClaudeCommandToGrokSkill',
   // agent converters (#1173 — descriptor-driven agent conversion wiring)
   'convertClaudeAgentToCopilotAgent',
   'convertClaudeAgentToAntigravityAgent',
@@ -675,6 +676,7 @@ const VALID_CONVERTER_NAMES = new Set([
   'convertClaudeAgentToCodebuddyAgent',
   'convertClaudeAgentToClineAgent',
   'convertClaudeAgentToCodexAgent',
+  'convertClaudeAgentToGrokAgent',
 ]);
 
 // C3: Validate role:runtime body
@@ -1972,7 +1974,7 @@ function runConfigFormatParityGate(capMap) {
     if (!r || typeof r.configFormat !== 'string') continue; // already validated above
 
     // Only check runtimes that have an installSurface (i.e. are config-adapter runtimes)
-    if (typeof r.installSurface !== 'string') continue; // grok etc. excluded — no installSurface
+    if (typeof r.installSurface !== 'string') continue; // non-installable descriptors excluded
 
     const installSurface = r.installSurface;
     const expectedConfigFormat = INSTALL_SURFACE_TO_CONFIG_FORMAT.get(installSurface);

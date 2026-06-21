@@ -20,11 +20,6 @@
 //
 // Known INTENTIONAL asymmetries — these are not drift; do not "fix" them by
 // tightening the invariants:
-//   - `grok` appears in runtime-homes.cjs's getGlobalConfigDir switch but NOT in
-//     the registry / artifact-layout supported sets (it resolves a config-dir home
-//     but is not an installable artifact target). So runtime-homes' full switch set
-//     is never tied into the equality invariant — it is only probed forward, per
-//     installable runtime.
 //   - getGlobalConfigDir() falls back to ~/.claude for an UNKNOWN runtime instead
 //     of throwing (a deliberately liberal projection). Only the registry and
 //     artifact-layout projections are loud gates, so only those are asserted to

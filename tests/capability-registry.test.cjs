@@ -3141,7 +3141,7 @@ const {
 const RUNTIME_IDS = [
   'claude', 'codex', 'antigravity', 'gemini', 'cursor', 'opencode',
   'kilo', 'copilot', 'augment', 'trae', 'qwen', 'hermes',
-  'codebuddy', 'cline', 'kimi', 'windsurf',
+  'codebuddy', 'cline', 'kimi', 'windsurf', 'grok',
 ];
 
 // Helper: build a minimal valid runtime capability object for fixture-based tests
@@ -3175,16 +3175,16 @@ function makeRuntimeCap(overrides) {
 
 // ── 24a. All 16 runtime ids appear in the runtimes index ─────────────────────
 
-describe('ADR-1016 phase 5a: all 16 runtimes in registry index', () => {
+describe('ADR-1016 phase 5a: all installable runtimes in registry index', () => {
   let registry;
 
-  test('loadAndValidate + buildRegistry produces runtimes index with 16 entries', () => {
+  test('loadAndValidate + buildRegistry produces runtimes index with 17 entries', () => {
     const { capMap, errors } = loadAndValidate(new Set());
     const hardErrors = errors.filter((e) => !e.includes('pending-migration'));
     assert.deepEqual(hardErrors, [], 'Expected no hard errors: ' + JSON.stringify(hardErrors));
     registry = buildRegistry(capMap);
     const runtimeKeys = Object.keys(registry.runtimes).sort();
-    assert.strictEqual(runtimeKeys.length, 16, 'Expected 16 runtime entries, got: ' + runtimeKeys.join(', '));
+    assert.strictEqual(runtimeKeys.length, 17, 'Expected 17 runtime entries, got: ' + runtimeKeys.join(', '));
     for (const id of RUNTIME_IDS) {
       assert.ok(
         Object.prototype.hasOwnProperty.call(registry.runtimes, id),
@@ -4177,17 +4177,17 @@ describe('ADR-857 phase 5e: configFormat ↔ installSurface parity gate', () => 
   // The gate reads installSurface from cap.runtime.installSurface (the descriptor level);
   // if it is absent (typeof !== 'string'), the runtime is soft-skipped.
   // NOTE: the gate no longer uses the adapter registry — it reads purely from the descriptor.
-  test('runtime with no installSurface in descriptor (e.g. hypothetical "grok") is excluded from parity gate — does not throw', () => {
-    // 'grok' has no installSurface → gate must soft-skip (typeof r.installSurface !== 'string')
-    const grokCap = {
-      id: 'grok',
+  test('runtime with no installSurface in descriptor (e.g. hypothetical "future-rt") is excluded from parity gate — does not throw', () => {
+    // missing installSurface → gate must soft-skip (typeof r.installSurface !== 'string')
+    const futureCap = {
+      id: 'future-rt',
       role: 'runtime',
-      title: 'Grok',
-      description: 'Hypothetical grok runtime',
+      title: 'Future Runtime',
+      description: 'Hypothetical runtime without installSurface',
       tier: 'core',
       requires: [],
       runtime: {
-        configHome: { kind: 'dot-home', name: '.grok', env: [] },
+        configHome: { kind: 'dot-home', name: '.future-rt', env: [] },
         configFormat: 'settings-json',  // any value — gate should not check this (no installSurface)
         artifactLayout: { global: [], local: [] },
         commandStyle: 'slash-hyphen',
@@ -4197,7 +4197,7 @@ describe('ADR-857 phase 5e: configFormat ↔ installSurface parity gate', () => 
         // intentionally no installSurface — gate must skip this entry
       },
     };
-    const capMap = new Map([['grok', grokCap]]);
+    const capMap = new Map([['future-rt', futureCap]]);
     assert.doesNotThrow(
       () => runConfigFormatParityGate(capMap),
       'Runtimes with no installSurface in their descriptor must be excluded from the parity gate',

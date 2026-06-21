@@ -378,18 +378,22 @@ export function resolveKimiGlobalDir(opts: ResolveKimiOpts = {}): string {
 export function getGlobalConfigDir(runtime: string, explicitDir?: string | null): string {
   if (explicitDir) return expandTilde(explicitDir);
 
-  // ── Grok: not in the registry — hardcoded branch ─────────────────────────
-  if (runtime === 'grok') {
-    const env = process.env as Record<string, string | undefined>;
-    return env['GROK_AGENTS_HOME'] ? expandTilde(env['GROK_AGENTS_HOME']) : path.join(os.homedir(), '.agents');
-  }
-
   // ── Descriptor-driven: look up in capability-registry ────────────────────
   const { runtimes } = getRegistry();
 
   const runtimeEntry = runtimes[runtime];
   if (runtimeEntry?.runtime?.configHome) {
     return resolveDescriptorWithOptions(runtimeEntry.runtime.configHome);
+  }
+
+  // Legacy alias: GROK_AGENTS_HOME was used by early local Grok experiments that
+  // mapped GSD into ~/.agents. Prefer GROK_HOME / ~/.grok via the descriptor when
+  // present; fall back here only when the registry entry is missing.
+  if (runtime === 'grok') {
+    const env = process.env as Record<string, string | undefined>;
+    if (env['GROK_HOME']) return expandTilde(env['GROK_HOME']);
+    if (env['GROK_AGENTS_HOME']) return expandTilde(env['GROK_AGENTS_HOME']);
+    return path.join(os.homedir(), '.grok');
   }
 
   // ── Default (unknown runtime → Claude fallback) ───────────────────────────

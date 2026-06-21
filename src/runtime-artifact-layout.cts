@@ -4,9 +4,9 @@
  * Runtime artifact layout module — resolves the artifact directory shapes
  * (commands, agents, skills) for each supported runtime.
  *
- * grok is intentionally absent: it is in runtime-homes.cjs but has no runtime
- * capability descriptor. The TypeError on unknown runtime is the loud-fail
- * signal that a runtime was added without an artifact layout descriptor.
+ * Artifact layouts are descriptor-driven via the capability registry. The
+ * TypeError on unknown runtime is the loud-fail signal that a runtime was
+ * added without an artifact layout descriptor.
  *
  * ADR-457 build-at-publish: the hand-written bin/lib/runtime-artifact-layout.cjs
  * collapsed to a TypeScript source of truth. Behaviour is preserved byte-for-behaviour

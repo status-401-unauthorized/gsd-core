@@ -843,6 +843,74 @@ const capabilities = {
     "contributions": [],
     "gates": []
   },
+  "grok": {
+    "id": "grok",
+    "role": "runtime",
+    "version": "1.6.0-rc.1",
+    "title": "Grok Build",
+    "description": "xAI Grok Build TUI — skills + agents under ~/.grok; AGENTS.md project rules; tier-2 support via Grok-native SKILL.md/agent frontmatter and spawn_subagent adapter.",
+    "tier": "core",
+    "requires": [],
+    "engines": {
+      "gsd": ">=1.6.0"
+    },
+    "runtime": {
+      "configHome": {
+        "kind": "dot-home",
+        "name": ".grok",
+        "env": [
+          "GROK_HOME"
+        ]
+      },
+      "configFormat": "none",
+      "artifactLayout": {
+        "global": [
+          {
+            "kind": "skills",
+            "destSubpath": "skills",
+            "prefix": "gsd-",
+            "nesting": "flat",
+            "recursive": true,
+            "converter": "convertClaudeCommandToGrokSkill"
+          },
+          {
+            "kind": "agents",
+            "destSubpath": "agents",
+            "prefix": "gsd-",
+            "nesting": "flat",
+            "recursive": false,
+            "converter": "convertClaudeAgentToGrokAgent"
+          }
+        ],
+        "local": [
+          {
+            "kind": "skills",
+            "destSubpath": "skills",
+            "prefix": "gsd-",
+            "nesting": "flat",
+            "recursive": true,
+            "converter": "convertClaudeCommandToGrokSkill"
+          },
+          {
+            "kind": "agents",
+            "destSubpath": "agents",
+            "prefix": "gsd-",
+            "nesting": "flat",
+            "recursive": false,
+            "converter": "convertClaudeAgentToGrokAgent"
+          }
+        ]
+      },
+      "commandStyle": "slash-hyphen",
+      "hooksSurface": "none",
+      "sandboxTier": "none",
+      "supportTier": 2,
+      "installSurface": "profile-marker-only",
+      "writesSharedSettings": false,
+      "permissionWriter": null,
+      "extendedHookEvents": []
+    }
+  },
   "hermes": {
     "id": "hermes",
     "role": "runtime",
@@ -3257,6 +3325,74 @@ const runtimes = {
       ]
     }
   },
+  "grok": {
+    "id": "grok",
+    "role": "runtime",
+    "version": "1.6.0-rc.1",
+    "title": "Grok Build",
+    "description": "xAI Grok Build TUI — skills + agents under ~/.grok; AGENTS.md project rules; tier-2 support via Grok-native SKILL.md/agent frontmatter and spawn_subagent adapter.",
+    "tier": "core",
+    "requires": [],
+    "engines": {
+      "gsd": ">=1.6.0"
+    },
+    "runtime": {
+      "configHome": {
+        "kind": "dot-home",
+        "name": ".grok",
+        "env": [
+          "GROK_HOME"
+        ]
+      },
+      "configFormat": "none",
+      "artifactLayout": {
+        "global": [
+          {
+            "kind": "skills",
+            "destSubpath": "skills",
+            "prefix": "gsd-",
+            "nesting": "flat",
+            "recursive": true,
+            "converter": "convertClaudeCommandToGrokSkill"
+          },
+          {
+            "kind": "agents",
+            "destSubpath": "agents",
+            "prefix": "gsd-",
+            "nesting": "flat",
+            "recursive": false,
+            "converter": "convertClaudeAgentToGrokAgent"
+          }
+        ],
+        "local": [
+          {
+            "kind": "skills",
+            "destSubpath": "skills",
+            "prefix": "gsd-",
+            "nesting": "flat",
+            "recursive": true,
+            "converter": "convertClaudeCommandToGrokSkill"
+          },
+          {
+            "kind": "agents",
+            "destSubpath": "agents",
+            "prefix": "gsd-",
+            "nesting": "flat",
+            "recursive": false,
+            "converter": "convertClaudeAgentToGrokAgent"
+          }
+        ]
+      },
+      "commandStyle": "slash-hyphen",
+      "hooksSurface": "none",
+      "sandboxTier": "none",
+      "supportTier": 2,
+      "installSurface": "profile-marker-only",
+      "writesSharedSettings": false,
+      "permissionWriter": null,
+      "extendedHookEvents": []
+    }
+  },
   "hermes": {
     "id": "hermes",
     "role": "runtime",
@@ -3834,6 +3970,7 @@ const _requiresGraph = {
   "gap-analysis": [],
   "gemini": [],
   "graphify": [],
+  "grok": [],
   "hermes": [],
   "intel": [],
   "kilo": [],

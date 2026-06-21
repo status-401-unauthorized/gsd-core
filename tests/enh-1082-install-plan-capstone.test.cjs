@@ -3,7 +3,7 @@
 /**
  * Golden-master test for resolveInstallPlan — ADR-857 phase 5g capstone.
  *
- * Pins the exact InstallPlan shape for all 16 runtimes to guard against
+ * Pins the exact InstallPlan shape for all installable runtimes to guard against
  * descriptor drift. Derived from actual resolveInstallPlan output at the time
  * the seam was introduced (2026-06-11). Behavioral: calls the exported
  * function and asserts on typed fields — no source-grep.
@@ -178,13 +178,23 @@ const EXPECTED = {
     hooksSurface: 'none',
     sandboxTier: 'none',
   },
+  grok: {
+    runtime: 'grok',
+    installSurface: 'profile-marker-only',
+    writesSharedSettings: false,
+    finishPermissionWriter: null,
+    hookEvents: undefined,
+    extendedHookEvents: [],
+    hooksSurface: 'none',
+    sandboxTier: 'none',
+  },
 };
 
 const ALL_RUNTIMES = Object.keys(EXPECTED);
 
 describe('resolveInstallPlan — ADR-857 phase 5g golden master', () => {
-  it('covers exactly 16 runtimes', () => {
-    assert.strictEqual(ALL_RUNTIMES.length, 16);
+  it('covers exactly 17 runtimes', () => {
+    assert.strictEqual(ALL_RUNTIMES.length, 17);
   });
 
   for (const runtime of ALL_RUNTIMES) {

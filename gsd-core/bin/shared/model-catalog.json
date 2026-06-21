@@ -77,6 +77,11 @@
       "sonnet": null,
       "haiku": null
     },
+    "grok": {
+      "opus": { "model": "grok-4" },
+      "sonnet": { "model": "grok-build" },
+      "haiku": { "model": "grok-3-mini" }
+    },
     "codebuddy": {
       "opus": null,
       "sonnet": null,

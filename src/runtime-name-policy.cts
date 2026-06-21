@@ -31,6 +31,7 @@ const FALLBACK_ALIASES: Readonly<Record<string, string[]>> = {
   kimi: ['kimi'],
   codebuddy: ['codebuddy', 'codebuddy-cli'],
   cline: ['cline', 'cline-cli'],
+  grok: ['grok', 'grok-build', 'grok-cli', 'xai-grok'],
 };
 
 function normalizeRuntimeToken(value: string): string {
@@ -115,5 +116,6 @@ export function getDirName(runtime: string): string {
   if (runtime === 'kimi') return '.kimi-code';
   if (runtime === 'codebuddy') return '.codebuddy';
   if (runtime === 'cline') return '.cline';
+  if (runtime === 'grok') return '.grok';
   return '.claude';
 }

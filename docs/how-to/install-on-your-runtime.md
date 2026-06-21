@@ -155,6 +155,38 @@ The extension loads GSD's operating context (`GEMINI.md`) into every session and
 
 ---
 
+### Grok Build
+
+```bash
+npx @opengsd/gsd-core@latest --grok --global
+```
+
+Skills land in `~/.grok/skills/gsd-*/SKILL.md` and agents in `~/.grok/agents/gsd-*.md`. The installer converts Claude Code frontmatter into Grok-compatible `SKILL.md` / agent definitions and injects a `<grok_skill_adapter>` block that maps Claude/Codex invocation patterns (`Task()`, `spawn_agent()`, `AskUserQuestion`) onto Grok Build tools (`spawn_subagent`, `ask_user_question`). Project rules use `AGENTS.md` (Grok reads repo-root and `.grok/` rules natively). Restart Grok Build (or open a new session) to pick up skills — run `grok inspect` to confirm `gsd-*` skills are listed.
+
+**Override the install directory:**
+
+```bash
+GROK_HOME=~/.grok-alt npx @opengsd/gsd-core@latest --grok --global
+```
+
+**Local (project-scoped) install:**
+
+```bash
+npx @opengsd/gsd-core@latest --grok --local
+```
+
+Writes to `./.grok/skills/` and `./.grok/agents/` in the current project (highest priority for Grok skill discovery).
+
+**Hooks**
+
+Grok Build discovers lifecycle hooks from `~/.grok/hooks/*.json` and also scans Claude/Cursor hook sources via its compatibility layer (`[compat.claude]` / `[compat.cursor]` in `~/.grok/config.toml`). This GSD runtime install focuses on the skills + agents surface; enable Claude/Cursor compat if you want GSD guard hooks from a parallel Claude or Cursor install.
+
+**Invocation**
+
+Grok activates skills by name and description match (not only slash commands). Ask for a workflow by name (for example “run gsd-new-project” or “gsd progress”) or invoke the skill directly when Grok offers it. Orchestrator skills (`gsd-plan-phase`, `gsd-execute-phase`, `gsd-autonomous`) should run at session depth 0 so they can `spawn_subagent` executor/verifier children (Grok limits subagent nesting to one level).
+
+---
+
 ### OpenCode
 
 ```bash

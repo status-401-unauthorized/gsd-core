@@ -6,7 +6,7 @@
  * hand-kept REGISTRY const.
  *
  * This golden-master test pins the observable contract: the return shape and
- * values must be identical to the pre-change behavior for all 16 runtimes.
+ * values must be identical to the pre-change behavior for all installable runtimes.
  * Purely behavioral — no source-grep.
  */
 
@@ -41,6 +41,7 @@ const EXPECTED = [
   { runtime: 'windsurf',     installSurface: 'profile-marker-only',  writesSharedSettings: false, finishPermissionWriter: null        },
   { runtime: 'trae',         installSurface: 'profile-marker-only',  writesSharedSettings: false, finishPermissionWriter: null        },
   { runtime: 'kimi',         installSurface: 'profile-marker-only',  writesSharedSettings: false, finishPermissionWriter: null        },
+  { runtime: 'grok',         installSurface: 'profile-marker-only',  writesSharedSettings: false, finishPermissionWriter: null        },
 ];
 
 // ---------------------------------------------------------------------------
@@ -84,21 +85,21 @@ describe('enh-1055 descriptor-drive: unknown runtime throws TypeError', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test 4: ALLOWED_CONFIG_RUNTIMES contains all 16 expected runtimes
+// Test 4: ALLOWED_CONFIG_RUNTIMES contains all expected runtimes
 // ---------------------------------------------------------------------------
 
 describe('enh-1055 descriptor-drive: ALLOWED_CONFIG_RUNTIMES completeness', () => {
-  const EXPECTED_16 = new Set([
+  const EXPECTED_RUNTIMES = new Set([
     'claude', 'gemini', 'antigravity', 'augment', 'qwen', 'hermes', 'codebuddy',
-    'opencode', 'kilo', 'codex', 'copilot', 'cline', 'cursor', 'windsurf', 'trae', 'kimi',
+    'opencode', 'kilo', 'codex', 'copilot', 'cline', 'cursor', 'windsurf', 'trae', 'kimi', 'grok',
   ]);
 
-  test('contains exactly the 16 expected runtimes', () => {
-    assert.deepStrictEqual(new Set(ALLOWED_CONFIG_RUNTIMES), EXPECTED_16);
+  test('contains exactly the expected runtimes', () => {
+    assert.deepStrictEqual(new Set(ALLOWED_CONFIG_RUNTIMES), EXPECTED_RUNTIMES);
   });
 
-  test('has exactly 16 entries', () => {
-    assert.strictEqual([...ALLOWED_CONFIG_RUNTIMES].length, 16);
+  test('has exactly 17 entries', () => {
+    assert.strictEqual([...ALLOWED_CONFIG_RUNTIMES].length, 17);
   });
 });
 

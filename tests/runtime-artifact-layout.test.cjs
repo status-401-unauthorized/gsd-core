@@ -342,15 +342,10 @@ describe('resolveRuntimeArtifactLayout edge-cases', () => {
     assert.strictEqual(layout.kinds[0].kind, 'skills');
   });
 
-  test('unknown runtime grok throws TypeError containing runtime name', () => {
-    assert.throws(
-      () => resolveRuntimeArtifactLayout('grok', '/tmp/x'),
-      (err) => {
-        assert.ok(err instanceof TypeError);
-        assert.ok(err.message.includes('grok'), 'error message must contain the runtime name');
-        return true;
-      }
-    );
+  test('grok resolves skills + agents artifact kinds', () => {
+    const layout = resolveRuntimeArtifactLayout('grok', '/tmp/x', 'global');
+    const kinds = layout.kinds.map((k) => k.kind).sort();
+    assert.deepStrictEqual(kinds, ['agents', 'skills']);
   });
 
   test('unknown runtime xyzunknown throws TypeError', () => {

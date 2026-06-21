@@ -242,3 +242,28 @@ This session delivered working `grok` runtime resolution + immediate version par
 **Last updated:** 2026-05-16 (by Grok, in this session)
 
 This document is intended to be living. Update it as the local Grok Build work progresses.
+
+---
+
+## 11. Progress — June 2026 (first-class runtime)
+
+Grok Build is now a first-class installable runtime in this tree (not only the pragmatic `~/.agents` experiment):
+
+- **`capabilities/grok/capability.json`** — `~/.grok` via `GROK_HOME`; skills + agents artifact layout; `profile-marker-only` install surface (hooks deferred; Grok compat can still scan Claude/Cursor hooks).
+- **Converters** — `convertClaudeCommandToGrokSkill` / `convertClaudeAgentToGrokAgent` in `src/runtime-artifact-conversion.cts` with a concise `<grok_skill_adapter>` / `<grok_agent_role>` block (`spawn_subagent`, `ask_user_question`, `AGENTS.md`).
+- **Installer** — `--grok` / `--grok-build`, interactive option 10, included in `--all`, help text, and `allRuntimes` / `runtimeMap` (option 18 = All).
+- **Homes / aliases** — `getDirName('grok')` → `.grok`; descriptor-driven `getGlobalConfigDir`; aliases `grok`, `grok-build`, `grok-cli`, `xai-grok`; model tier defaults `grok-4` / `grok-build` / `grok-3-mini`.
+- **Docs** — README + `docs/how-to/install-on-your-runtime.md` Grok section.
+
+Install and verify:
+
+```bash
+npx @opengsd/gsd-core@latest --grok --global
+# or from this checkout:
+node bin/install.js --grok --global
+grok inspect
+```
+
+Remaining follow-ups: native `~/.grok/hooks/*.json` writer (beyond compat scanning), slim adapter token cost, and launcher-snippet `GROK_HOME` probe if not already covered by descriptor-driven paths.
+
+**Last updated:** 2026-06-21
