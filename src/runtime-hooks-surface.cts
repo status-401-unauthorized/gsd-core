@@ -1321,7 +1321,9 @@ function applySettingsJsonHooks(settings: any, opts: ApplySettingsJsonHooksOpts)
   // guard must also skip kimi's surface so applySettingsJsonHooks doesn't log
   // misleading "Configured ..." console messages for a settings object that
   // finishInstall() will never persist for kimi.
-  if (hooksSurface !== 'none' && hooksSurface !== 'kimi-hooks-toml') {
+  // Grok Build uses hooksSurface 'grok-hooks-json' — native ~/.grok/hooks/*.json
+  // files via writeGrokHooksJson, not settings.json.
+  if (hooksSurface !== 'none' && hooksSurface !== 'kimi-hooks-toml' && hooksSurface !== 'grok-hooks-json') {
     if (!settings.hooks) {
       settings.hooks = {};
     }
@@ -2038,6 +2040,126 @@ function referencesHook(h: Record<string, unknown>, hookName: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Grok Build native hooks (hooksSurface: 'grok-hooks-json')
+//
+// Grok discovers lifecycle hooks from ~/.grok/hooks/*.json (and project
+// .grok/hooks/). The JSON shape matches Claude Code's nested hooks table
+// (PascalCase events under a top-level "hooks" key). GSD writes a single
+// managed file `gsd-lifecycle.json` so user-authored sibling *.json files
+// are never clobbered. Commands point at scripts under <configDir>/hooks/
+// installed by installSharedHooksBundle.
+// ---------------------------------------------------------------------------
+
+/** Managed marker field — Grok ignores unknown fields; we use it for ownership. */
+const GSD_GROK_HOOK_MARKER = 'gsd-managed';
+
+/** Filename under <configDir>/hooks/ for the GSD-owned Grok lifecycle table. */
+const GSD_GROK_HOOKS_FILE = 'gsd-lifecycle.json';
+
+/**
+ * Event → script mapping for Grok's Claude-dialect hook bus.
+ * Scripts live under hooks/ and are copied into the Grok config dir's hooks/
+ * directory by the shared hooks bundle install.
+ */
+const GROK_EVENT_SCRIPT_MAP: Readonly<Record<string, { script: string; matcher?: string; timeout?: number }>> = Object.freeze({
+  SessionStart: { script: 'gsd-check-update.js' },
+  PreToolUse: { script: 'gsd-prompt-guard.js', matcher: '.*', timeout: 10 },
+  PostToolUse: {
+    script: 'gsd-context-monitor.js',
+    // Grok aliases Claude tool names (Bash→run_terminal_command, etc.); match both.
+    matcher: 'Bash|Edit|Write|MultiEdit|Agent|Task|run_terminal_command|search_replace|spawn_subagent',
+    timeout: 10,
+  },
+  Stop: { script: 'gsd-workflow-guard.js', timeout: 10 },
+});
+
+interface WriteGrokHooksJsonOpts {
+  portableHooks?: boolean;
+  platform?: string;
+  runtime?: string;
+}
+
+/**
+ * Write GSD-managed Grok lifecycle hooks to <targetDir>/hooks/gsd-lifecycle.json.
+ * Idempotent: overwrites the managed file wholesale; sibling user hook JSON
+ * files are left untouched.
+ */
+function writeGrokHooksJson(
+  targetDir: string,
+  opts?: WriteGrokHooksJsonOpts,
+): { hooksJsonPath: string; changed: boolean; entryCount: number } {
+  opts = opts || {};
+  const hooksDir = path.join(targetDir, 'hooks');
+  fs.mkdirSync(hooksDir, { recursive: true });
+
+  const hookOpts: BuildHookCommandOpts = {
+    portableHooks: opts.portableHooks,
+    platform: opts.platform || process.platform,
+    runtime: opts.runtime || 'grok',
+  };
+
+  const hookTable: Record<string, unknown[]> = {};
+  let entryCount = 0;
+
+  for (const [eventName, spec] of Object.entries(GROK_EVENT_SCRIPT_MAP)) {
+    const scriptPath = path.join(hooksDir, spec.script);
+    if (!fs.existsSync(scriptPath)) continue;
+    const command = buildHookCommand(targetDir, spec.script, hookOpts);
+    if (!command) continue;
+
+    const hookEntry: Record<string, unknown> = {
+      type: 'command',
+      command,
+      [GSD_GROK_HOOK_MARKER]: true,
+    };
+    if (spec.timeout !== undefined) hookEntry['timeout'] = spec.timeout;
+
+    const group: Record<string, unknown> = { hooks: [hookEntry] };
+    if (spec.matcher !== undefined) group['matcher'] = spec.matcher;
+
+    hookTable[eventName] = [group];
+    entryCount += 1;
+  }
+
+  const hooksJsonPath = path.join(hooksDir, GSD_GROK_HOOKS_FILE);
+  const payload = `${JSON.stringify({ hooks: hookTable }, null, 2)}\n`;
+  let changed = true;
+  if (fs.existsSync(hooksJsonPath)) {
+    try {
+      const existing = fs.readFileSync(hooksJsonPath, 'utf8');
+      if (existing === payload) changed = false;
+    } catch { /* rewrite on read failure */ }
+  }
+  if (changed) {
+    if (entryCount === 0) {
+      // Nothing to register — remove a stale managed file if present.
+      if (fs.existsSync(hooksJsonPath)) {
+        try { fs.unlinkSync(hooksJsonPath); } catch { /* best-effort */ }
+        return { hooksJsonPath, changed: true, entryCount: 0 };
+      }
+      return { hooksJsonPath, changed: false, entryCount: 0 };
+    }
+    atomicWriteFileSync(hooksJsonPath, payload, 'utf8');
+  }
+  return { hooksJsonPath, changed, entryCount };
+}
+
+/**
+ * Remove the GSD-managed Grok lifecycle hooks file. User-authored sibling
+ * hook JSON files under hooks/ are preserved.
+ */
+function removeGrokHooksJson(targetDir: string): { changed: boolean } {
+  const hooksJsonPath = path.join(targetDir, 'hooks', GSD_GROK_HOOKS_FILE);
+  if (!fs.existsSync(hooksJsonPath)) return { changed: false };
+  try {
+    fs.unlinkSync(hooksJsonPath);
+    return { changed: true };
+  } catch {
+    return { changed: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
@@ -2090,6 +2212,12 @@ export = {
   removeKimiHooksToml,
   KIMI_HOOKS_TOML_MARKER_BEGIN,
   KIMI_HOOKS_TOML_MARKER_END,
+
+  // Grok Build native hooks/*.json
+  writeGrokHooksJson,
+  removeGrokHooksJson,
+  GSD_GROK_HOOKS_FILE,
+  GSD_GROK_HOOK_MARKER,
 
   // Shared
   buildHookCommand,

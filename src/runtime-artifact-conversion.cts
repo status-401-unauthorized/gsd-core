@@ -1561,21 +1561,30 @@ function convertClaudeCommandToCodexSkill(content, skillName) {
  * Grok Build skill adapter — maps Claude/Codex invocation patterns to Grok tools.
  * Shorter than the Codex adapter: Grok has first-class spawn_subagent and skills
  * are invoked by name (no Skill(gsd:*) prefix noise).
+ *
+ * Kept in sync with Grok Build user-guide (skills, subagents, plan mode) as of
+ * Grok 4.5 / CLI 0.2.9x: max spawn depth 1, background subagents +
+ * get_command_or_subagent_output, capability_mode / isolation worktrees,
+ * enter_plan_mode / exit_plan_mode, update_goal.
  */
 function getGrokSkillAdapterHeader(skillName) {
   return `<grok_skill_adapter>
 Skill: ${skillName}
 
 Runtime mapping (Claude / Codex → Grok Build):
-- Task(subagent_type=..., prompt=...) / spawn_agent(...) → spawn_subagent(subagent_type=..., prompt=..., description=...)
+- Task(subagent_type=..., prompt=...) / spawn_agent(...) → spawn_subagent(subagent_type=..., prompt=..., description=..., background?=..., capability_mode?=..., isolation?=...)
 - Agent(type) / typed agent roles → spawn_subagent with subagent_type matching the agent name when installed under ~/.grok/agents/gsd-*.md, else general-purpose + role preamble
+- Background / parallel child work → spawn_subagent(..., background=true) then get_command_or_subagent_output(task_ids=[...]) (or monitor for long streams)
+- Isolation for file-mutating children → isolation="worktree" (mutually exclusive with cwd); default isolation is none (shared workspace)
+- Tool restriction on children → capability_mode: read-only | read-write | execute | all
 - AskUserQuestion / request_user_input → ask_user_question
-- TodoWrite / update_plan → keep as structured steps in your reply; Grok tracks goals via update_goal when available
+- TodoWrite / update_plan → keep as structured steps in your reply; track multi-step goals via update_goal when available
+- Plan Mode (design before edits) → enter_plan_mode then exit_plan_mode after the plan is written (Grok reads the plan file from disk)
 - SlashCommand /skill:gsd-* → invoke the matching gsd-* skill by name (already installed as ~/.grok/skills/gsd-*/SKILL.md)
-- CLAUDE.md / AGENTS.md project rules → AGENTS.md (repo root or .grok/ project rules)
+- Project rules (Claude project-rules file / AGENTS.md) → AGENTS.md (repo root or .grok/ project rules)
 - ~/.claude/ and ~/.codex/ paths in instructions → ~/.grok/ (or $GROK_HOME)
 
-Subagent depth: Grok allows one level of spawn_subagent nesting. Orchestrator skills (plan-phase, execute-phase, autonomous) run at depth 0 and spawn executors/verifiers; do not nest another spawner inside a child.
+Subagent depth: Grok allows one level of spawn_subagent nesting. Orchestrator skills (plan-phase, execute-phase, autonomous) run at depth 0 and spawn executors/verifiers; do not nest another spawner inside a child (spawn_subagent from a child fails with a depth-limit error).
 
 When a typed GSD agent is unavailable as a subagent_type, inject its agent file role/purpose as a preamble and spawn general-purpose. Label results as "generic-agent workaround".
 </grok_skill_adapter>`;
@@ -1636,7 +1645,8 @@ function convertClaudeAgentToGrokAgent(content) {
 role: ${name}
 tools: ${tools}
 purpose: ${toSingleLine(description)}
-spawn_hint: spawn_subagent(subagent_type="${name}", prompt=..., description=...)
+spawn_hint: spawn_subagent(subagent_type="${name}", prompt=..., description=..., background?=false, capability_mode?="all", isolation?="none")
+notes: Max spawn depth is 1 (this agent must not spawn further subagents). Prefer isolation="worktree" when editing files in parallel with the parent. Use background=true + get_command_or_subagent_output for long-running work.
 </grok_agent_role>`;
 
   const cleanFrontmatter = `---\nname: ${yamlQuote(name)}\ndescription: ${yamlQuote(toSingleLine(description))}\nprompt_mode: full\n---`;

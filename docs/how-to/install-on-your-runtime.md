@@ -139,11 +139,11 @@ Writes to `./.grok/skills/` and `./.grok/agents/` in the current project (highes
 
 **Hooks**
 
-Grok Build discovers lifecycle hooks from `~/.grok/hooks/*.json` and also scans Claude/Cursor hook sources via its compatibility layer (`[compat.claude]` / `[compat.cursor]` in `~/.grok/config.toml`). This GSD runtime install focuses on the skills + agents surface; enable Claude/Cursor compat if you want GSD guard hooks from a parallel Claude or Cursor install.
+GSD writes a managed Claude-dialect lifecycle table to `~/.grok/hooks/gsd-lifecycle.json` (SessionStart, PreToolUse, PostToolUse, Stop) and installs the shared hook scripts under `~/.grok/hooks/`. Reinstalls overwrite only that managed file; any sibling user-authored `*.json` hook files are left alone. Uninstall removes `gsd-lifecycle.json` without touching user hooks. Grok may still also scan Claude/Cursor hook sources via `[compat.claude]` / `[compat.cursor]` in `~/.grok/config.toml` if you keep a parallel install.
 
 **Invocation**
 
-Grok activates skills by name and description match (not only slash commands). Ask for a workflow by name (for example “run gsd-new-project” or “gsd progress”) or invoke the skill directly when Grok offers it. Orchestrator skills (`gsd-plan-phase`, `gsd-execute-phase`, `gsd-autonomous`) should run at session depth 0 so they can `spawn_subagent` executor/verifier children (Grok limits subagent nesting to one level).
+Grok activates skills by name and description match (not only slash commands). Ask for a workflow by name (for example “run gsd-new-project” or “gsd progress”) or invoke the skill directly when Grok offers it. Orchestrator skills (`gsd-plan-phase`, `gsd-execute-phase`, `gsd-autonomous`) should run at session depth 0 so they can `spawn_subagent` executor/verifier children (Grok limits subagent nesting to one level). Background children use `spawn_subagent(..., background=true)` plus `get_command_or_subagent_output`; prefer `isolation="worktree"` for file-mutating parallel work.
 
 ---
 

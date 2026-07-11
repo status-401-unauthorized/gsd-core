@@ -774,6 +774,8 @@ const applySettingsJsonHooks = hooksSurface.applySettingsJsonHooks;
 // surface (#2095 EoS/kimi Upgrade 1) — separate from settings.json entirely.
 const writeKimiHooksToml = hooksSurface.writeKimiHooksToml;
 const removeKimiHooksToml = hooksSurface.removeKimiHooksToml;
+const writeGrokHooksJson = hooksSurface.writeGrokHooksJson;
+const removeGrokHooksJson = hooksSurface.removeGrokHooksJson;
 // processAttribution: pure Co-Authored-By content transform, relocated to the
 // conversion module (ADR-1508 / #1510 Phase 1). Bound here so install.js
 // callers continue to work and there is a single implementation. (All call
@@ -7004,6 +7006,14 @@ function uninstall(isGlobal, runtime = DEFAULT_RUNTIME) {
   // resolves ~/.kimi, a sibling of targetDir's ~/.config/agents), so its
   // cleanup can't be driven by anything under targetDir the way every other
   // hook surface above is.
+  if (resolveInstallPlan(runtime).hooksSurface === 'grok-hooks-json') {
+    const grokHooksCleanup = removeGrokHooksJson(targetDir);
+    if (grokHooksCleanup.changed) {
+      removedCount++;
+      console.log(`  ${green}✓${reset} Removed GSD Grok lifecycle hooks (gsd-lifecycle.json)`);
+    }
+  }
+
   if (resolveInstallPlan(runtime).hooksSurface === 'kimi-hooks-toml') {
     const kimiHooksRoot = resolveKimiHooksTomlDir();
     const kimiHooksTomlPath = path.join(kimiHooksRoot, 'config.toml');
@@ -10593,6 +10603,26 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       if (kimiHooksResult.changed) {
         console.log(`  ${green}✓${reset} Configured ${kimiHooksResult.entryCount} GSD hook(s) in ${kimiHooksTomlPath}`);
       }
+    }
+    // Grok Build native hooks: Claude-dialect JSON under ~/.grok/hooks/gsd-lifecycle.json.
+    // Shared hooks bundle is already installed into targetDir above for profile-marker
+    // runtimes that do not set skipSharedHooksInstall (grok does not).
+    if (plan.hooksSurface === 'grok-hooks-json') {
+      const grokHooksResult = writeGrokHooksJson(targetDir, {
+        portableHooks: hasPortableHooks,
+        runtime: 'grok',
+      });
+      if (grokHooksResult.entryCount > 0) {
+        if (grokHooksResult.changed) {
+          console.log(`  ${green}✓${reset} Configured ${grokHooksResult.entryCount} Grok lifecycle hook(s) in ${grokHooksResult.hooksJsonPath}`);
+        } else {
+          console.log(`  ${green}✓${reset} Grok lifecycle hooks already up to date`);
+        }
+      } else {
+        console.warn(`  ${yellow}⚠${reset}  Skipped Grok lifecycle hooks — no managed hook scripts found under ${path.join(targetDir, 'hooks')}`);
+      }
+      // Re-hash so gsd-lifecycle.json is tracked in the file manifest.
+      writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
     }
     persistActiveProfileMarker();
     return { settingsPath: null, settings: null, statuslineCommand: null, updateBannerCommand: null, runtime, configDir: targetDir };

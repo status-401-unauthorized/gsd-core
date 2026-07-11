@@ -1418,13 +1418,18 @@ const capabilities = {
         ]
       },
       "commandStyle": "slash-hyphen",
-      "hooksSurface": "none",
+      "hooksSurface": "grok-hooks-json",
+      "hookEvents": "claude",
       "sandboxTier": "none",
       "supportTier": 2,
       "installSurface": "profile-marker-only",
       "writesSharedSettings": false,
       "permissionWriter": null,
-      "extendedHookEvents": [],
+      "extendedHookEvents": [
+        "Stop",
+        "SubagentStart",
+        "SubagentStop"
+      ],
       "hostIntegration": {
         "embeddingMode": "imperative",
         "commandSurface": "slash-file",
@@ -1437,7 +1442,7 @@ const capabilities = {
           "backgroundDispatch": true
         },
         "modelMode": "passive",
-        "hookBus": "none",
+        "hookBus": "host",
         "stateIO": "filesystem",
         "transport": "mcp",
         "runtime": "node"
@@ -4721,13 +4726,18 @@ const runtimes = {
         ]
       },
       "commandStyle": "slash-hyphen",
-      "hooksSurface": "none",
+      "hooksSurface": "grok-hooks-json",
+      "hookEvents": "claude",
       "sandboxTier": "none",
       "supportTier": 2,
       "installSurface": "profile-marker-only",
       "writesSharedSettings": false,
       "permissionWriter": null,
-      "extendedHookEvents": [],
+      "extendedHookEvents": [
+        "Stop",
+        "SubagentStart",
+        "SubagentStop"
+      ],
       "hostIntegration": {
         "embeddingMode": "imperative",
         "commandSurface": "slash-file",
@@ -4740,7 +4750,7 @@ const runtimes = {
           "backgroundDispatch": true
         },
         "modelMode": "passive",
-        "hookBus": "none",
+        "hookBus": "host",
         "stateIO": "filesystem",
         "transport": "mcp",
         "runtime": "node"

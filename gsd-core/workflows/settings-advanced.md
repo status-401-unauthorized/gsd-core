@@ -361,7 +361,7 @@ Built-in tier defaults by runtime:
 | `copilot`  | `claude-opus-4-8`             | `claude-sonnet-5`             | `claude-haiku-4-5`            |
 | `hermes`   | `anthropic/claude-opus-4-8`   | `anthropic/claude-sonnet-5`   | `anthropic/claude-haiku-4-5`  |
 | `kilo`     | `anthropic/claude-opus-4-8`   | `anthropic/claude-sonnet-5`   | `anthropic/claude-haiku-4-5`  |
-| `grok`     | `grok-4`                      | `grok-build`                    | `grok-3-mini`                 |
+| `grok`     | `grok-build`                  | `grok-build`                    | `grok-composer-2.5-fast`      |
 | Group B (`cline`, `cursor`, `windsurf`, `augment`, `trae`, `codebuddy`, `antigravity`) | (no built-in default — your runtime handles model selection) | | |
 
 Display a table to the user showing the effective configuration:

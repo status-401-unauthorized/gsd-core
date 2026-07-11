@@ -3458,6 +3458,21 @@ describe('ADR-1016 phase 5a: sample axis value assertions', () => {
     assert.strictEqual(kimiRt.installSurface, 'profile-marker-only', 'kimi.installSurface must remain "profile-marker-only"');
   });
 
+  test('grok: hooksSurface === grok-hooks-json, hookEvents === claude, extendedHookEvents wired', () => {
+    const { capMap } = loadAndValidate(new Set());
+    const registry = buildRegistry(capMap);
+    const grokRt = registry.runtimes['grok'].runtime;
+    assert.strictEqual(grokRt.hooksSurface, 'grok-hooks-json', 'grok.hooksSurface must be "grok-hooks-json"');
+    assert.strictEqual(grokRt.hookEvents, 'claude', 'grok.hookEvents must be "claude" (Grok uses Claude-dialect hooks JSON)');
+    assert.deepStrictEqual(
+      [...grokRt.extendedHookEvents].sort(),
+      ['Stop', 'SubagentStart', 'SubagentStop'].sort(),
+      'grok.extendedHookEvents must wire Stop/SubagentStart/SubagentStop',
+    );
+    assert.strictEqual(grokRt.installSurface, 'profile-marker-only', 'grok.installSurface must remain "profile-marker-only"');
+    assert.strictEqual(grokRt.hostIntegration.hookBus, 'host', 'grok.hostIntegration.hookBus must be "host"');
+  });
+
   test('codex: hooksSurface === codex-hooks-json, cursor: hooksSurface === cursor-hooks-json', () => {
     const { capMap } = loadAndValidate(new Set());
     const registry = buildRegistry(capMap);
@@ -3967,12 +3982,12 @@ describe('ADR-1016 phase 5a: closed-vocab set exports', () => {
     assert.strictEqual(VALID_COMMAND_STYLES.size, 2);
   });
 
-  test('VALID_HOOKS_SURFACES has exactly 7 values', () => {
+  test('VALID_HOOKS_SURFACES has exactly 8 values', () => {
     assert.ok(VALID_HOOKS_SURFACES instanceof Set);
-    for (const v of ['settings-json', 'codex-hooks-json', 'cursor-hooks-json', 'copilot-inline', 'cline-rules', 'kimi-hooks-toml', 'none']) {
+    for (const v of ['settings-json', 'codex-hooks-json', 'cursor-hooks-json', 'copilot-inline', 'cline-rules', 'kimi-hooks-toml', 'grok-hooks-json', 'none']) {
       assert.ok(VALID_HOOKS_SURFACES.has(v), 'VALID_HOOKS_SURFACES must contain "' + v + '"');
     }
-    assert.strictEqual(VALID_HOOKS_SURFACES.size, 7);
+    assert.strictEqual(VALID_HOOKS_SURFACES.size, 8);
   });
 
   test('VALID_HOOK_EVENTS has exactly 2 managed-hook dialects (claude/gemini)', () => {
@@ -4019,9 +4034,9 @@ describe('ADR-1016 phase 5a: closed-vocab set exports', () => {
 // ─── 25. ADR-857 phase 5e: closed ConverterName enum (Part B) ─────────────────
 
 describe('ADR-857 phase 5e: VALID_CONVERTER_NAMES closed enum', () => {
-  test('VALID_CONVERTER_NAMES has exactly 26 entries (16 command/skill/workflow + 10 agent converters)', () => {
+  test('VALID_CONVERTER_NAMES has exactly 28 entries (17 command/skill/workflow + 11 agent converters)', () => {
     assert.ok(VALID_CONVERTER_NAMES instanceof Set, 'VALID_CONVERTER_NAMES must be a Set');
-    assert.strictEqual(VALID_CONVERTER_NAMES.size, 26, 'VALID_CONVERTER_NAMES must have exactly 26 entries, got: ' + VALID_CONVERTER_NAMES.size);
+    assert.strictEqual(VALID_CONVERTER_NAMES.size, 28, 'VALID_CONVERTER_NAMES must have exactly 28 entries, got: ' + VALID_CONVERTER_NAMES.size);
   });
 
   test('VALID_CONVERTER_NAMES contains all expected converter names', () => {
@@ -4042,6 +4057,7 @@ describe('ADR-857 phase 5e: VALID_CONVERTER_NAMES closed enum', () => {
       'convertClaudeCommandToOpencodeSkill',
       'convertClaudeCommandToTraeSkill',
       'convertClaudeCommandToWindsurfSkill',
+      'convertClaudeCommandToGrokSkill',
       'convertClaudeCommandToWindsurfWorkflow',
       // agent converters (#1173 — descriptor-driven agent conversion wiring)
       'convertClaudeAgentToCopilotAgent',
@@ -4053,12 +4069,15 @@ describe('ADR-857 phase 5e: VALID_CONVERTER_NAMES closed enum', () => {
       'convertClaudeAgentToCodebuddyAgent',
       'convertClaudeAgentToClineAgent',
       'convertClaudeAgentToCodexAgent',
+      'convertClaudeAgentToGrokAgent',
       // ADR-1239 / #2092 Phase B Upgrade 1 — native .qwen/agents/*.md subagent projection.
       'convertClaudeAgentToQwenAgent',
     ];
     for (const name of expected) {
       assert.ok(VALID_CONVERTER_NAMES.has(name), 'VALID_CONVERTER_NAMES must contain "' + name + '"');
     }
+    assert.strictEqual(expected.length, VALID_CONVERTER_NAMES.size,
+      'expected list must cover the full VALID_CONVERTER_NAMES set');
   });
 });
 
@@ -4402,7 +4421,7 @@ describe('ADR-857 phase 5f: cross-field consistency gate rejection tests (DEFECT
   });
 
   test('GATE A REJECTS: profile-marker-only + hooksSurface="settings-json" → validation error', () => {
-    // profile-marker-only installSurface only allows hooksSurface='none'
+    // profile-marker-only allows none | kimi-hooks-toml | grok-hooks-json — not settings-json
     const cap = makeValidRuntimeCap({
       runtime: {
         installSurface: 'profile-marker-only',
