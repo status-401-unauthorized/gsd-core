@@ -54,11 +54,35 @@ interface ResolvedProfile {
   agents: Set<string>;
 }
 
+/**
+ * Cross-cutting context for descriptor-driven agent staging (ADR-1235 §1).
+ * Passed as the optional second arg to ArtifactKind.stage() for agents kind
+ * entries so that stageAgentsForRuntimeWithConverter can apply the exact
+ * inline-loop transform order: pathRewrites → attribution → converter → normalize.
+ */
+interface AgentCtx {
+  runtime: string;
+  pathPrefix: string;
+  attribution: string | null | undefined;
+}
+
 interface ArtifactKind {
   kind: KimiArtifactKindName;
   destSubpath: string;
   prefix: string;
-  stage: (resolvedProfile: ResolvedProfile) => string;
+  /** For agents kind with a converter, accepts an optional AgentCtx as the second
+   *  arg so cross-cutting can be applied pre-converter (ADR-1235 §1). */
+  stage: (resolvedProfile: ResolvedProfile, agentCtx?: AgentCtx) => string;
+  /** Resolved absolute alternate install root for this kind, if the descriptor
+   *  specifies one (e.g. codex skills → $HOME/.agents). Undefined means the
+   *  kind installs under the runtime's normal configDir. */
+  home?: string;
+  /** Name of the converter function in Runtime Artifact Conversion exports, as
+   *  declared on the descriptor's `converter` field. Only populated for the
+   *  `skills` kind today — lets bespoke callers (e.g. the OpenCode-family
+   *  combined installer, ADR-1239 / #2093) look up the descriptor-declared
+   *  converter by name instead of re-deriving it from a runtime === check. */
+  converter?: string;
 }
 
 interface Layout {
@@ -175,6 +199,28 @@ function agentsKind(destSubpath: string, prefix: string, configDir: string): Art
  * Agent filenames are preserved verbatim (the prefix is already embedded in the
  * agent stem — e.g. `gsd-planner.md`).
  *
+ * #1173 SCOPE — plumbing only (real install still elsewhere): this provides
+ * the converter dispatch + `isGlobal` scope threading for the descriptor's
+ * `agents` kind. As of #2092, 8 non-Claude runtimes DO declare a converted
+ * `agents` kind in their `capability.json` — qwen (`convertClaudeAgentToQwenAgent`)
+ * plus the 7 that already declared one before it (antigravity, augment,
+ * codebuddy, copilot, cursor, trae, windsurf) — so the descriptor-level
+ * declaration is no longer deferred. What IS still deferred is wiring
+ * `resolveRuntimeArtifactLayout`'s `agents` kind into the REAL install:
+ * `bin/install.js`'s agent-staging loop does not consume this module's
+ * `convertedAgentsKind` resolution at all — it dispatches the very same
+ * converter functions directly via `_hostBehaviors(runtime)` checks
+ * (`frontmatterDialect`, `brandingRewrites`, `isCopilot`/`isAntigravity`/…),
+ * duplicating the mapping declared here. That duplication is deliberate until
+ * the second `layout.kinds` consumer — `applySurface` / `/gsd:surface` /
+ * `--materialize` (`src/surface.cts`) — mirrors the legacy agent pipeline
+ * (Copilot's `.agent.md` filename rename, the cross-cutting path-prefix
+ * rewrite + attribution, stale-file cleanup, config-reading steps); declaring
+ * `bin/install.js` itself against this resolver before then would risk
+ * regressing the surface path. Until that follow-up lands, `bin/install.js`
+ * remains authoritative for the real install, and this `convertedAgentsKind`
+ * is exercised only by `/gsd:surface` and synthetic-descriptor seam tests.
+ *
  * Mirrors the `convertedCommandsKind` pattern (#785).
  *
  * @param destSubpath   destination subpath within configDir (e.g. 'agents')
@@ -187,14 +233,28 @@ function convertedAgentsKind(
   prefix: string,
   converterName: string,
   configDir: string,
+  scope: 'local' | 'global' = 'global',
 ): ArtifactKind {
   return {
     kind: 'agents',
     destSubpath,
     prefix,
-    stage: (resolved) => {
-      const converter = conversionExports[converterName] as (content: string) => string;
-      return stageAgentsForRuntimeWithConverter(findAgentsSourceRoot(configDir), resolved, converter);
+    stage: (resolved, agentCtx) => {
+      // isGlobal is threaded so scope-aware agent converters (copilot, antigravity)
+      // choose global-home vs workspace-relative paths; converters that only take
+      // (content) ignore the extra positional arg. Mirrors skillsKind's scope
+      // threading (#1173).
+      const converter = conversionExports[converterName] as (content: string, isGlobal?: boolean) => string;
+      // ADR-1235 §1: when agentCtx is provided (by createRuntimeArtifactInstallPlan
+      // for descriptor-driven runtimes), thread it through so stageAgentsForRuntimeWithConverter
+      // can apply the full pre-converter + post-converter sequence in the correct order.
+      return stageAgentsForRuntimeWithConverter(
+        findAgentsSourceRoot(configDir),
+        resolved,
+        converter,
+        scope === 'global',
+        agentCtx,
+      );
     },
   };
 }
@@ -269,6 +329,7 @@ function skillsKind(
     kind: 'skills',
     destSubpath,
     prefix,
+    converter: converterName,
     stage: (resolved) => {
       const realConverter = conversionExports[converterName] as (content: string, skillName: string, runtime: string, cmdNames: string[], isGlobal: boolean) => string;
       // Compute cmdNames once per stage call for performance (#3583).
@@ -344,12 +405,15 @@ function convertedCommandsKind(
 //     augment    — https://docs.augmentcode.com/cli/skills (flat single-level)
 //     trae       — docs.trae.ai/ide/skills + Trae-AI/TRAE#2253 (flat; nesting errors)
 //                  Trae IDE (trae.ai), not trae-agent — see runtime-homes.cts header note
-//     antigravity— discuss.ai.google.dev/t/more-antigravity-issues/145875 ("will not recursive scan")
-//
 //   FLAT (recursive loader → nesting gives no saving):
 //     cursor     — https://cursor.com/docs/skills (walks skills root recursively)
 //     opencode   — sst/opencode skill/index.ts glob "skills/**/SKILL.md"
 //     kilo       — Kilo-Org/kilocode (opencode fork, same ** glob)
+//
+//   FLAT (one-level scan, but concrete skills must be directly discoverable):
+//     antigravity— https://antigravity.google/docs/skills + /docs/cli-plugins
+//                  (skills live at <skills-dir>/<skill-folder>/SKILL.md; AGY does not
+//                   register router-nested concrete skills as slash commands)
 //
 //   FLAT (reverted from nested — nested skills not discoverable by Skill tool, #924):
 //     claude     — https://code.claude.com/docs/en/skills + anthropics/claude-code#28266
@@ -374,6 +438,10 @@ interface ArtifactKindDescriptor {
   nesting: 'flat' | 'nested';
   recursive: boolean;
   converter: string | null;
+  /** Optional alternate install home, relative to the user's home directory
+   *  (e.g. ".agents" for codex skills → $HOME/.agents/skills). When absent,
+   *  the kind installs under the runtime's normal configDir. */
+  home?: string;
 }
 
 interface ArtifactLayoutDescriptor {
@@ -400,18 +468,19 @@ function dispatchKindEntry(entry: ArtifactKindDescriptor, runtime: string, confi
   const { kind, destSubpath, prefix, nesting, converter } = entry;
   const nested = nesting === 'nested';
 
+  let result: ArtifactKind;
   switch (kind) {
     case 'commands':
-      if (converter == null) {
-        return commandsKind(destSubpath, prefix, configDir);
-      }
-      return convertedCommandsKind(destSubpath, prefix, converter, configDir);
+      result = converter == null
+        ? commandsKind(destSubpath, prefix, configDir)
+        : convertedCommandsKind(destSubpath, prefix, converter, configDir);
+      break;
 
     case 'agents':
-      if (converter == null) {
-        return agentsKind(destSubpath, prefix, configDir);
-      }
-      return convertedAgentsKind(destSubpath, prefix, converter, configDir);
+      result = converter == null
+        ? agentsKind(destSubpath, prefix, configDir)
+        : convertedAgentsKind(destSubpath, prefix, converter, configDir, scope);
+      break;
 
     case 'skills':
       if (converter == null) {
@@ -419,16 +488,24 @@ function dispatchKindEntry(entry: ArtifactKindDescriptor, runtime: string, confi
           `resolveRuntimeArtifactLayout: skills entry for '${runtime}' has converter=null (converter is required for skills)`,
         );
       }
-      return skillsKind(destSubpath, prefix, converter, runtime, configDir, nested, scope);
+      result = skillsKind(destSubpath, prefix, converter, runtime, configDir, nested, scope);
+      break;
 
     case 'kimi-agents':
-      return kimiAgentsKind(destSubpath, prefix, configDir);
+      result = kimiAgentsKind(destSubpath, prefix, configDir);
+      break;
 
     default:
       throw new TypeError(
         `resolveRuntimeArtifactLayout: unknown kind '${kind}' in descriptor for runtime '${runtime}'`,
       );
   }
+
+  if (typeof entry.home === 'string' && entry.home !== '') {
+    result.home = path.join(os.homedir(), entry.home);
+  }
+
+  return result;
 }
 
 /**

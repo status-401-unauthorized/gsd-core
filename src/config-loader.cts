@@ -108,6 +108,7 @@ const CONFIG_DEFAULTS = {
   verifier: _getNestedConfigDefault('workflow', 'verifier'),
   nyquist_validation: _getNestedConfigDefault('workflow', 'nyquist_validation'),
   ai_integration_phase: _getNestedConfigDefault('workflow', 'ai_integration_phase'),
+  api_coverage_gate: _getNestedConfigDefault('workflow', 'api_coverage_gate'),
   parallelization: _getConfigDefault('parallelization'),
   brave_search: _getConfigDefault('brave_search'),
   firecrawl: _getConfigDefault('firecrawl'),
@@ -138,6 +139,11 @@ function _deepMergeConfig(base: Record<string, unknown>, overlay: Record<string,
   if (typeof base !== 'object' || typeof overlay !== 'object') return overlay;
   const result: Record<string, unknown> = { ...base };
   for (const key of Object.keys(overlay)) {
+    // Prototype-pollution guard — mirrors the four sibling guards in this file
+    // (lines ~315/319/331/341/549). Without it a workstream/root config.json with
+    // {"__proto__": {...}} pollutes this merged object's prototype chain and can
+    // spoof unset config flags. (Per-object pollution, not global Object.prototype.)
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     if (overlay[key] !== null && typeof overlay[key] === 'object' && !Array.isArray(overlay[key])) {
       result[key] = _deepMergeConfig((base[key] ?? {}) as Record<string, unknown>, overlay[key] as Record<string, unknown>);
     } else {

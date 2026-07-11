@@ -8,6 +8,13 @@
  * behavior is asserted via the install module's exported pure functions
  * (`runtimeMap`, `allRuntimes`, `parseRuntimeInput`, `buildRuntimePromptText`)
  * instead of regexing bin/install.js source text.
+ *
+ * #1928: Google sunset Gemini CLI (2026-06-18) and the `gemini` runtime was
+ * removed from GSD (Antigravity CLI is the successor). The runtime option
+ * numbering below is renumbered accordingly — option 9 (formerly gemini) is
+ * now hermes, and the "All" shortcut moved from 17 to 16.
+ *
+ * #1925: ZCode (Z.ai) added as option 16; the "All" shortcut moved from 16 to 17.
  */
 
 process.env.GSD_TEST_MODE = '1';
@@ -42,51 +49,55 @@ describe('multi-runtime selection parsing', () => {
   });
 
   test('comma-separated choices return multiple runtimes', () => {
-    assert.deepStrictEqual(parseRuntimeInput('1,7,9'), ['claude', 'copilot', 'gemini']);
+    assert.deepStrictEqual(parseRuntimeInput('1,7,9'), ['claude', 'copilot', 'grok']);
     assert.deepStrictEqual(parseRuntimeInput('2,3'), ['antigravity', 'augment']);
     assert.deepStrictEqual(parseRuntimeInput('3,6'), ['augment', 'codex']);
   });
 
   test('space-separated choices return multiple runtimes', () => {
-    assert.deepStrictEqual(parseRuntimeInput('1 7 9'), ['claude', 'copilot', 'gemini']);
-    assert.deepStrictEqual(parseRuntimeInput('8 13'), ['cursor', 'kilo']);
+    assert.deepStrictEqual(parseRuntimeInput('1 7 9'), ['claude', 'copilot', 'grok']);
+    assert.deepStrictEqual(parseRuntimeInput('8 12'), ['cursor', 'kilo']);
   });
 
   test('mixed comma and space separators work', () => {
-    assert.deepStrictEqual(parseRuntimeInput('1, 7, 9'), ['claude', 'copilot', 'gemini']);
+    assert.deepStrictEqual(parseRuntimeInput('1, 7, 9'), ['claude', 'copilot', 'grok']);
     assert.deepStrictEqual(parseRuntimeInput('2 , 8'), ['antigravity', 'cursor']);
   });
 
   test('single choice for grok', () => {
-    assert.deepStrictEqual(parseRuntimeInput('10'), ['grok']);
+    assert.deepStrictEqual(parseRuntimeInput('9'), ['grok']);
   });
 
   test('single choice for hermes', () => {
-    assert.deepStrictEqual(parseRuntimeInput('11'), ['hermes']);
+    assert.deepStrictEqual(parseRuntimeInput('10'), ['hermes']);
   });
 
   test('single choice for kimi', () => {
-    assert.deepStrictEqual(parseRuntimeInput('12'), ['kimi']);
+    assert.deepStrictEqual(parseRuntimeInput('11'), ['kimi']);
   });
 
   test('single choice for kilo', () => {
-    assert.deepStrictEqual(parseRuntimeInput('13'), ['kilo']);
+    assert.deepStrictEqual(parseRuntimeInput('12'), ['kilo']);
   });
 
   test('single choice for opencode', () => {
-    assert.deepStrictEqual(parseRuntimeInput('14'), ['opencode']);
+    assert.deepStrictEqual(parseRuntimeInput('13'), ['opencode']);
   });
 
   test('single choice for qwen', () => {
-    assert.deepStrictEqual(parseRuntimeInput('15'), ['qwen']);
+    assert.deepStrictEqual(parseRuntimeInput('14'), ['qwen']);
   });
 
   test('single choice for trae', () => {
-    assert.deepStrictEqual(parseRuntimeInput('16'), ['trae']);
+    assert.deepStrictEqual(parseRuntimeInput('15'), ['trae']);
   });
 
   test('single choice for windsurf', () => {
-    assert.deepStrictEqual(parseRuntimeInput('17'), ['windsurf']);
+    assert.deepStrictEqual(parseRuntimeInput('16'), ['windsurf']);
+  });
+
+  test('single choice for zcode', () => {
+    assert.deepStrictEqual(parseRuntimeInput('17'), ['zcode']);
   });
 
   test('choice 18 returns all runtimes', () => {
@@ -122,12 +133,12 @@ describe('multi-runtime selection parsing', () => {
 
   test('duplicate choices are deduplicated', () => {
     assert.deepStrictEqual(parseRuntimeInput('1,1,1'), ['claude']);
-    assert.deepStrictEqual(parseRuntimeInput('7,7,9,9'), ['copilot', 'gemini']);
+    assert.deepStrictEqual(parseRuntimeInput('7,7,9,9'), ['copilot', 'grok']);
   });
 
   test('preserves selection order', () => {
-    assert.deepStrictEqual(parseRuntimeInput('9,1,7'), ['gemini', 'claude', 'copilot']);
-    assert.deepStrictEqual(parseRuntimeInput('13,2,8'), ['kilo', 'antigravity', 'cursor']);
+    assert.deepStrictEqual(parseRuntimeInput('9,1,7'), ['grok', 'claude', 'copilot']);
+    assert.deepStrictEqual(parseRuntimeInput('12,2,8'), ['kilo', 'antigravity', 'cursor']);
   });
 });
 
@@ -141,20 +152,20 @@ describe('install.js exports multi-select runtime metadata', () => {
     '6': 'codex',
     '7': 'copilot',
     '8': 'cursor',
-    '9': 'gemini',
-    '10': 'grok',
-    '11': 'hermes',
-    '12': 'kimi',
-    '13': 'kilo',
-    '14': 'opencode',
-    '15': 'qwen',
-    '16': 'trae',
-    '17': 'windsurf',
+    '9': 'grok',
+    '10': 'hermes',
+    '11': 'kimi',
+    '12': 'kilo',
+    '13': 'opencode',
+    '14': 'qwen',
+    '15': 'trae',
+    '16': 'windsurf',
+    '17': 'zcode',
   };
   const expectedRuntimes = [
     'claude', 'antigravity', 'augment', 'cline', 'codebuddy', 'codex',
-    'copilot', 'cursor', 'gemini', 'grok', 'hermes', 'kimi', 'kilo', 'opencode',
-    'qwen', 'trae', 'windsurf',
+    'copilot', 'cursor', 'grok', 'hermes', 'kimi', 'kilo', 'opencode',
+    'qwen', 'trae', 'windsurf', 'zcode',
   ];
 
   test('runtimeMap exports every option key bound to the right runtime', () => {
@@ -187,6 +198,10 @@ describe('install.js exports multi-select runtime metadata', () => {
     assert.deepStrictEqual(selectRuntimesFromArgs(['--grok-build']), ['grok']);
   });
 
+  test('--zcode flag selects ZCode without interactive prompt', () => {
+    assert.deepStrictEqual(selectRuntimesFromArgs(['--zcode']), ['zcode']);
+  });
+
   test('--all flag includes Kimi exactly once', () => {
     const selected = selectRuntimesFromArgs(['--all']);
     assert.ok(selected.includes('kimi'), '--all includes kimi');
@@ -201,22 +216,36 @@ describe('install.js exports multi-select runtime metadata', () => {
       '--all includes grok exactly once');
   });
 
-  test('prompt lists Grok Build (10), Hermes Agent (11), Kimi (12), Qwen Code (15), Trae (16), and All (18)', () => {
+  test('--all flag includes ZCode exactly once', () => {
+    const selected = selectRuntimesFromArgs(['--all']);
+    assert.ok(selected.includes('zcode'), '--all includes zcode');
+    assert.strictEqual(selected.filter((runtime) => runtime === 'zcode').length, 1,
+      '--all includes zcode exactly once');
+  });
+
+  test('prompt lists Grok Build (9), Hermes (10), Kimi (11), ZCode (17), and All (18)', () => {
     const prompt = stripAnsi(buildRuntimePromptText());
-    assert.ok(/\b10\)\s*Grok Build\b/.test(prompt),
-      'prompt lists Grok Build as option 10');
-    assert.ok(/\b11\)\s*Hermes Agent\b/.test(prompt),
-      'prompt lists Hermes Agent as option 11');
-    assert.ok(/\b12\)\s*Kimi\b/.test(prompt),
-      'prompt lists Kimi as option 12');
+    assert.ok(/\b9\)\s*Grok Build\b/.test(prompt),
+      'prompt lists Grok Build as option 9');
+    assert.ok(/\b10\)\s*Hermes Agent\b/.test(prompt),
+      'prompt lists Hermes Agent as option 10');
+    assert.ok(/\b11\)\s*Kimi\b/.test(prompt),
+      'prompt lists Kimi as option 11');
     assert.ok(/Kimi\s+\(~\/\.config\/agents, then ~\/\.agents if existing\)/.test(prompt),
       'prompt shows the Kimi first-existing generic root policy');
-    assert.ok(/\b15\)\s*Qwen Code\b/.test(prompt),
-      'prompt lists Qwen Code as option 15');
-    assert.ok(/\b16\)\s*Trae\b/.test(prompt),
-      'prompt lists Trae as option 16');
+    assert.ok(/\b14\)\s*Qwen Code\b/.test(prompt),
+      'prompt lists Qwen Code as option 14');
+    assert.ok(/\b15\)\s*Trae\b/.test(prompt),
+      'prompt lists Trae as option 15');
+    assert.ok(/\b17\)\s*ZCode\b/.test(prompt),
+      'prompt lists ZCode as option 17');
     assert.ok(/\b18\)\s*All\b/.test(prompt),
       'prompt lists All as option 18');
+  });
+
+  test('prompt does not list Gemini (removed #1928)', () => {
+    const prompt = stripAnsi(buildRuntimePromptText());
+    assert.ok(!/Gemini/.test(prompt), 'prompt must not mention Gemini');
   });
 
   test('prompt text shows multi-select hint', () => {

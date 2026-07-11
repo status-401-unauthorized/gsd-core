@@ -1,7 +1,7 @@
 {
   "id": "opencode",
   "role": "runtime",
-  "version": "1.6.0-rc.1",
+  "version": "1.7.0-rc.5",
   "title": "OpenCode",
   "description": "OpenCode — XDG-based config dir; flat command/ + skills artifact layout; settings-json config format; no lifecycle hook registration; tier-2 support.",
   "tier": "core",
@@ -19,6 +19,7 @@
         "XDG_CONFIG_HOME"
       ]
     },
+    "localConfigDir": ".opencode",
     "configFormat": "settings-json",
     "artifactLayout": {
       "global": [
@@ -60,11 +61,46 @@
     },
     "commandStyle": "slash-hyphen",
     "hooksSurface": "none",
+    "extensionEvents": "opencode",
     "sandboxTier": "none",
     "supportTier": 2,
     "installSurface": "settings-json",
     "writesSharedSettings": true,
     "permissionWriter": "opencode",
-    "extendedHookEvents": []
+    "extendedHookEvents": [],
+    "hostIntegration": {
+      "embeddingMode": "imperative",
+      "commandSurface": "slash-file",
+      "dispatch": {
+        "namedDispatch": true,
+        "nested": "undocumented",
+        "maxDepth": "undocumented",
+        "background": true,
+        "subagentToolkit": "full",
+        "backgroundDispatch": true
+      },
+      "modelMode": "active",
+      "hookBus": "host",
+      "stateIO": "filesystem",
+      "transport": "mcp",
+      "runtime": "bun"
+    },
+    "hostBehaviors": {
+      "reapplyCommand": "/gsd-update --reapply",
+      "attributionConfigResolver": "opencode",
+      "flatCommandDir": "command",
+      "combinedFamilyInstall": true,
+      "frontmatterDialect": "opencode",
+      "nativePlugin": {
+        "dir": "plugins",
+        "file": "gsd-core.js",
+        "source": ".opencode/plugins/gsd-core.js"
+      },
+      "skipHomePrefixSubstitution": true,
+      "skipSettingsUi": true,
+      "skipUpdateBannerCommand": true,
+      "skipCodexSkillsManifest": true,
+      "reviewerCli": true
+    }
   }
 }

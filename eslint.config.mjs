@@ -15,6 +15,15 @@ import noElapsedAssertion from './eslint-rules/no-elapsed-assertion.cjs';
 import noRawRmsyncInTests from './eslint-rules/no-raw-rmsync-in-tests.cjs';
 import noTautologicalAssert from './eslint-rules/no-tautological-assert.cjs';
 import noAdhocMarkdownParsing from './eslint-rules/no-adhoc-markdown-parsing.cjs';
+import noPathLiteralInAssert from './eslint-rules/no-path-literal-in-assert.cjs';
+import noPosixModeBitAssert from './eslint-rules/no-posix-mode-bit-assert.cjs';
+import noUnguardedNonportableExec from './eslint-rules/no-unguarded-nonportable-exec.cjs';
+import noCrlfFragileSplit from './eslint-rules/no-crlf-fragile-split.cjs';
+import noHardcodedTmp from './eslint-rules/no-hardcoded-tmp.cjs';
+import noBareNpmExec from './eslint-rules/no-bare-npm-exec.cjs';
+import requireUserprofileWithHome from './eslint-rules/require-userprofile-with-home.cjs';
+import normalizePathInContent from './eslint-rules/normalize-path-in-content.cjs';
+import requireFsOpFallback from './eslint-rules/require-fs-op-fallback.cjs';
 
 const localPlugin = {
   rules: {
@@ -24,6 +33,15 @@ const localPlugin = {
     'no-raw-rmsync-in-tests': noRawRmsyncInTests,
     'no-tautological-assert': noTautologicalAssert,
     'no-adhoc-markdown-parsing': noAdhocMarkdownParsing,
+    'no-path-literal-in-assert': noPathLiteralInAssert,
+    'no-posix-mode-bit-assert': noPosixModeBitAssert,
+    'no-unguarded-nonportable-exec': noUnguardedNonportableExec,
+    'no-crlf-fragile-split': noCrlfFragileSplit,
+    'no-hardcoded-tmp': noHardcodedTmp,
+    'no-bare-npm-exec': noBareNpmExec,
+    'require-userprofile-with-home': requireUserprofileWithHome,
+    'normalize-path-in-content': normalizePathInContent,
+    'require-fs-op-fallback': requireFsOpFallback,
   },
 };
 
@@ -38,7 +56,14 @@ export default tseslint.config(
       'coverage/**',
       '**/*.generated.cjs',
       // ADR-457: tsc-generated runtime artifact — lint the src/*.cts source, not the emitted .cjs.
+      'gsd-core/bin/lib/claude-orchestration.cjs',
+      'gsd-core/bin/lib/claude-orchestration-command-router.cjs',
       'gsd-core/bin/lib/semver-compare.cjs',
+      'gsd-core/bin/lib/host-integration.cjs',
+      'gsd-core/bin/lib/handshake-serialized.cjs',
+      'gsd-core/bin/lib/host-integration-sdk.cjs',
+      'gsd-core/bin/lib/install-effort-resolver.cjs',
+      'gsd-core/bin/lib/install-engine.cjs',
       'gsd-core/bin/lib/capability-loader.cjs',
       'gsd-core/bin/lib/capability-source.cjs',
       'gsd-core/bin/lib/capability-ledger.cjs',
@@ -49,12 +74,18 @@ export default tseslint.config(
       'gsd-core/bin/lib/resolution.cjs',
       'gsd-core/bin/lib/plan-drift-guard.cjs',
       'gsd-core/bin/lib/cli-exit.cjs',
+      'gsd-core/bin/lib/external-job.cjs',
       'gsd-core/bin/lib/edge-probe.cjs',
       'gsd-core/bin/lib/probe-core.cjs',
+      'gsd-core/bin/lib/spec-section.cjs',
       'gsd-core/bin/lib/prohibition-enforcement.cjs',
+      'gsd-core/bin/lib/ui-consideration-probe.cjs',
       'gsd-core/bin/lib/code-review-flags.cjs',
       'gsd-core/bin/lib/context-utilization.cjs',
+      'gsd-core/bin/lib/api-coverage.cjs',
       'gsd-core/bin/lib/artifacts.cjs',
+      'gsd-core/bin/lib/assumption-delta.cjs',
+      'gsd-core/bin/lib/state-transition.cjs',
       'gsd-core/bin/lib/command-arg-projection.cjs',
       'gsd-core/bin/lib/clock.cjs',
       'gsd-core/bin/lib/ui-safety-gate.cjs',
@@ -65,6 +96,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/installer-migration-report.cjs',
       'gsd-core/bin/lib/prompt-budget.cjs',
       'gsd-core/bin/lib/secrets.cjs',
+      'gsd-core/bin/lib/smart-entry.cjs',
       'gsd-core/bin/lib/phase-lifecycle.cjs',
       'gsd-core/bin/lib/workstream-name-policy.cjs',
       'gsd-core/bin/lib/decisions.cjs',
@@ -112,6 +144,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/planning-workspace.cjs',
       'gsd-core/bin/lib/command-roster.cjs',
       'gsd-core/bin/lib/runtime-artifact-conversion.cjs',
+      'gsd-core/bin/lib/runtime-artifact-install-plan.cjs',
       'gsd-core/bin/lib/runtime-artifact-layout.cjs',
       'gsd-core/bin/lib/runtime-config-adapter-registry.cjs',
       'gsd-core/bin/lib/runtime-hooks-surface.cjs',
@@ -119,6 +152,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/core-utils.cjs',
       'gsd-core/bin/lib/io.cjs',
       'gsd-core/bin/lib/phase-id.cjs',
+      'gsd-core/bin/lib/normalize-test-command.cjs',
       'gsd-core/bin/lib/config-loader.cjs',
       'gsd-core/bin/lib/phase-locator.cjs',
       'gsd-core/bin/lib/roadmap-parser.cjs',
@@ -132,7 +166,10 @@ export default tseslint.config(
       'gsd-core/bin/lib/verify-command-router.cjs',
       'gsd-core/bin/lib/verification.cjs',
       'gsd-core/bin/lib/verification-command-router.cjs',
+      'gsd-core/bin/lib/eval.cjs',
+      'gsd-core/bin/lib/eval-command-router.cjs',
       'gsd-core/bin/lib/init-command-router.cjs',
+      'gsd-core/bin/lib/onboard-projection.cjs',
       'gsd-core/bin/lib/agent-command-router.cjs',
       'gsd-core/bin/lib/agent-install-check.cjs',
       'gsd-core/bin/lib/task-command-router.cjs',
@@ -141,6 +178,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/roadmap-command-router.cjs',
       'gsd-core/bin/lib/state-command-router.cjs',
       'gsd-core/bin/lib/gap-checker.cjs',
+      'gsd-core/bin/lib/gate-predicate-evaluator.cjs',
       'gsd-core/bin/lib/config.cjs',
       'gsd-core/bin/lib/profile-output.cjs',
       'gsd-core/bin/lib/commands.cjs',
@@ -157,6 +195,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/profile-pipeline.cjs',
       'gsd-core/bin/lib/template.cjs',
       'gsd-core/bin/lib/uat.cjs',
+      'gsd-core/bin/lib/coverage.cjs',
       'gsd-core/bin/lib/uat-predicate.cjs',
       'gsd-core/bin/lib/workstream.cjs',
       'gsd-core/bin/lib/roadmap.cjs',
@@ -168,10 +207,21 @@ export default tseslint.config(
       'gsd-core/bin/lib/git-base-branch.cjs',
       // ADR-1213: tsc-generated runtime artifact — lint the src/capability-writer.cts source.
       'gsd-core/bin/lib/capability-writer.cjs',
+      // issue #1754: tsc-generated runtime artifact — lint the src/cli-skew-check.cts source.
+      'gsd-core/bin/lib/cli-skew-check.cjs',
       // issue #1355: tsc-generated runtime artifact — lint the src/teams-status.cts source.
       'gsd-core/bin/lib/teams-status.cjs',
       // ADR-1372: tsc-generated runtime artifact — lint the src/markdown-sectionizer.cts source.
       'gsd-core/bin/lib/markdown-sectionizer.cjs',
+      // ADR-1239 Phase C-1 (#1680): tsc-generated — lint src/embedding-adapter.cts + src/adapter-declarative.cts.
+      'gsd-core/bin/lib/embedding-adapter.cjs',
+      'gsd-core/bin/lib/adapter-declarative.cjs',
+      'gsd-core/bin/lib/adapter-imperative.cjs',
+      'gsd-core/bin/lib/model-adapter.cjs',
+      'gsd-core/bin/lib/hook-bus.cjs',
+      'gsd-core/bin/lib/state-io.cjs',
+      'gsd-core/bin/lib/external-descriptor-trust.cjs',
+      'gsd-core/bin/lib/mcp-server.cjs',
     ],
   },
 
@@ -196,6 +246,42 @@ export default tseslint.config(
       // ADR-1372 T7: enforce use of the markdown-sectionizer seam; grandfather
       // pre-migration sites with // allow-adhoc-markdown: <reason>
       'local/no-adhoc-markdown-parsing': 'error',
+      // ADR-1703 Phase 5: flag path-returning calls interpolated into content
+      // (markdown @-references, workflow files, generated docs) without POSIX
+      // normalization. Promoted to 'error' after precision review (path.basename
+      // excluded; content heuristic tightened to genuine reference/config-dir
+      // markers). See RULESET.CONTENT-PATH-NORMALIZATION in CONTEXT.md.
+      'local/normalize-path-in-content': 'error',
+      // ADR-1703 Phase 6: flag an unguarded fs.rename/fs.renameSync (the
+      // atomic-publish primitive) that lacks a transient-errno fallback
+      // (EPERM/EBUSY/EACCES retry or a Windows platform guard). See
+      // DEFECT.WINDOWS-FS-OPS in CONTEXT.md.
+      'local/require-fs-op-fallback': 'error',
+    },
+  },
+
+  // ── bin/install.js + scripts/build-hooks.js — ADR-1703 Phase 6 glob expansion ─
+  // The top-level `bin/install.js` (generated installer) and `scripts/build-hooks.js`
+  // (the build-side atomic-replace helper) are the two production surfaces named by
+  // DEFECT.WINDOWS-FS-OPS that were NOT covered by the src/**/*.cts / gsd-core/bin/**/*.cjs
+  // globs (ADR-1703 L124-126). This block brings them under the two production
+  // portability rules. It deliberately does NOT apply the full js.recommended set —
+  // bin/install.js is ~12k lines of generated code; the ADR's mandate is the
+  // portability defect surface, not a broader generated-code style sweep.
+  {
+    files: ['bin/install.js', 'bin/gsd-mcp-server.js', 'scripts/build-hooks.js'],
+    plugins: {
+      local: localPlugin,
+    },
+    languageOptions: {
+      sourceType: 'commonjs',
+      globals: {
+        ...globals.node,
+      },
+    },
+    rules: {
+      'local/normalize-path-in-content': 'error',
+      'local/require-fs-op-fallback': 'error',
     },
   },
 
@@ -260,6 +346,20 @@ export default tseslint.config(
       'local/no-tautological-assert': 'error',
       // Ban source-grep pattern in tests — use require() + behavior assertions instead
       'local/no-source-grep': 'error',
+      // Ban path-returning calls compared to hardcoded POSIX-slash literals (fails on Windows)
+      'local/no-path-literal-in-assert': 'error',
+      // Ban POSIX mode-bit assertions compared to octal literals (fails on Windows)
+      'local/no-posix-mode-bit-assert': 'error',
+      // Ban unguarded chmod exec-bit + sh/bash -c combos (fails on Windows Git Bash)
+      'local/no-unguarded-nonportable-exec': 'error',
+      // Ban CRLF-fragile file-content splits and regex patterns (ADR-1703 Phase 4)
+      'local/no-crlf-fragile-split': 'error',
+      // Ban hardcoded /tmp/ paths in fs.* calls (ADR-1703 Phase 4)
+      'local/no-hardcoded-tmp': 'error',
+      // Ban bare npm exec without shell:true (ADR-1703 Phase 4)
+      'local/no-bare-npm-exec': 'error',
+      // Require USERPROFILE alongside HOME assignments (ADR-1703 Phase 4)
+      'local/require-userprofile-with-home': 'error',
       // Ban raw setTimeout sync + elapsed/duration-style assertions via no-restricted-syntax
       'no-restricted-syntax': [
         'error',
@@ -296,6 +396,19 @@ export default tseslint.config(
   // project's own `eslint .` green. (#1279)
   {
     files: ['tests/_ff_lint_violation.cjs'],
+    plugins: { local: localPlugin },
+    languageOptions: { sourceType: 'commonjs', globals: { ...globals.node } },
+    rules: { 'local/no-source-grep': 'error' },
+  },
+  // ── #2126 lint-rule CLEAN fixture ───────────────────────────────────────────
+  // `tests/_ff_lint_clean.cjs` is the KNOWN-CLEAN companion to the violation fixture: the
+  // prohibition-enforcement real-runner tests lint it as their non-vacuous "clean target" instead of
+  // a type-aware `src/**/*.cts` file, so each eslint spawn is ~0.8s (non-type-aware) not ~2s
+  // (whole-tsconfig-program load) — removing the CPU starvation that blew the 60s bound under
+  // --test-concurrency. Rule enabled (as error) so the pass is non-vacuous; the file is clean so it
+  // greens. PLAIN `.cjs`, kept OFF the `*.test.cjs` runner glob. (#2126)
+  {
+    files: ['tests/_ff_lint_clean.cjs'],
     plugins: { local: localPlugin },
     languageOptions: { sourceType: 'commonjs', globals: { ...globals.node } },
     rules: { 'local/no-source-grep': 'error' },

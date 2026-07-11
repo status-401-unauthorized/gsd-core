@@ -1,7 +1,7 @@
 {
   "id": "qwen",
   "role": "runtime",
-  "version": "1.6.0-rc.1",
+  "version": "1.7.0-rc.5",
   "title": "Qwen Code",
   "description": "Qwen Code (Alibaba) — nested-skill artifact layout; settings-json hook surface; Claude hook event dialect; tier-2 support.",
   "tier": "core",
@@ -17,6 +17,7 @@
         "QWEN_CONFIG_DIR"
       ]
     },
+    "localConfigDir": ".qwen",
     "configFormat": "settings-json",
     "artifactLayout": {
       "global": [
@@ -27,6 +28,14 @@
           "nesting": "nested",
           "recursive": false,
           "converter": "convertClaudeCommandToClaudeSkill"
+        },
+        {
+          "kind": "agents",
+          "destSubpath": "agents",
+          "prefix": "gsd-",
+          "nesting": "flat",
+          "recursive": false,
+          "converter": "convertClaudeAgentToQwenAgent"
         }
       ],
       "local": [
@@ -37,6 +46,14 @@
           "nesting": "nested",
           "recursive": false,
           "converter": "convertClaudeCommandToClaudeSkill"
+        },
+        {
+          "kind": "agents",
+          "destSubpath": "agents",
+          "prefix": "gsd-",
+          "nesting": "flat",
+          "recursive": false,
+          "converter": "convertClaudeAgentToQwenAgent"
         }
       ]
     },
@@ -51,7 +68,34 @@
     "extendedHookEvents": [
       "SubagentStop",
       "Stop",
-      "PreCompact"
-    ]
+      "PreCompact",
+      "SubagentStart"
+    ],
+    "hostIntegration": {
+      "embeddingMode": "imperative",
+      "commandSurface": "slash-file",
+      "dispatch": {
+        "namedDispatch": true,
+        "nested": false,
+        "maxDepth": 1,
+        "background": true,
+        "subagentToolkit": "full",
+        "backgroundDispatch": false
+      },
+      "modelMode": "passive",
+      "hookBus": "host",
+      "stateIO": "filesystem",
+      "transport": "mcp",
+      "runtime": "node"
+    },
+    "hostBehaviors": {
+      "skillPriorityFrontmatter": true,
+      "brandingRewrites": { "CLAUDE.md": "QWEN.md", "Claude Code": "Qwen Code", ".claude/": ".qwen/" },
+      "legacyCommandsGsdCleanup": true,
+      "legacyCommandsGsdInstallMigration": true,
+      "legacyCommandsGsdUninstall": true,
+      "hyphenNameAgentBody": true,
+      "reviewerCli": true
+    }
   }
 }

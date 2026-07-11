@@ -67,6 +67,22 @@ build/
 # by `npm run build:lib`). Source of truth is src/; these are emitted, never edited.
 # Published via prepublishOnly; built before test via pretest. Grows as modules migrate.
 /tsconfig.build.tsbuildinfo
+/gsd-core/bin/lib/host-integration.cjs
+/gsd-core/bin/lib/host-integration-sdk.cjs
+/gsd-core/bin/lib/host-integration-adapters/imperative-hook-bus.cjs
+/gsd-core/bin/lib/host-integration-adapters/cline-sdk-binding.cjs
+/gsd-core/bin/lib/handshake-serialized.cjs
+/gsd-core/bin/lib/install-effort-resolver.cjs
+/gsd-core/bin/lib/install-engine.cjs
+/gsd-core/bin/lib/embedding-adapter.cjs
+/gsd-core/bin/lib/adapter-declarative.cjs
+/gsd-core/bin/lib/adapter-imperative.cjs
+/gsd-core/bin/lib/model-adapter.cjs
+/gsd-core/bin/lib/hook-bus.cjs
+/gsd-core/bin/lib/state-io.cjs
+/gsd-core/bin/lib/mcp-server.cjs
+/gsd-core/bin/lib/external-descriptor-trust.cjs
+/gsd-core/bin/lib/cli-skew-check.cjs
 /gsd-core/bin/lib/capability-loader.cjs
 /gsd-core/bin/lib/capability-source.cjs
 /gsd-core/bin/lib/capability-ledger.cjs
@@ -83,7 +99,9 @@ build/
 /gsd-core/bin/lib/plan-drift-guard.cjs
 /gsd-core/bin/lib/edge-probe.cjs
 /gsd-core/bin/lib/probe-core.cjs
+/gsd-core/bin/lib/spec-section.cjs
 /gsd-core/bin/lib/prohibition-enforcement.cjs
+/gsd-core/bin/lib/ui-consideration-probe.cjs
 /gsd-core/bin/lib/config-types.cjs
 /gsd-core/bin/lib/cli-exit.cjs
 /gsd-core/bin/lib/code-review-flags.cjs
@@ -99,6 +117,7 @@ build/
 /gsd-core/bin/lib/installer-migration-report.cjs
 /gsd-core/bin/lib/prompt-budget.cjs
 /gsd-core/bin/lib/secrets.cjs
+/gsd-core/bin/lib/smart-entry.cjs
 /gsd-core/bin/lib/phase-lifecycle.cjs
 /gsd-core/bin/lib/workstream-name-policy.cjs
 /gsd-core/bin/lib/decisions.cjs
@@ -151,6 +170,7 @@ build/
 /gsd-core/bin/lib/core-utils.cjs
 /gsd-core/bin/lib/io.cjs
 /gsd-core/bin/lib/phase-id.cjs
+/gsd-core/bin/lib/normalize-test-command.cjs
 /gsd-core/bin/lib/config-loader.cjs
 /gsd-core/bin/lib/model-resolver.cjs
 /gsd-core/bin/lib/loop-resolver.cjs
@@ -165,6 +185,7 @@ build/
 /gsd-core/bin/lib/phase-command-router.cjs
 /gsd-core/bin/lib/surface.cjs
 /gsd-core/bin/lib/gap-checker.cjs
+/gsd-core/bin/lib/gate-predicate-evaluator.cjs
 /gsd-core/bin/lib/docs.cjs
 /gsd-core/bin/lib/check-command-router.cjs
 /gsd-core/bin/lib/frontmatter.cjs
@@ -174,7 +195,10 @@ build/
 /gsd-core/bin/lib/roadmap-upgrade.cjs
 /gsd-core/bin/lib/phases-command-router.cjs
 /gsd-core/bin/lib/verify-command-router.cjs
+/gsd-core/bin/lib/eval.cjs
+/gsd-core/bin/lib/eval-command-router.cjs
 /gsd-core/bin/lib/init-command-router.cjs
+/gsd-core/bin/lib/onboard-projection.cjs
 /gsd-core/bin/lib/agent-command-router.cjs
 /gsd-core/bin/lib/agent-install-check.cjs
 /gsd-core/bin/lib/task-command-router.cjs
@@ -192,6 +216,7 @@ build/
 /gsd-core/bin/lib/verify.cjs
 /gsd-core/bin/lib/init.cjs
 /gsd-core/bin/lib/uat.cjs
+/gsd-core/bin/lib/coverage.cjs
 /gsd-core/bin/lib/uat-predicate.cjs
 /gsd-core/bin/lib/workstream.cjs
 /gsd-core/bin/lib/roadmap.cjs
@@ -228,3 +253,7 @@ reports/mutation/
 # Local Crabbox machine configuration
 .crabbox.yaml
 .crabbox.local.yaml
+
+# Memtrace local daemon/runtime state (per-machine; never committed)
+.memdb/
+.memtrace/

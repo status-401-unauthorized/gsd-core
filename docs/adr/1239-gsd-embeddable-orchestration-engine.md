@@ -1,6 +1,6 @@
 # ADR-1239: GSD as an Embeddable Orchestration Engine
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-14
 - **Issue:** [#1239](https://github.com/open-gsd/gsd-core/issues/1239)
 - **Epic:** [#857](https://github.com/open-gsd/gsd-core/issues/857) (Capability system)
@@ -85,11 +85,69 @@ The **primitive vocabulary stays closed and first-party** (ADR-857 Decision 8): 
 
 Each phase is its own `approved-*` issue + PR with equivalence/parity proof.
 
+### Amendment — Phase A implemented (#1684, v1.7.0)
+
+Phase A is **implemented** and Phases B–E have landed, so this ADR is **Accepted** (Status flipped from `Proposed` once Phase E shipped the published SDK + serialized handshake + versioning policy + Diátaxis docs). The negotiated capability schema is materialized as a pure, additive, no-I/O module — the **Host-Integration Interface** (`src/host-integration.cts` → `gsd-core/bin/lib/host-integration.cjs`):
+
+- **The eight negotiated axes** are carried under `capability.json` `runtime.hostIntegration` (extending, not replacing, the ADR-1016 axes), validated by `validateRuntimeBody` (`capability-validator.cjs`) across all 16 runtime descriptors, with the closed vocabulary kept in lock-step by a parity guard.
+- **`PROTOCOL_VERSION`** is an integer starting at `1`, **distinct** from the package `version` / `engines.gsd` semver (the `version`/`protocolVersion` overlap, resolved).
+- **`negotiateHostCapabilities(host, engine?)`** performs the in-process `initialize` exchange and enforces the trust-boundary invariant `effective ⊆ host-declared ∩ engine-known`: an undeclared axis or an unknown / higher-`protocolVersion` value is **never** trusted — it degrades to the most-restrictive known value (fail-closed), never throws.
+- **`degradationFor`** is the typed Full/Degraded/Absent ladder table; **`profileOf` + `PROFILE_BASELINES`** classify each descriptor into `programmatic-cli` (9 hosts: claude, opencode, cursor, cline, hermes, qwen, kilo, trae, kimi), `declarative-cli` (7 hosts: codex, gemini, antigravity, augment, codebuddy, copilot, windsurf), or `ide` (defined as a baseline; no installed host yet — VS Code lands in Phase D).
+- **Overlap resolutions (explicit):** `commandStyle` (GSD emission style, retained) ⊥ `commandSurface` (host surface type); `hookEvents` dialect ⊥ `hookBus` ownership (a host with `hooksSurface:none` may still be `hookBus:host` — e.g. opencode); `runtimeCompat` (feature→host) stays an independent override, orthogonal to these runtime→engine axes.
+- **`extensionEvents` vocabulary (amendment, #1943).** The OpenCode extension-system event subset is a SEPARATE descriptor field + closed vocabulary, **not** a `hookEvents` value. `hookEvents` is the *managed-hook* dialect only (`claude`/`gemini`) — the event names GSD writes into a declarative host's settings.json. `extensionEvents` is the *plugin/extension-system* event surface an imperative host exposes: `{ opencode, pi, none }` (OpenCode ~25 plugin events; pi ~30 fine-grained events; `none` = the host exposes no extension surface and the engine owns the bus, e.g. VS Code). The former `opencode-subset` `hookEvents` value was this concept misfiled; it is now `extensionEvents: opencode`. Keeping them separate preserves the `hooksSurface:"none" ⇔ no-hookEvents` invariant (OpenCode declares `extensionEvents`, not `hookEvents`). Resolved by `extensionEventSurfaceFor` in `src/host-integration.cts`, validated by `VALID_EXTENSION_EVENTS` in `capability-validator.cjs`.
+
+**Every per-host axis value is documentation-sourced, with citations.** Each of the 8 axes for all 16 installed CLIs was determined from that CLI's authoritative documentation (Context7 + the official dev docs/source), never inferred. The full per-CLI, per-axis matrix — value, source, and an evidence quote — is recorded in [`docs/reference/host-integration-capability-matrix.md`](reference/host-integration-capability-matrix.md), the deployment source-of-truth that Phases B–E build on. Where a CLI's docs genuinely do not state an axis, the descriptor carries the explicit `undocumented` sentinel (which `negotiateHostCapabilities` fail-closes on) rather than a guessed value — 22 such markers exist today, each with its search trail in the matrix. Two findings corrected this ADR's original appendix matrix: (1) current OpenAI **Codex** docs document slash-commands, so its `commandSurface` is `slash-file`, not `prose-only`; (2) several hosts run non-Node runtimes (opencode & kilo on **bun**; hermes & kimi on **python**; antigravity on **go**), so the `runtime` axis vocabulary was widened to `node|bun|sandboxed-web|python|go|rust|electron|other`. The documented `embeddingMode` split (9 imperative / 7 declarative, above) likewise reflects each CLI's real plugin/extension API, not a profile assumption.
+
+No consumer wires the negotiated result yet — Phase A is interface-definition only; the engine↔host boundary (Phase B) and the adapters (Phase C) are where it is consumed.
+
 ## Host-capability profiles (negotiation baselines)
 
 - **Programmatic-CLI** (Claude Code, pi, OpenCode): imperative; full dispatch; host hook bus; MCP; `slash` surface. The richest target — minimal degradation.
 - **Declarative-CLI** (Gemini, Cursor, Codex, Cline-rules, Hermes): declarative (projection); host hook bus or none; passive model; shallow/flat dispatch; MCP (except via rules). The ADR-1016 path.
 - **IDE** (VS Code): imperative but *not a terminal* — palette/chat surface, engine-owned hook bus, `active` model (no system messages), sandboxed state, possible no-`child_process`. A distinct profile that most stresses the interface.
+
+## OpenCode binding (worked host-plugin)
+
+> **Amendment — OpenCode worked binding (#1239, 2026-06-22).** Makes the abstract *programmatic-CLI* profile concrete for OpenCode, grounded in its plugin API (`opencode.ai/docs/plugins`, retrieved 2026-06-22) — the first reference target for Phase D. It is also the answer to "can a GSD *capability* be a standalone OpenCode plugin": **the skills can; the loop overlay cannot — without the engine.**
+
+### What an OpenCode plugin actually is (the binding substrate)
+
+A plugin is a JS/TS module exporting an `async` function that returns a **hooks object**. It is loaded either from `.opencode/plugins/` (project) / `~/.config/opencode/plugins/` (global), or as an npm package named in `opencode.json` `"plugin": [...]` (installed with Bun at startup; deps via `.opencode/package.json`). The function receives `{ project, directory, worktree, client, $ }` — `client` is the OpenCode SDK, `$` is Bun's shell. Extension primitives: an `event` hook (the bus), `tool.execute.before`/`after` interceptors, per-tool `tool: { name: tool({...}) }` custom tools, `shell.env` injection, `experimental.session.compacting` context/prompt injection, and `client.app.log` structured logging. **This is the entire imperative adapter surface for OpenCode** — there is nothing phase-aware in it.
+
+### Six interface points → OpenCode primitives
+
+| Point | OpenCode binding | Negotiated axis value | Degradation |
+|---|---|---|---|
+| 1 Command | slash-file commands projected to the xdg command dir (`gsd:`-namespaced); plugin may also surface entrypoints as custom `tool()`s and drive `tui.command.execute` | `commandSurface: slash-file` | none (full) |
+| 2 Dispatch | `mode: subagent` / `@`-mention; `subtask` is **synchronous-only** | `dispatch: { namedDispatch:true, nested:true, background:false, subagentToolkit:'full' }` | no background → waves run inline (the #853 flatten rule) |
+| 3 Model | per-agent `model` field on the agent `.md`; no provider `sendRequest` | `modelMode: passive` | tier routing degrades to per-agent model field |
+| 4 Hooks | host `event` bus (~25 events) | `hookBus: host`; `extensionEvents: opencode` (Phase D / #1943) | session/tool-scoped only — see gap below |
+| 5 State | filesystem `.planning/` + config under xdg `~/.config/opencode`; `opencode-jsonc` permissions sidecar (`permissionWriter: 'opencode'`) | `stateIO: filesystem` | `configHome` write-confinement applies |
+| 6 Artifact | native Agent Skills + `@agent` subagents + slash commands | — | none (full) |
+
+**Portable event floor → OpenCode events:** `SessionStart` ≈ plugin-init + `session.created`; `PreToolUse`/`PostToolUse` ≈ `tool.execute.before`/`after`; `Stop` ≈ `session.idle`; `SessionEnd` ≈ `session.deleted`; `PreCompact` ≈ `experimental.session.compacting`. `shell.env` covers env injection; `command.executed`, `file.edited`, and `permission.asked`/`replied` are extended events GSD can subscribe to but does not require.
+
+### The load-bearing gap: the loop is phase-scoped, the bus is session-scoped
+
+OpenCode's bus fires on **sessions, tools, files, and permissions** — never on **workflow phases**. GSD's 12 loop extension points (`plan:pre`, `verify:post`, `ship:post`…) have **no event on this bus**. So the imperative adapter for OpenCode cannot drive the loop *from host events*; the engine must own phase sequencing internally and treat OpenCode's bus as a **subset extension-event surface** — exactly what the `extensionEvents: opencode` vocabulary encodes (amendment #1943; formerly misfiled as a `hookEvents` value `opencode-subset`). Concretely:
+
+- **Steps, gates, and most contributions fire from GSD's own workflow/command invocation (point 1), engine-side** — not from the host bus. The plugin invokes `gsd-tools.cjs` (via `$` or the companion MCP server) and the engine runs the loop resolver.
+- **Only the contributions that align with a real host event bind to the bus.** The clean case is memory: a MemPalace-style capability's capture/recall already keys on `discuss:post`/`plan:post`/`verify:post`; those can *additionally* bind to `experimental.session.compacting` so memory persists across OpenCode's compaction — a concrete win the host gives us for free.
+- **Gates that cannot be evaluated at a host event fail closed**, reusing the overlay model's synthetic-blocking-gate semantics (see `capability-overlay-model.md`) — never fail open just because the host lacks a phase event.
+
+### How a capability reaches OpenCode (two adapters, one engine)
+
+1. **Declarative (today, via ADR-1016 projection).** The capability's `skills`/`agents`/commands convert into OpenCode's xdg home; OpenCode runs them as native skills/subagents. **Lossy by design:** `steps`/`contributions`/`gates` — the orchestration — are dropped, because projection has no loop. Good enough when the capability is "just skills."
+
+2. **Imperative (this ADR, the faithful path).** A thin `@opengsd/opencode-plugin` (or local `.opencode/plugins/gsd.ts`) that on init calls the engine's `loadRegistry({ includeInstalled: true })` as a library, composing first-party ∪ installed capability overlays with the **same** precedence, consent, and fail-closed-gate guarantees GSD already enforces — then binds the composed registry to the OpenCode primitives in the table above. The plugin stays thin **because it does not reimplement the loop resolver**; it delegates to it. This is the difference between "port the capability to OpenCode" (rebuilds the loop in a place that can't express it) and "embed the engine under OpenCode" (the loop stays where it lives).
+
+### Lowest-effort first cut
+
+Because OpenCode consumes MCP, the **companion MCP server** (the MemPalace pattern, already shipping) binds interface points 1 + 5 with **no bespoke plugin at all** — OpenCode connects to it like any MCP server and gets GSD command + state IO. Ship that first; add the thin `event`-bus plugin only to capture the `experimental.session.compacting` / `session.idle` bindings that MCP cannot reach. Sequence for #1239 Phase D: **(i)** MCP-companion binding → **(ii)** declarative skill projection (already built) → **(iii)** thin imperative plugin for the compaction/idle hooks → **(iv)** golden parity vs. the Claude reference host.
+
+### New open question (OpenCode-specific)
+
+- OpenCode installs plugins with **Bun**, but the engine matrix lists `runtime: node`. Decide whether the imperative plugin invokes the engine in-process (requires Bun-compatible engine entry) or shells out to a Node `gsd-tools.cjs` via `$` — and whether the companion MCP server makes that question moot for the first cut.
 
 ## Alternatives considered
 

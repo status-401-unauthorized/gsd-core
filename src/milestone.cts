@@ -14,23 +14,25 @@ import planningWorkspace = require('./planning-workspace.cjs');
 import frontmatterMod = require('./frontmatter.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- state.cjs is an export= CommonJS module
 import stateMod = require('./state.cjs');
-import { platformWriteSync, platformEnsureDir, execGit } from './shell-command-projection.cjs';
+import { platformWriteSync, platformEnsureDir, execGit, retryRenameSync } from './shell-command-projection.cjs';
 import { formatGsdSlash, resolveRuntime } from './runtime-slash.cjs';
+import { realClock } from './clock.cjs';
+import { transitionCore } from './state-transition.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import ioMod = require('./io.cjs');
 const { output, error } = ioMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import phaseIdMod = require('./phase-id.cjs');
-const { escapeRegex, normalizePhaseName, phaseTokenMatches } = phaseIdMod;
+const { escapeRegex, normalizePhaseName, phaseTokenMatches, PHASE_NUMBER_TOKEN_SOURCE } = phaseIdMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import roadmapParserMod = require('./roadmap-parser.cjs');
-const { getMilestonePhaseFilter, extractCurrentMilestone } = roadmapParserMod;
+const { getMilestonePhaseFilter, extractCurrentMilestone, getMilestoneInfo } = roadmapParserMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import coreUtilsMod = require('./core-utils.cjs');
 const { extractOneLinerFromBody } = coreUtilsMod;
 const { planningPaths } = planningWorkspace;
 const { extractFrontmatter } = frontmatterMod;
-const { writeStateMd, stateReplaceFieldWithFallback } = stateMod;
+const { writeStateMd } = stateMod;
 
 interface MilestoneCompleteOptions {
   name?: string;
@@ -128,8 +130,13 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
   const roadmapPath = planningPaths(cwd).roadmap;
   const reqPath = planningPaths(cwd).requirements;
   const statePath = planningPaths(cwd).state;
-  const milestonesPath = path.join(cwd, '.planning', 'MILESTONES.md');
-  const archiveDir = path.join(cwd, '.planning', 'milestones');
+  // #1911: derive the archive base from the workstream-aware planning root so
+  // `milestone complete --ws` archives into the workstream, not root. planningPaths(cwd).planning
+  // resolves to the workstream base when GSD_WORKSTREAM is set and to root .planning otherwise
+  // (flat mode is a no-op).
+  const planningBase = planningPaths(cwd).planning;
+  const milestonesPath = path.join(planningBase, 'MILESTONES.md');
+  const archiveDir = path.join(planningBase, 'milestones');
   const phasesDir = planningPaths(cwd).phases;
   const today = new Date().toISOString().split('T')[0];
   const milestoneName = options.name || version;
@@ -169,7 +176,8 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
       if (stateVersion && stateVersion === version) {
         const roadmapContent = fs.readFileSync(roadmapPath, 'utf-8');
         const scopedContent = extractCurrentMilestone(roadmapContent, cwd);
-        const phasePattern = /#{2,4}\s*Phase\s+(\d+[A-Z]?(?:\.\d+)*)\s*:\s*([^\n]+)/gi;
+        // #1729: `(?:\s*\([^)\n]{0,200}\))?` tolerates a pre-colon ( ) tag (literal mirror of OPTIONAL_PHASE_TAG_SOURCE).
+        const phasePattern = new RegExp(`#{2,4}\\s*Phase\\s+(${PHASE_NUMBER_TOKEN_SOURCE})(?:\\s*\\([^)\\n]{0,200}\\))?\\s*:\\s*([^\\n]+)`, 'gi');
         const noDirectoryPhases: string[] = [];
         let pm: RegExpExecArray | null;
         const phaseDirEntries = ((): string[] => {
@@ -184,6 +192,13 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
         })();
         while ((pm = phasePattern.exec(scopedContent)) !== null) {
           const phaseNum = pm[1];
+          // Phase 0 (pre-milestone) and Phase 999 (backlog) are sentinels, not
+          // real phases — they legitimately have no directory and must not block
+          // milestone completion. Mirrors the engine-wide sentinel convention
+          // (phase-id getMilestoneFromPhaseId, roadmap-command-router SENTINELS,
+          // the #1445 /^999/ progress filters). (#1580)
+          const major = parseInt(phaseNum, 10);
+          if (major === 0 || major === 999) continue;
           const normalized = normalizePhaseName(phaseNum);
           // A phase has disk_status: 'no_directory' when no phase directory
           // with a matching token exists on disk. Use the same phaseTokenMatches
@@ -269,14 +284,20 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
   // Archive REQUIREMENTS.md
   if (fs.existsSync(reqPath)) {
     const reqContent = fs.readFileSync(reqPath, 'utf-8');
-    const archiveHeader = `# Requirements Archive: ${version} ${milestoneName}\n\n**Archived:** ${today}\n**Status:** SHIPPED\n\nFor current requirements, see \`.planning/REQUIREMENTS.md\`.\n\n---\n\n`;
+    // Derive the display path from the same source the writer uses (reqPath), so a
+    // workstream archive header points at `.planning/workstreams/<ws>/REQUIREMENTS.md`
+    // instead of the hardcoded root path (#1993). Root case is byte-identical.
+    // Normalize to POSIX separators so the header is cross-platform (Windows
+    // path.relative yields backslashes; the original literal was forward-slash).
+    const reqDisplay = path.relative(cwd, reqPath).split(path.sep).join('/');
+    const archiveHeader = `# Requirements Archive: ${version} ${milestoneName}\n\n**Archived:** ${today}\n**Status:** SHIPPED\n\nFor current requirements, see \`${reqDisplay}\`.\n\n---\n\n`;
     platformWriteSync(path.join(archiveDir, `${version}-REQUIREMENTS.md`), archiveHeader + reqContent);
   }
 
   // Archive audit file if exists
-  const auditFile = path.join(cwd, '.planning', `${version}-MILESTONE-AUDIT.md`);
+  const auditFile = path.join(planningBase, `${version}-MILESTONE-AUDIT.md`);
   if (fs.existsSync(auditFile)) {
-    fs.renameSync(auditFile, path.join(archiveDir, `${version}-MILESTONE-AUDIT.md`));
+    retryRenameSync(auditFile, path.join(archiveDir, `${version}-MILESTONE-AUDIT.md`));
   }
 
   // Create/append MILESTONES.md entry
@@ -304,50 +325,31 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
     platformWriteSync(milestonesPath, `# Milestones\n\n${milestoneEntry}`);
   }
 
-  // Update STATE.md — keep frontmatter/body semantically aligned after closure
+  // Update STATE.md — keep frontmatter/body semantically aligned after closure.
+  // ADR-1769 Phase 5: dispatches to the STATE.md Transition Module. The closure
+  // write (Status, Last Activity, Last Activity Description, Current Position
+  // reset, Operator Next Steps reset) is the pure `milestoneCompleteCore` in
+  // src/state-transition.cts, backed by the field-classification table. The
+  // runtime-specific next-milestone slash command is resolved here and injected
+  // via the intent so the core stays pure. writeStateMd still owns the lock and
+  // the steady-state syncStateFrontmatter post-sync.
   if (fs.existsSync(statePath)) {
-    let stateContent = fs.readFileSync(statePath, 'utf-8');
-
-    stateContent = stateReplaceFieldWithFallback(stateContent, 'Status', null, `${version} milestone complete`);
-    stateContent = stateReplaceFieldWithFallback(stateContent, 'Last Activity', 'Last activity', today);
-    stateContent = stateReplaceFieldWithFallback(
-      stateContent,
-      'Last Activity Description',
-      null,
-      `${version} milestone completed and archived`,
+    const result = transitionCore(
+      fs.readFileSync(statePath, 'utf-8'),
+      {
+        kind: 'milestoneComplete',
+        version,
+        nextMilestoneCommand: formatGsdSlash('new-milestone', resolveRuntime(cwd)) as string,
+      },
+      { clock: realClock, progressProvider: () => null },
     );
-
-    // Reset Current Position narrative so resume/progress flows do not keep
-    // pointing at closed-phase execution instructions.
-    const positionPattern = /(##\s*Current Position\s*\n)([\s\S]*?)(?=\n##|$)/i; // allow-adhoc-markdown: pre-seam section write-modify in milestone.cts; pending collectSection migration #1372
-    const closedPositionBody =
-      `\nPhase: Milestone ${version} complete\n` +
-      `Plan: —\n` +
-      `Status: Awaiting next milestone\n` +
-      `Last activity: ${today} — Milestone ${version} completed and archived\n\n`;
-    if (positionPattern.test(stateContent)) {
-      stateContent = stateContent.replace(positionPattern, (_m, header: string) => `${header}${closedPositionBody}`);
-    } else {
-      stateContent = `${stateContent.trimEnd()}\n\n## Current Position\n${closedPositionBody}`;
-    }
-
-    // Normalize operator-next-step tails that can become stale after close.
-    const operatorPattern = /(##\s*Operator Next Steps\s*\n)([\s\S]*?)(?=\n##|$)/i; // allow-adhoc-markdown: pre-seam section write-modify in milestone.cts; pending collectSection migration #1372
-    if (operatorPattern.test(stateContent)) {
-      stateContent = stateContent.replace(
-        operatorPattern,
-        `$1\n- Start the next milestone with ${formatGsdSlash('new-milestone', resolveRuntime(cwd)) as string}\n\n`,
-      );
-    } else {
-      stateContent = `${stateContent.trimEnd()}\n\n## Operator Next Steps\n\n- Start the next milestone with ${formatGsdSlash('new-milestone', resolveRuntime(cwd)) as string}\n`;
-    }
-
-    writeStateMd(statePath, stateContent, cwd);
+    writeStateMd(statePath, result.content, cwd);
   }
 
   // Archive phase directories if requested
   let phasesArchived = false;
-  if (options.archivePhases) {
+  // #1871: archive phase dirs by default on milestone complete (opt out via --no-archive-phases).
+  if (options.archivePhases !== false) {
     try {
       const phaseArchiveDir = path.join(archiveDir, `${version}-phases`);
       platformEnsureDir(phaseArchiveDir);
@@ -357,7 +359,7 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
       let archivedCount = 0;
       for (const dir of phaseDirNames) {
         if (!isDirInMilestone(dir)) continue;
-        fs.renameSync(path.join(phasesDir, dir), path.join(phaseArchiveDir, dir));
+        retryRenameSync(path.join(phasesDir, dir), path.join(phaseArchiveDir, dir));
         archivedCount++;
       }
       phasesArchived = archivedCount > 0;
@@ -446,10 +448,8 @@ function cmdPhasesClear(cwd: string, raw: boolean, args: string[]): void {
     }
 
     try {
-      for (const entry of dirs) {
-        fs.rmSync(path.join(phasesDir, entry.name), { recursive: true, force: true });
-        cleared++;
-      }
+      // #1871: archive phase directories instead of destroying them (shared helper).
+      cleared = archivePhaseDirectories(cwd, phasesDir, dirs).archived;
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       error('Failed to clear phases directory: ' + message);
@@ -457,6 +457,40 @@ function cmdPhasesClear(cwd: string, raw: boolean, args: string[]): void {
   }
 
   output({ cleared }, raw, `${cleared} phase director${cleared === 1 ? 'y' : 'ies'} cleared`);
+}
+
+/**
+ * #1871: move each non-999 phase directory under `phasesDir` into
+ * `milestones/<version>-phases/` (collision-safe; version from getMilestoneInfo,
+ * timestamp fallback). Shared by `phases clear` (archive-then-remove) and the
+ * internal milestone.complete phase archival so phase history survives a
+ * milestone switch instead of being hard-deleted.
+ */
+function archivePhaseDirectories(cwd: string, phasesDir: string, dirs: ReadonlyArray<{ name: string }>): { archiveDir: string; archived: number } {
+  let archiveVersion: string | null = null;
+  try {
+    archiveVersion = getMilestoneInfo(cwd).version ?? null;
+  } catch {
+    /* ROADMAP/STATE unreadable — fall back to a dated label */
+  }
+  if (!archiveVersion) {
+    archiveVersion = `archived-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 8)}`;
+  }
+  const archivePhasesDir = path.join(planningPaths(cwd).planning, 'milestones', `${archiveVersion}-phases`);
+  platformEnsureDir(archivePhasesDir);
+  let archived = 0;
+  for (const entry of dirs) {
+    const src = path.join(phasesDir, entry.name);
+    // Collision-safe: if a same-named archive entry exists (re-run), suffix it.
+    let dest = path.join(archivePhasesDir, entry.name);
+    let n = 1;
+    while (fs.existsSync(dest)) {
+      dest = path.join(archivePhasesDir, `${entry.name}.${n++}`);
+    }
+    retryRenameSync(src, dest);
+    archived++;
+  }
+  return { archiveDir: archivePhasesDir, archived };
 }
 
 export = {

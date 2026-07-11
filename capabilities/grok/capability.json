@@ -1,7 +1,7 @@
 {
   "id": "grok",
   "role": "runtime",
-  "version": "1.6.0-rc.1",
+  "version": "1.7.0-rc.5",
   "title": "Grok Build",
   "description": "xAI Grok Build TUI — skills + agents under ~/.grok; AGENTS.md project rules; tier-2 support via Grok-native SKILL.md/agent frontmatter and spawn_subagent adapter.",
   "tier": "core",
@@ -17,6 +17,7 @@
         "GROK_HOME"
       ]
     },
+    "localConfigDir": ".grok",
     "configFormat": "none",
     "artifactLayout": {
       "global": [
@@ -63,6 +64,23 @@
     "installSurface": "profile-marker-only",
     "writesSharedSettings": false,
     "permissionWriter": null,
-    "extendedHookEvents": []
+    "extendedHookEvents": [],
+    "hostIntegration": {
+      "embeddingMode": "imperative",
+      "commandSurface": "slash-file",
+      "dispatch": {
+        "namedDispatch": true,
+        "nested": true,
+        "maxDepth": 1,
+        "background": true,
+        "subagentToolkit": "full",
+        "backgroundDispatch": true
+      },
+      "modelMode": "passive",
+      "hookBus": "none",
+      "stateIO": "filesystem",
+      "transport": "mcp",
+      "runtime": "node"
+    }
   }
 }

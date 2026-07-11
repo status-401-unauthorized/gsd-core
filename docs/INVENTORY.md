@@ -67,7 +67,7 @@ These six routers are descriptor-only entries that the model picks first; the bo
 
 | Command | Role | Source |
 |---------|------|--------|
-| `/gsd-workflow` | Phase pipeline router — discuss / plan / execute / verify / phase / progress. | [commands/gsd/ns-workflow.md](../commands/gsd/ns-workflow.md) |
+| `/gsd-workflow` | Phase pipeline router — discuss / plan / execute / verify / phase / progress / next. | [commands/gsd/ns-workflow.md](../commands/gsd/ns-workflow.md) |
 | `/gsd-project` | Project lifecycle router — milestones, audits, summary. | [commands/gsd/ns-project.md](../commands/gsd/ns-project.md) |
 | `/gsd-quality` | Quality-gate router — code review, debug, audit, security, eval, ui. | [commands/gsd/ns-review.md](../commands/gsd/ns-review.md) |
 | `/gsd-context` | Codebase-intelligence router — map, graphify, docs, learnings. | [commands/gsd/ns-context.md](../commands/gsd/ns-context.md) |
@@ -79,6 +79,7 @@ These six routers are descriptor-only entries that the model picks first; the bo
 | Command | Role | Source |
 |---------|------|--------|
 | `/gsd-new-project` | Initialize a new project with deep context gathering and PROJECT.md. | [commands/gsd/new-project.md](../commands/gsd/new-project.md) |
+| `/gsd-onboard` | Guide existing codebase onboarding through mapping, docs ingest, project setup, and onboarding summary. | [commands/gsd/onboard.md](../commands/gsd/onboard.md) |
 | `/gsd-workspace` | Manage GSD workspaces — create (`--new`), list (`--list`), or remove (`--remove`) isolated workspace environments. | [commands/gsd/workspace.md](../commands/gsd/workspace.md) |
 | `/gsd-discuss-phase` | Gather phase context through adaptive questioning before planning. | [commands/gsd/discuss-phase.md](../commands/gsd/discuss-phase.md) |
 | `/gsd-mvp-phase` | Plan a phase as a vertical MVP slice — user story, SPIDR splitting, then plan-phase. | [commands/gsd/mvp-phase.md](../commands/gsd/mvp-phase.md) |
@@ -123,6 +124,7 @@ These six routers are descriptor-only entries that the model picks first; the bo
 
 | Command | Role | Source |
 |---------|------|--------|
+| `/gsd:next` | State-aware smart-entry launcher — reads project state, shows a contextual menu, and dispatches one existing GSD command. | [commands/gsd/next.md](../commands/gsd/next.md) |
 | `/gsd-progress` | Check project progress, show context, and route to next action; use `--next` to advance automatically or `--do` to run a freeform task. | [commands/gsd/progress.md](../commands/gsd/progress.md) |
 | `/gsd-capture` | Capture ideas, tasks, notes, and seeds — todo (default), `--note`, `--backlog`, `--seed`, or `--list` pending todos. | [commands/gsd/capture.md](../commands/gsd/capture.md) |
 | `/gsd-stats` | Display project statistics — phases, plans, requirements, git metrics, timeline. | [commands/gsd/stats.md](../commands/gsd/stats.md) |
@@ -215,12 +217,14 @@ Full roster at `gsd-core/workflows/*.md`. Workflows are thin orchestrators that 
 | `ingest-docs.md` | Scan a repo for mixed planning docs; classify, synthesize, and bootstrap or merge into `.planning/` with a conflicts report. | `/gsd-ingest-docs` |
 | `insert-phase.md` | Insert a decimal phase for urgent work discovered mid-milestone. | `/gsd-phase --insert` |
 | `list-phase-assumptions.md` | Surface Claude's assumptions about a phase before planning. | `/gsd-discuss-phase --assumptions` |
+| `list-seeds.md` | List and audit captured seeds (read-only), with optional status filter. | `/gsd-capture --list-seeds` |
 | `list-workspaces.md` | List all GSD workspaces found in `~/gsd-workspaces/` with their status. | `/gsd-workspace --list` |
 | `manager.md` | Interactive milestone command center — dashboard, inline discuss, background plan/execute. | `/gsd-manager` |
 | `map-codebase.md` | Orchestrate parallel codebase mapper agents to produce `.planning/codebase/` docs. | `/gsd-map-codebase` |
 | `milestone-summary.md` | Milestone summary synthesis — onboarding and review artifact from milestone artifacts. | `/gsd-milestone-summary` |
 | `new-milestone.md` | Start a new milestone cycle — load project context, gather goals, update PROJECT.md/STATE.md. | `/gsd-new-milestone` |
 | `new-project.md` | Unified new-project flow — questioning, research (optional), requirements, roadmap. | `/gsd-new-project` |
+| `onboard.md` | Brownfield onboarding orchestration — map codebase, ingest docs, initialize planning, summarize next step. | `/gsd-onboard` |
 | `new-workspace.md` | Create an isolated workspace with repo worktrees/clones and an independent `.planning/`. | `/gsd-workspace --new` |
 | `next.md` | Detect current project state and automatically advance to the next logical step. | `/gsd-progress --next` |
 | `node-repair.md` | Autonomous repair operator for failed task verification; invoked by `execute-plan`. | `execute-plan.md` (recovery) |
@@ -282,6 +286,7 @@ Full roster at `gsd-core/references/*.md`. References are shared knowledge docum
 | `verification-patterns.md` | How to verify different artifact types. |
 | `verification-overrides.md` | Per-artifact verification override rules. |
 | `planning-config.md` | Full config schema and behavior. |
+| `security-asvs-levels.md` | OWASP ASVS level definitions for GSD threat modeling — per-level planner disposition rigor and auditor verification depth (L1 opportunistic, L2 standard, L3 comprehensive). |
 | `git-integration.md` | Git commit, branching, and history patterns. |
 | `git-planning-commit.md` | Planning directory commit conventions. |
 | `questioning.md` | Dream-extraction philosophy for project initialization. |
@@ -290,6 +295,7 @@ Full roster at `gsd-core/references/*.md`. References are shared knowledge docum
 | `common-bug-patterns.md` | Common bug patterns for code review and verification. |
 | `debugger-philosophy.md` | Evergreen debugging disciplines loaded by `gsd-debugger`. |
 | `mandatory-initial-read.md` | Shared required-reading boilerplate injected into agent prompts. |
+| `agent-skills-bootstrap.md` | Shared agent_skills self-load contract (query + Read + dedup guard) injected into all 22 consumer agents. |
 | `project-skills-discovery.md` | Shared project-skills-discovery boilerplate injected into agent prompts. |
 | `research-documentation-lookup.md` | Shared documentation-lookup protocol (Context7 MCP + guarded CLI fallback) injected into all researcher agents. |
 | `research-philosophy.md` | Shared research philosophy (training-as-hypothesis, honest reporting, investigation-not-confirmation) injected into researcher agents. |
@@ -306,13 +312,17 @@ Full roster at `gsd-core/references/*.md`. References are shared knowledge docum
 | `domain-probes.md` | Domain-specific probing questions for discuss-phase. |
 | `edge-probe.md` | Spec-phase edge-completeness probe — 8-category edge taxonomy, shape classification, and the `requirements → checks → verifier` resolution model (Step 5.5). |
 | `prohibition-probe.md` | Spec-phase prohibition-completeness probe — the two-stage adversarial-recall → precision protocol that surfaces the unwritten *must-NOT* constraints (values/safety/ethics), with status×verification (`test`/`judgment`) tiering and canon-referral breadcrumbs (Step 5.6); second adapter of the `probe-core` resolution model. |
+| `ui-consideration-probe.md` | UI-phase state-completeness probe — the closed shape-rooted UI-state taxonomy (empty/loading/error/populated/partial/overflow/zero-one-many/long-text), element-cue relevance filter, and `{explicit, backstop}` tiering; third adapter of the `probe-core` model (ADR-550 D7), run at ui-phase Step 9.5; the MIXED axis routes open UX (real-time/a11y/i18n-RTL) to `domain-probes.md` (#1867). |
+| `honest-verifier.md` | Verify-time abstention on non-inferable (`backstop`) truths — the truth-axis mirror of the prohibition judgment-tier disposition (ADR-550 D4): a `backstop` truth the verifier can't confirm with explicit evidence abstains → `human_needed` (reason `insufficient_spec`), never a silent pass (#1154). |
 | `gate-prompts.md` | Gate/checkpoint prompt templates. |
 | `loop-hook-dispatch.md` | Generic dispatch contract for consuming `gsd_run loop render-hooks <point> --raw` output in any host-loop workflow — envelope shape, per-kind dispatch rules (contribution/step/gate), and liveness banner. |
 | `scout-codebase.md` | Phase-type→codebase-map selection table for discuss-phase scout step (extracted via the discuss-phase/modes progressive-disclosure split, #717). |
 | `revision-loop.md` | Plan revision iteration patterns. |
+| `reviewer-instances.md` | Custom reviewer instances for `/gsd-review` (#1517) — same-adapter multi-model review: config shape, resolution rules, invocation, and the REVIEWS.md contract. Lazily loaded by `review.md` when `review.reviewer_instances` is configured. |
 | `universal-anti-patterns.md` | Universal anti-patterns to detect and avoid. |
 | `worktree-branch-check.md` | Canonical spawn-time worktree HEAD/base guard (worktree_branch_check): verify-only and fail-closed — per-agent-branch assertion, protected-ref refusal (#2924), and an exact-base assertion that halts with `exit 42` on mismatch so the orchestrator (worktree lifecycle owner) performs recovery (#48). Embedded into worktree sub-agent prompts at dispatch. |
 | `worktree-path-safety.md` | Worktree guard suite: HEAD assertion, cwd-drift sentinel (step 0a, #3097), and absolute-path guard (step 0b, #3099) — loaded into executor spawn prompts via `<execution_context>`. |
+| `untrusted-input-boundary.md` | Shared prompt-injection boundary (#1577) `@`-included by the 10 research/doc-ingest agents (`gsd-project-researcher`, `gsd-phase-researcher`, `gsd-ui-researcher`, `gsd-assumptions-analyzer`, `gsd-advisor-researcher`, `gsd-doc-classifier`, `gsd-doc-synthesizer`, `gsd-research-synthesizer`, `gsd-ai-researcher`, `gsd-domain-researcher`): treat fetched/read text as data-not-instructions, self-scan before use (PromptArmor 2507.15219), task-anchor (2504.20472), and fence quoted text with a fresh random delimiter per wrap (PPA 2506.05739). Prompt-level defense-in-depth (2503.00061); the hook scanner is a separate pattern pre-filter. |
 | `artifact-types.md` | Planning artifact type definitions. |
 | `phase-argument-parsing.md` | Phase argument parsing conventions. |
 | `decimal-phase-calculation.md` | Decimal sub-phase numbering rules. |
@@ -322,6 +332,7 @@ Full roster at `gsd-core/references/*.md`. References are shared knowledge docum
 | `autonomous-smart-discuss.md` | Smart-discuss logic for autonomous mode. |
 | `ios-scaffold.md` | iOS application scaffolding patterns. |
 | `ai-evals.md` | AI evaluation design reference for `/gsd-ai-integration-phase`. |
+| `api-coverage.md` | API-coverage gate reference (full-coverage-by-default) for the `ai-integration` capability's `verify:pre` blocking gate (#1562) — matrix format, trigger, tuning, detector CLI. |
 | `ai-frameworks.md` | AI framework decision-matrix reference for `gsd-framework-selector`. |
 | `executor-examples.md` | Worked examples for the gsd-executor agent. |
 | `doc-conflict-engine.md` | Shared conflict-detection contract for ingest/import workflows. |
@@ -372,6 +383,7 @@ The `gsd-planner` agent is decomposed into a core agent plus reference modules t
 | `planner-load-graph-context.md` | Planner's load_graph_context step: knowledge-graph freshness + dependency-context query via the gsd_run launcher (extracted from gsd-planner.md). |
 | `skeleton-template.md` | SKELETON.md template emitted for new-project Walking Skeleton (Phase 1 + `--mvp`). |
 | `user-story-template.md` | User story format for MVP planning — "As a / I want to / So that" structured fields. |
+| `specless-probe-fallback.md` | Spec-less probe fallback protocol — gate (toggle + per-section absence via the shared `spec-section` helper), the deterministic edge probe (mirrors spec-phase 5.5), the in-planner prohibition recall, and the `must_haves` authoring lift; consumed by plan-phase step 7.95 when a phase SPEC omits `## Edge Coverage` / `## Prohibitions` (ADR-857 Phase 6). |
 | `spidr-splitting.md` | SPIDR splitting decomposition rules for handling large user stories in MVP mode. |
 
 > **Subdirectory:** `gsd-core/references/few-shot-examples/` contains additional few-shot examples (`plan-checker.md`, `verifier.md`) that are referenced from specific agents. These are not among the top-level references.
@@ -387,6 +399,7 @@ Full listing: `gsd-core/bin/lib/*.cjs`.
 | `active-workstream-store.cjs` | Workstream source precedence and selection (CLI `--ws` > `GSD_WORKSTREAM` env > stored pointer); name validation and environment propagation |
 | `adr-parser.cjs` | ADR decision parser for plan-phase ingest express path; normalizes section synonyms, parses status/decision/scope fences, and enforces status rejection gates |
 | `agent-command-router.cjs` | Thin CJS subcommand router adapter for `gsd-tools agent` |
+| `api-coverage.cjs` | API-coverage detector + matrix validator (#1562) — pure `detectApiIntegration` (compound verb+noun signal + `<Service> API/SDK` surface; strips fenced code) and `validateCoverageMatrix`/`parseCoverageMatrix`/`renderCoverageMatrix` for the COVERAGE.md artifact; STDIN CLI (`echo "$SCOPE" \| node .../api-coverage.cjs [--json]`, exit 0=detected/1=none/2=error); consumed by the `ai-integration` capability's `plan:pre` contribution and blocking `verify:pre` gate (`check api-coverage.verify-pre`) |
 | `artifacts.cjs` | Canonical artifact registry — known `.planning/` root file names; used by `gsd-health` W019 lint |
 | `audit-command-router.cjs` | ADR-959 capability command router for `gsd-tools audit-uat` and `gsd-tools audit-open` — extracted from hardcoded cases in `gsd-tools.cjs`; dispatches to `uat.cjs:cmdAuditUat` and `audit.cjs:{auditOpenArtifacts,formatAuditReport}`; phase 4d-impl-3 |
 | `audit.cjs` | Audit dispatch, audit open sessions, audit storage helpers |
@@ -395,7 +408,7 @@ Full listing: `gsd-core/bin/lib/*.cjs`.
 | `capability-lock.cjs` | Shared cross-process lock primitive (#1459 finding 4) — the SINGLE hardened lockfile protocol used by BOTH capability-lifecycle (`.gsd/capabilities/.lock`) and capability-consent (`.consent.lock`); exports `acquireLock(lockPath, opts?)`/`releaseLock(handle)` with pid + process-start-time liveness identity, a hard deadman, and token+inode owner-safe release — NEVER stale-steals a verified-live same-host holder, reclaims only a provably-dead/unverifiable holder, never deadlocks; `opts.maxAttempts`/`opts.waitForFresh` let the consent store serialize genuinely-contended writers; `_setLockProbes`/`_resetLockProbes` are test seams |
 | `capability-ledger.cjs` | Per-runtime install ledger (ADR-1244 D4) — atomic read/write of `.gsd-capabilities.json` recording `{ id, version, source, integrity, files[], sharedEdits[] }` per installed capability; exports `readLedger`/`writeLedger`/`recordInstall`/`removeEntry`/`reconcile` (orphan detection)/`readSmallRegularFile` (utf8) + `readSmallRegularFileBuffer` (raw bytes, the byte-exact consent-hash reader, #1459 finding 1); atomic commit point and reconciliation basis for Phase-4 upgrade/remove |
 | `capability-lifecycle.cjs` | Capability lifecycle orchestration (ADR-1244 Phase 4, D5+D6) — composes the source resolver + ledger + trust gate into `installCapability`/`upgradeCapability`/`removeCapability`/`reconcileCapabilities`; ledger write is the commit point; upgrade is atomic stage-then-swap (old set aside, new swapped in, ledger committed, backup dropped) with deterministic crash recovery (`reconcileCapabilities` rolls forward/back to a fully-old-or-fully-new state); remove surgically strips only marker-stamped (`_gsdCapability`) shared-config entries, preserving user hand-edits; never executes capability code |
-| `capability-loader.cjs` | Runtime Capability Registry overlay (ADR-1244 D2) — `loadRegistry({ includeInstalled })` composes the frozen first-party registry with a validated installed overlay read from `$GSD_HOME/.gsd/capabilities/<id>/` (global) and `<projectRoot>/.gsd/capabilities/<id>/` (project); first-party-wins on id/skill/agent/config collisions, reserved-namespace rejection, load-time `engines.gsd` re-gate (skip-with-warning), and gate-kind fail-closed via `_overlay.blockedGates`; composes through the canonical `buildRegistry` so derived views never drift |
+| `capability-loader.cjs` | Runtime Capability Registry overlay (ADR-1244 D2) — `loadRegistry({ includeInstalled })` composes the frozen first-party registry with a validated installed overlay read from `$GSD_HOME/.gsd/capabilities/<id>/` (global) and `<projectRoot>/.gsd/capabilities/<id>/` (project); first-party-wins on id/skill/agent/config collisions, reserved-namespace rejection, load-time `engines.gsd` re-gate (skip-with-warning), and gate-kind fail-open via `_overlay.blockedGates` — a loud warning (stderr + envelope `warnings`) naming the load failure and `gsd capability remove <id>` remediation; no gate injected (#2009); composes through the canonical `buildRegistry` so derived views never drift |
 | `capability-registry.cjs` | Generated central Capability Registry — role-partitioned index of all co-located capability declarations (`capabilities/<id>/capability.json`); emitted by `scripts/gen-capability-registry.cjs --write` (ADR-894 §5) |
 | `capability-source.cjs` | Capability source resolver (ADR-1244 D3) — `resolveCapabilitySource(spec, opts)` fetches and stages a capability from local path, git (https/ssh/git transports only), npm pack (no lifecycle scripts), tarball (sha512 integrity verify before extraction), or registry (stub); tar-slip/symlink rejection; atomic staging to `$GSD_HOME/.gsd/capabilities/<id>/`; no capability code executes during install |
 | `capability-state.cjs` | Unified capability-state resolver (ADR-857 phase 4b/6) — composes install profile, runtime surface, and config activation into one per-capability view consumed by workflow hook rendering; exports pure `resolveCapabilityState`, reusable `resolveCapabilityRuntimeState`, and I/O handler `cmdCapabilityState`; command surface: `gsd-tools capability state [--config-dir <path>]` emitting `{ runtimeConfigDir, capabilities[] }` |
@@ -421,10 +434,13 @@ Full listing: `gsd-core/bin/lib/*.cjs`.
 | `context-utilization.cjs` | Pure classifier for `gsd-health --context` — turns (tokensUsed, contextWindow) into a `{ percent, state }` triage result against the 60%/70% fracture-point thresholds (#2792) |
 | `core-utils.cjs` | Shared low-level utilities — POSIX path normalization, sub-repo/subdirectory scanning, phase file stats, slug/one-liner/plan-id helpers, time-ago (extracted from `core.cjs`, ADR-857) |
 | `core.cjs` | Shared utilities and runtime fallbacks; compatibility re-exports for planning-workspace and I/O (`io.cjs`) helpers |
+| `coverage.cjs` | Deterministic SUMMARY `coverage:` block parser/validator/classifier for `gsd-tools uat classify-coverage`; routes deliverables to auto-pass vs human-UAT with a fail-safe default (#1602) |
 | `decisions.cjs` | Parses CONTEXT.md `<decisions>` blocks; accepts numeric (D-42) and alphanumeric (D-INFRA-01) IDs; returns `{id, text, category, tags, trackable}` |
 | `docs.cjs` | Docs-update workflow init, Markdown scanning, monorepo detection |
 | `drift.cjs` | Post-execute codebase structural drift detector (#2003): classifies file changes into new-dir/barrel/migration/route categories and round-trips `last_mapped_commit` frontmatter |
 | `edge-probe.cjs` | Spec-completeness edge probe (compiled from `src/edge-probe.cts`, gitignored) — the first adapter of the `probe-core` resolution model (ADR-550 Decision 7): shape classification, applicable-category relevance filter, edge proposal, and the `{explicit, backstop}` verification validators; delegates merge/rollup/CLI to `probe-core`; exports `classifyShape`, `applicableCategories`, `proposeEdges`, `analyzeCoverage`, `validateResolution`, `TAXONOMY` (#550) |
+| `eval-command-router.cjs` | Routes the `eval.score` verb (compiled from `src/eval-command-router.cts`, gitignored) — thin dispatcher into the eval scoring module (#1579) |
+| `eval.cjs` | Deterministic eval scoring (compiled from `src/eval.cts`, gitignored) — `computeEvalScore` (coverage*0.6 + infra*0.4, bands 80/60/40) + `cmdEvalScore` CLI domain guard; moves the gsd-eval-auditor's weighted arithmetic out of the prompt into code (#10 / #1579) |
 | `fallow-runner.cjs` | Fallow audit adapter for `/gsd-code-review`: binary resolution (`PATH` then `node_modules/.bin`), actionable missing-binary errors, and structural findings normalization |
 | `federated-config.cjs` | Defensive merge of capability-declared config slices into the loadConfig return value — ADR-857 phase 3b; exports `mergeFederatedConfig({ configSchema, isCentralKey, userConfig })` → `{ values, validKeys, warnings }`; live for migrated Capability keys that are atomically removed from the central config schema |
 | `frontmatter.cjs` | YAML frontmatter CRUD operations |
@@ -433,8 +449,11 @@ Full listing: `gsd-core/bin/lib/*.cjs`.
 | `graphify.cjs` | Knowledge-graph build/query/status/diff for `/gsd-graphify` |
 | `graphify-command-router.cjs` | ADR-959 capability command router for `gsd-tools graphify` — dispatches build/query/status/diff subcommands; first real capability command cutover (phase 4d-impl-2) |
 | `gsd2-import.cjs` | External-plan ingest for `/gsd-import --from-gsd2` |
+| `host-integration.cjs` | Host-Integration Interface (ADR-1239 Phase A) — negotiated capability contract over the six host-integration points; `negotiateHostCapabilities` fail-closes on undeclared/unknown/`undocumented` values, typed degradation ladder, host-capability profiles; the 8 `runtime.hostIntegration` axes are validated in `capability-validator.cjs` and sourced per-CLI in `docs/reference/host-integration-capability-matrix.md` |
 | `init-command-router.cjs` | Thin CJS subcommand router adapter for `gsd-tools init` |
 | `init.cjs` | Compound context loading for each workflow type |
+| `install-effort-resolver.cjs` | Install-time effort resolution — `readGsdEffectiveEffortConfig` (merges `~/.gsd/defaults.json` + project `.planning/config.json`) + `resolveInstallTimeEffort`, extracted from `bin/install.js` (#2071) so `gsd-tools effort sync` can require it from the shipped runtime instead of the never-copied package-root installer; install.js imports them back (single source) |
+| `install-engine.cjs` | Runtime-artifact install engine — `installRuntimeArtifacts`/`uninstallRuntimeArtifacts`/`installOpencodeFamilySkills` + their helpers, extracted from `bin/install.js` (ADR-1239 Phase B, #1679); install.js imports them back and injects `getCommitAttribution` |
 | `install-profiles.cjs` | Install profile allowlist + skill staging for `--minimal` install (#2762); single source of truth for which `gsd-*` skills/agents land in runtime config dirs |
 | `installer-migration-authoring.cjs` | Installer migration authoring guardrails for record metadata, explicit scopes, ownership evidence, and runtime contract citations |
 | `installer-migration-report.cjs` | Installer migration report projection and blocked-action guard for install/update integration |
@@ -476,6 +495,7 @@ Full listing: `gsd-core/bin/lib/*.cjs`.
 | `roadmap-upgrade.cjs` | Migration tool for converting legacy `Phase N` entries to milestone-prefixed `Phase M-NN` convention; `computeMigrationPlan` + `applyMigration` with dry-run default and atomic rollback |
 | `roadmap.cjs` | ROADMAP.md parsing, phase extraction, plan progress |
 | `runtime-artifact-conversion.cjs` | Runtime artifact conversion module — projects Claude-authored commands, agents, and skills into runtime-specific artifact bodies while preserving installer compatibility exports |
+| `runtime-artifact-install-plan.cjs` | Runtime artifact install plan module — stages pre-resolved layout kinds, applies runtime body rewrites, and returns copy-plan items plus cleanup obligations |
 | `runtime-artifact-layout.cjs` | Runtime artifact layout module — resolves the artifact directory shapes (commands, agents, skills) for each supported runtime; single source of truth for per-runtime artifact placement (#3663) |
 | `runtime-config-adapter-registry.cjs` | Explicit runtime config adapter registry — resolves per-runtime config-mutation install intent (install surface, shared-settings gate, finish-phase permission writer); see ADR-58. |
 | `runtime-hooks-surface.cjs` | Runtime hooks surface module — standalone hook-surface writer functions extracted from bin/install.js (ADR-857 phase 5f-1); owns Cline/Cursor/Copilot/Codex hook artifact generation and reconciliation. |
@@ -487,14 +507,17 @@ Full listing: `gsd-core/bin/lib/*.cjs`.
 | `semver-compare.cjs` | Shared semver comparison policy helpers (`compareSemverCore`, stable-triplet validation, normalized tuple parsing) consumed by update-check hooks, statusline dev-install detection, and changeset extract range logic (#10) |
 | `security.cjs` | Path traversal prevention, prompt injection detection, safe JSON/shell helpers |
 | `shell-command-projection.cjs` | Runtime-aware shell command projection for managed hook serialization: decides PowerShell call-operator usage by runtime/platform and normalizes Windows script path tokens |
+| `spec-section.cjs` | SPEC section-status helper (compiled from `src/spec-section.cts`, gitignored) — the single source of truth for the canonical SPEC headings (suffix-tolerant) and markdown-table row counting; `specSectionStatus`/`countSectionDataRows` decide per-section "supplied" for plan-phase's spec-less probe fallback, replacing ad-hoc awk (contract pinned by `tests/spec-section.test.cjs`) |
 | `state-command-router.cjs` | Thin CJS subcommand router adapter for `gsd-tools state` |
 | `state.cjs` | STATE.md parsing, updating, progression, metrics |
 | `state-document.cjs` | Pure STATE.md field extraction, replacement, status normalization, and progress calculation transforms |
 | `surface.cjs` | Runtime surface module — manages the runtime enable/disable surface state independently of the install-time profile marker (ADR-0011 Phase 2) |
 | `task-command-router.cjs` | Thin CJS subcommand router adapter for `gsd-tools task` |
 | `template.cjs` | Template selection and filling with variable substitution |
+| `normalize-test-command.cjs` | Normalizes a resolved test command to a one-shot form so a watch-mode runner (vitest/jest) cannot hang a verification gate (#1857); shared by all four test-command gates (regression, post-merge, audit-fix, verify-phase) |
 | `uat.cjs` | UAT file parsing, verification debt tracking, audit-uat support |
 | `uat-predicate.cjs` | UAT-passed predicate — markdown-aware evaluation of HUMAN-UAT results; returns pass only when all required checks pass; ignores false-positive contexts (frontmatter, fenced code, blockquotes, HTML comments) |
+| `ui-consideration-probe.cjs` | Spec-completeness UI-consideration probe (compiled from `src/ui-consideration-probe.cts`, gitignored) — the third adapter of the `probe-core` resolution model (ADR-550 Decision 7): element-kind classification, applicable-category relevance filter, consideration proposal, `proposeElements`/`autoResolve` (propose-then-confirm + the `--auto` never-dismiss floor), and the `{explicit, backstop}` validators; delegates merge/rollup/CLI to `probe-core`; exports `classifyElement`, `applicableCategories`, `proposeConsiderations`, `proposeElements`, `autoResolve`, `analyzeCoverage`, `UI_TAXONOMY` (#1867) |
 | `ui-safety-gate.cjs` | Shell-free word-boundary UI token detector (#3706, #3718); reads phase-section text from stdin, exits 0 (UI found) or 1 (no UI); also deployed to `gsd-core/bin/lib/` so the GSD installer ships it to `$RUNTIME_DIR` (#448) |
 | `update-context.cjs` | Pure install-context resolver for `/gsd:update` — runtime/scope/config-dir/version detection (LOCAL/GLOBAL/UNKNOWN) ported from update.md bash; backs `gsd-tools update-context` (#498) |
 | `validate-command-router.cjs` | Thin CJS subcommand router adapter for `gsd-tools validate` |
@@ -527,6 +550,10 @@ Full listing: `hooks/`.
 | `gsd-update-banner.js` | `SessionStart` | Opt-in banner surfacing update availability when GSD statusline isn't used (PR #2795) |
 | `gsd-cursor-session-start.js` | Cursor `sessionStart` | Cursor-native context injection at session start (issue #777) |
 | `gsd-cursor-post-tool.js` | Cursor `postToolUse` | Cursor-native STATE.md update monitor after tool calls (issue #777) |
+| `gsd-cursor-pre-tool.js` | Cursor `preToolUse` | Cursor-native write-path guard for `.planning/` (ADR-1239 / #2089) |
+| `gsd-cursor-stop.js` | Cursor `stop` | Cursor-native verify-work reminder on agent stop (ADR-1239 / #2089) |
+| `gsd-cursor-subagent-start.js` | Cursor `subagentStart` | Cursor-native subagent context injection (ADR-1239 / #2089) |
+| `gsd-cursor-subagent-stop.js` | Cursor `subagentStop` | Cursor-native subagent completion reminder (ADR-1239 / #2089) |
 | `gsd-prompt-guard.js` | `PreToolUse` | Scans `.planning/` writes for prompt-injection patterns (advisory) |
 | `gsd-workflow-guard.js` | `PreToolUse` | Detects file edits outside GSD workflow context (advisory, opt-in) |
 | `gsd-read-guard.js` | `PreToolUse` | Advisory guard preventing Edit/Write on unread files |

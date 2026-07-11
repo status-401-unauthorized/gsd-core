@@ -1,7 +1,7 @@
 {
   "id": "claude",
   "role": "runtime",
-  "version": "1.6.0-rc.1",
+  "version": "1.7.0-rc.5",
   "title": "Claude Code",
   "description": "Anthropic Claude Code — primary development runtime; tier-1 support with full hook surface and skills-based global install.",
   "tier": "core",
@@ -17,6 +17,7 @@
         "CLAUDE_CONFIG_DIR"
       ]
     },
+    "localConfigDir": ".claude",
     "configFormat": "settings-json",
     "artifactLayout": {
       "global": [
@@ -61,6 +62,44 @@
       "Stop",
       "PreCompact",
       "FileChanged"
-    ]
+    ],
+    "hostIntegration": {
+      "embeddingMode": "imperative",
+      "commandSurface": "slash-file",
+      "dispatch": {
+        "namedDispatch": true,
+        "nested": true,
+        "maxDepth": 5,
+        "background": true,
+        "subagentToolkit": "full",
+        "backgroundDispatch": false
+      },
+      "modelMode": "passive",
+      "hookBus": "host",
+      "stateIO": "filesystem",
+      "transport": "mcp",
+      "runtime": "node"
+    },
+    "hostBehaviors": {
+      "attributionSource": "settings-json-commit",
+      "authorsCanonicalWorkflow": true,
+      "localInstallStyle": "legacy-flat",
+      "permissionsSchema": "claude",
+      "settingsFileByScope": {
+        "local": "settings.local.json",
+        "global": "settings.json"
+      },
+      "sourceMarkerFile": ".gsd-source",
+      "agentFrontmatterExtensions": [
+        "effort"
+      ],
+      "ownsClaudePaths": true,
+      "nativeModelAliases": true,
+      "skillsGlobalOnboarding": true,
+      "legacyCommandsGsdInstallMigration": true,
+      "legacyCommandsGsdUninstall": "global",
+      "hyphenNameAgentBody": true,
+      "reviewerCli": true
+    }
   }
 }

@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { runGsdTools, cleanup } = require('./helpers.cjs');
 const { createFixture, seedPhase } = require('./fixtures/index.cjs');
+const { createTempProject } = require('./helpers.cjs');
 
 describe('init commands', () => {
   let tmpDir;
@@ -87,6 +88,193 @@ describe('init commands', () => {
     assert.strictEqual(output.research_path, '.planning/phases/03-api/03-RESEARCH.md');
     assert.strictEqual(output.verification_path, '.planning/phases/03-api/03-VERIFICATION.md');
     assert.strictEqual(output.uat_path, '.planning/phases/03-api/03-UAT.md');
+  });
+
+  // #2056: normalizePhaseName() strips ANY [A-Z][A-Z0-9_]*- prefix as a project
+  // code, so a foreign-prefixed workstream/task id like "MEM-01" collapsed to
+  // "01" and resolved to the unrelated numeric Phase 01. init plan-phase must
+  // require exact prefixed evidence (a phase dir/roadmap entry literally
+  // carrying the foreign prefix) before accepting a numeric-fallback match.
+  test('#2056 — init plan-phase does not collapse foreign-prefixed task IDs into numeric phases', () => {
+    seedPhase(tmpDir, '01-stable-baseline-on-main', {
+      '01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      '# Roadmap\n\n### Phase 1: Stable Baseline On Main\n**Goal:** Establish baseline\n**Plans:** 1 plan\n',
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'LKML' }, null, 2),
+    );
+
+    const result = runGsdTools('init plan-phase MEM-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, false, 'MEM-01 must NOT resolve to numeric Phase 01');
+    assert.strictEqual(output.phase_dir, null);
+    assert.strictEqual(output.phase_number, null);
+  });
+
+  // #2056 companion: the guard must not reject the configured project_code's
+  // OWN prefixed phases — LKML-01 (project_code = LKML) must still resolve.
+  test('#2056 — init plan-phase still resolves configured project-code-prefixed phases', () => {
+    seedPhase(tmpDir, 'LKML-01-stable-baseline-on-main', {
+      'LKML-01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'LKML' }, null, 2),
+    );
+
+    const result = runGsdTools('init plan-phase LKML-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, true, 'LKML-01 (own project code) must resolve');
+    assert.strictEqual(output.phase_dir, '.planning/phases/LKML-01-stable-baseline-on-main');
+    assert.strictEqual(output.phase_number, 'LKML-01');
+  });
+
+  // #2056 accept-branch: a foreign-prefixed query MUST still resolve when a phase
+  // directory literally carries that prefix (e.g. a real MEM-01-* workstream
+  // phase). Proves the guard accepts exact-prefixed evidence, not just rejects.
+  test('#2056 — init plan-phase resolves a real foreign-prefixed phase dir', () => {
+    seedPhase(tmpDir, 'MEM-01-integration', {
+      'MEM-01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'LKML' }, null, 2),
+    );
+
+    const result = runGsdTools('init plan-phase MEM-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, true, 'a real MEM-01-* dir must resolve under its own prefix');
+    assert.strictEqual(output.phase_dir, '.planning/phases/MEM-01-integration');
+    assert.strictEqual(output.phase_number, 'MEM-01');
+  });
+
+  // #2056 edge: with NO project_code configured, any prefixed query is foreign
+  // and must NOT collapse to a numeric phase. Pins the strict default.
+  test('#2056 — init plan-phase treats prefixed queries as foreign when no project_code is configured', () => {
+    seedPhase(tmpDir, '01-stable-baseline-on-main', {
+      '01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({}, null, 2),
+    );
+
+    const result = runGsdTools('init plan-phase MEM-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, false, 'with no project_code, MEM-01 must not resolve to numeric Phase 01');
+    assert.strictEqual(output.phase_number, null);
+  });
+
+  // #2104: the #2056 guard must also cover init execute-phase, verify-work,
+  // and phase-op — all three had unguarded findPhaseInternal/getRoadmapPhaseInternal
+  // calls that collapsed foreign prefixes (MEM-01 → 01) to numeric phases.
+  test('#2104 — init execute-phase does not collapse foreign-prefixed task IDs', () => {
+    seedPhase(tmpDir, '01-stable-baseline-on-main', {
+      '01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      '# Roadmap\n\n### Phase 1: Stable Baseline On Main\n**Goal:** Establish baseline\n**Plans:** 1 plan\n',
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'LKML' }, null, 2),
+    );
+
+    const result = runGsdTools('init execute-phase MEM-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, false, 'MEM-01 must NOT resolve to numeric Phase 01');
+    assert.strictEqual(output.phase_number, null);
+  });
+
+  test('#2104 — init verify-work does not collapse foreign-prefixed task IDs', () => {
+    seedPhase(tmpDir, '01-stable-baseline-on-main', {
+      '01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      '# Roadmap\n\n### Phase 1: Stable Baseline On Main\n**Goal:** Establish baseline\n**Plans:** 1 plan\n',
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'LKML' }, null, 2),
+    );
+
+    const result = runGsdTools('init verify-work MEM-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, false, 'MEM-01 must NOT resolve to numeric Phase 01');
+  });
+
+  // #2104 accept-branch: a real foreign-prefixed phase dir MUST still resolve
+  // through the now-guarded commands, proving the guard narrows but does not block.
+  test('#2104 — init execute-phase resolves a real foreign-prefixed phase dir', () => {
+    seedPhase(tmpDir, 'MEM-01-integration', {
+      'MEM-01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'LKML' }, null, 2),
+    );
+
+    const result = runGsdTools('init execute-phase MEM-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, true, 'a real MEM-01-* dir must resolve under its own prefix');
+    assert.strictEqual(output.phase_dir, '.planning/phases/MEM-01-integration');
+  });
+
+  test('#2104 — init verify-work resolves a real foreign-prefixed phase dir', () => {
+    seedPhase(tmpDir, 'MEM-01-integration', {
+      'MEM-01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'LKML' }, null, 2),
+    );
+
+    const result = runGsdTools('init verify-work MEM-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, true, 'a real MEM-01-* dir must resolve under its own prefix');
+  });
+
+  test('#2104 — init phase-op does not collapse foreign-prefixed task IDs', () => {
+    seedPhase(tmpDir, '01-stable-baseline-on-main', {
+      '01-CONTEXT.md': '# Phase Context',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      '# Roadmap\n\n### Phase 1: Stable Baseline On Main\n**Goal:** Establish baseline\n**Plans:** 1 plan\n',
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'LKML' }, null, 2),
+    );
+
+    const result = runGsdTools('init phase-op MEM-01', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_found, false, 'MEM-01 must NOT resolve to numeric Phase 01');
+    assert.strictEqual(output.phase_number, null);
   });
 
   test('init plan-phase exposes text_mode from config (defaults false)', () => {
@@ -424,6 +612,66 @@ describe('init commands', () => {
     const output = JSON.parse(result.output);
     assert.strictEqual(output.phase_found, true);
     assert.strictEqual(output.phase_req_ids, 'REQ-02, REQ-03');
+  });
+
+  test('init plan-phase prefers real phase details outside fenced examples and ignores backlog sentinels (#1588)', () => {
+    const projectDir = createTempProject('init-1588-');
+    try {
+      fs.writeFileSync(
+        path.join(projectDir, '.planning', 'STATE.md'),
+        [
+          '---',
+          'gsd_state_version: 1.0',
+          'milestone: v1.1',
+          'status: planning',
+          '---',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(projectDir, '.planning', 'ROADMAP.md'),
+        [
+          '# Roadmap',
+          '',
+          '<details open>',
+          '<summary>v1.1 Current (Phases 8-9) - PLANNED</summary>',
+          '',
+          '- [ ] **Phase 9: Real Phase**',
+          '',
+          '</details>',
+          '',
+          '## Phase Details',
+          '',
+          '```markdown',
+          '### Phase 9: Fenced Example Phase',
+          '**Goal:** This example must not be treated as roadmap structure.',
+          '```',
+          '',
+          '### Phase 9: Real Phase',
+          '**Goal:** Use the real phase details outside the fenced block.',
+          '**Requirements:** REAL-01',
+          '',
+          '## Backlog',
+          '',
+          '### Phase 999.1: Backlog Thing',
+          '**Goal:** Future backlog item.',
+          '',
+        ].join('\n')
+      );
+
+      const phase9 = runGsdTools('init plan-phase 9', projectDir);
+      assert.ok(phase9.success, `init plan-phase 9 failed: ${phase9.error}`);
+      const phase9Output = JSON.parse(phase9.output);
+      assert.equal(phase9Output.phase_name, 'Real Phase');
+      assert.equal(phase9Output.phase_req_ids, 'REAL-01');
+
+      const backlog = runGsdTools('init plan-phase 999.1', projectDir);
+      assert.ok(backlog.success, `init plan-phase 999.1 failed: ${backlog.error}`);
+      const backlogOutput = JSON.parse(backlog.output);
+      assert.equal(backlogOutput.phase_found, false);
+    } finally {
+      cleanup(projectDir);
+    }
   });
 
   test('init phase-op resolves a details-summary milestone phase from later flat Phase Details', () => {
@@ -906,6 +1154,89 @@ describe('cmdInitMilestoneOp', () => {
     assert.strictEqual(output.all_phases_complete, true);
   });
 
+  test('project_code-prefixed phase directories count as completed milestone phases (#1836)', () => {
+    seedPhase(tmpDir, 'PROJ-01-setup', {
+      'PROJ-01-01-PLAN.md': '# Plan',
+      'PROJ-01-01-SUMMARY.md': '# Summary',
+    });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({ project_code: 'PROJ' }, null, 2)
+    );
+
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'STATE.md'),
+      [
+        '---',
+        'gsd_state_version: 1.0',
+        'milestone: v1.0.0',
+        'milestone_name: Test Milestone',
+        'status: executing',
+        '---',
+        '',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      [
+        '# Roadmap',
+        '',
+        '## 🚧 v1.0.0 Test Milestone',
+        '### Phase 1: Setup',
+        '',
+      ].join('\n')
+    );
+
+    const result = runGsdTools('init milestone-op', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_count, 1);
+    assert.strictEqual(output.completed_phases, 1);
+    assert.strictEqual(output.all_phases_complete, true);
+  });
+
+  test('backlog 999.x headings do not inflate milestone phase counts (#1838)', () => {
+    const phase1 = path.join(tmpDir, '.planning', 'phases', '01-setup');
+    fs.mkdirSync(phase1, { recursive: true });
+    fs.writeFileSync(path.join(phase1, '01-01-PLAN.md'), '# Plan');
+    fs.writeFileSync(path.join(phase1, '01-01-SUMMARY.md'), '# Summary');
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'STATE.md'),
+      [
+        '---',
+        'gsd_state_version: 1.0',
+        'milestone: v1.0.0',
+        'milestone_name: Test Milestone',
+        'status: completed',
+        '---',
+        '',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      [
+        '# Roadmap',
+        '',
+        '## 🚧 v1.0.0 Test Milestone',
+        '### Phase 1: Setup',
+        '',
+        '## Backlog',
+        '### Phase 999.1: Deferred Idea',
+        '### Phase 999.2: Another Deferred Idea',
+        '',
+      ].join('\n')
+    );
+
+    const result = runGsdTools('init milestone-op', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_count, 1);
+    assert.strictEqual(output.completed_phases, 1);
+    assert.strictEqual(output.all_phases_complete, true);
+  });
+
   test('archive directory scanning', () => {
     fs.mkdirSync(path.join(tmpDir, '.planning', 'archive', 'v1.0'), { recursive: true });
     fs.mkdirSync(path.join(tmpDir, '.planning', 'archive', 'v0.9'), { recursive: true });
@@ -1082,6 +1413,13 @@ describe('cmdInitPhaseOp fallback', () => {
 describe('cmdInitProgress', () => {
   let tmpDir;
 
+  function writePassedVerification(phaseDir, phaseToken) {
+    fs.writeFileSync(
+      path.join(phaseDir, `${phaseToken}-VERIFICATION.md`),
+      ['---', 'status: passed', '---', '', '# Verification', ''].join('\n')
+    );
+  }
+
   beforeEach(() => {
     tmpDir = createFixture();
   });
@@ -1108,6 +1446,7 @@ describe('cmdInitProgress', () => {
     fs.mkdirSync(phase1, { recursive: true });
     fs.writeFileSync(path.join(phase1, '01-01-PLAN.md'), '# Plan');
     fs.writeFileSync(path.join(phase1, '01-01-SUMMARY.md'), '# Summary');
+    writePassedVerification(phase1, '01');
 
     // Phase 02: in_progress (has plan, no summary)
     const phase2 = path.join(tmpDir, '.planning', 'phases', '02-api');
@@ -1161,6 +1500,7 @@ describe('cmdInitProgress', () => {
     fs.mkdirSync(phase1, { recursive: true });
     fs.writeFileSync(path.join(phase1, '01-01-PLAN.md'), '# Plan');
     fs.writeFileSync(path.join(phase1, '01-01-SUMMARY.md'), '# Summary');
+    writePassedVerification(phase1, '01');
 
     const result = runGsdTools('init progress', tmpDir);
     assert.ok(result.success, `Command failed: ${result.error}`);
@@ -1169,6 +1509,26 @@ describe('cmdInitProgress', () => {
     assert.strictEqual(output.completed_count, 1);
     assert.strictEqual(output.current_phase, null);
     assert.strictEqual(output.next_phase, null);
+  });
+
+  test('implementation-complete phase without passed verification remains current work', () => {
+    const phase1 = path.join(tmpDir, '.planning', 'phases', '01-setup');
+    fs.mkdirSync(phase1, { recursive: true });
+    fs.writeFileSync(path.join(phase1, '01-01-PLAN.md'), '# Plan');
+    fs.writeFileSync(path.join(phase1, '01-01-SUMMARY.md'), '# Summary');
+
+    const result = runGsdTools('init progress', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.completed_count, 0);
+    assert.strictEqual(output.in_progress_count, 1);
+    assert.strictEqual(output.has_work_in_progress, true);
+    assert.strictEqual(output.current_phase.number, '01');
+    assert.strictEqual(output.current_phase.status, 'executed');
+    assert.strictEqual(output.current_phase.implementation_complete, true);
+    assert.strictEqual(output.current_phase.verification_status, 'missing');
+    assert.strictEqual(output.current_phase.verification_passed, false);
   });
 
   test('paused_at detected from STATE.md', () => {
@@ -1377,7 +1737,7 @@ describe('cmdInitMapCodebase', () => {
       path.join(__dirname, '..', 'gsd-core', 'workflows', 'map-codebase.md'), 'utf8'
     );
     // OpenCode must NOT appear in the "WITHOUT Task tool" / "NOT available" condition
-    const withoutLine = workflow.split('\n').find(l =>
+    const withoutLine = workflow.split(/\r?\n/).find(l =>
       l.includes('NOT available') || l.includes('WITHOUT Task tool')
     );
     assert.ok(withoutLine, 'workflow should have a line about Task tool NOT being available');
@@ -1426,6 +1786,9 @@ describe('cmdInitNewProject', () => {
   test('brownfield with codebase map does not need map', () => {
     fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
     fs.mkdirSync(path.join(tmpDir, '.planning', 'codebase'), { recursive: true });
+    for (const name of ['STACK', 'ARCHITECTURE', 'STRUCTURE', 'CONVENTIONS', 'TESTING', 'INTEGRATIONS', 'CONCERNS']) {
+      fs.writeFileSync(path.join(tmpDir, '.planning', 'codebase', `${name}.md`), `# ${name}\n`);
+    }
 
     const result = runGsdTools('init new-project', tmpDir);
     assert.ok(result.success, `Command failed: ${result.error}`);
@@ -2048,5 +2411,249 @@ describe('init handlers honor GSD_WORKSTREAM (ADR-0006 planningPaths consumption
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// #1912: init.progress fails safe in workstream mode with no active workstream
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('#1912 — init.progress fails safe in workstream mode with no active workstream', () => {
+  let tmpDir;
+
+  beforeEach(() => { tmpDir = createTempProject(); });
+  afterEach(() => { cleanup(tmpDir); });
+
+  function seedWs(name, milestoneVersion) {
+    const wsDir = path.join(tmpDir, '.planning', 'workstreams', name);
+    fs.mkdirSync(path.join(wsDir, 'phases'), { recursive: true });
+    fs.writeFileSync(
+      path.join(wsDir, 'STATE.md'),
+      `# State\n\n**Status:** executing\n**Milestone:** ${milestoneVersion}\n`,
+    );
+    fs.writeFileSync(
+      path.join(wsDir, 'ROADMAP.md'),
+      `# Roadmap\n\n## Milestones\n- ${milestoneVersion} Test (Phase 1)\n\n## Phases\n### Phase 1: X\n**Goal:** do x\n`,
+    );
+    return wsDir;
+  }
+
+  test('errors (does NOT report stale root) when workstreams exist but none active', () => {
+    seedWs('alpha', 'v9.0');
+    seedWs('beta', 'v9.0');
+    // Stale root STATE — the misleading value that must never be silently reported.
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'milestone: v7.1\nstatus: executing\n');
+    // No active-workstream pointer, no --ws.
+    const result = runGsdTools('init progress', tmpDir);
+    assert.equal(result.success, false, 'should fail safe rather than report the stale root milestone');
+    assert.match(result.error || '', /workstream|--ws/i, 'error should name the workstream requirement');
+  });
+
+  test('succeeds with --ws (reads the named workstream, not root)', () => {
+    seedWs('alpha', 'v9.0');
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'milestone: v7.1\nstatus: executing\n');
+    const result = runGsdTools('init progress --ws alpha', tmpDir);
+    assert.ok(result.success, `should succeed with --ws: ${result.error}`);
+  });
+
+  test('flat mode (no workstreams dir) is unchanged', () => {
+    const result = runGsdTools('init progress', tmpDir);
+    assert.ok(result.success, `flat mode should still work: ${result.error}`);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // roadmap analyze command
 // ─────────────────────────────────────────────────────────────────────────────
+
+
+// ────────────────────────────────────────────────────────────────────────
+// Folded from tests/bug-3491-nested-git-worktree.test.cjs — consolidation epic #1969 (B6 #1975)
+// ────────────────────────────────────────────────────────────────────────
+{
+  const { describe: __foldDescribe } = require('node:test');
+  __foldDescribe("folded:bug-3491-nested-git-worktree (consolidation epic #1969 B6 #1975)", () => {
+// allow-test-rule: source-text-is-the-product (see #3491)
+// Bug #3491 — new-project workflow creates nested .git in subdirectory when
+// parent already has git repo.
+//
+// The workflow's `has_git` boolean was derived from `pathExists(cwd, '.git')`
+// — a shallow check that only sees a `.git` entry directly in the current
+// directory. Subdirectories of an existing git worktree therefore reported
+// `has_git: false`, causing the workflow's `git init` step to create a nested
+// `.git` inside the outer repo's worktree. Subsequent gsd-sdk commits then
+// targeted the nested repo instead of the outer one, silently dropping all
+// planning artefacts from the outer repo's history.
+//
+// This test asserts the corrected semantics, mirroring `git rev-parse
+// --is-inside-work-tree`:
+//
+//   - `has_git: true` is reported whenever the cwd is inside a git worktree,
+//     even when no `.git` entry is in cwd itself.
+//   - The init payload surfaces `git_worktree_root` and `in_nested_subdir` so
+//     the workflow can warn the user and skip `git init`.
+//   - The workflow markdown's `git init` step is gated on
+//     `in_nested_subdir: false`, never unconditional under `has_git: false`.
+
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execSync } = require('node:child_process');
+
+const { runGsdTools, cleanup } = require('./helpers.cjs');
+
+const WORKFLOW_PATH = path.join(
+  __dirname,
+  '..',
+  'gsd-core',
+  'workflows',
+  'new-project.md',
+);
+
+// ─── Helper: create outer git repo with a nested workstream subdir ─────────
+
+// On Windows the runtime emits forward slashes (git's convention) while
+// path.join produces backslashes — normalize both sides via the shared
+// toPosixPath helper before any equality comparison.
+const { toPosixPath: normalizePath } = require('./helpers.cjs');
+
+function createOuterRepoWithSubdir(prefix = 'bug-3491-') {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  // macOS /tmp -> /private/tmp; on Windows the runner's %TEMP% is the 8.3
+  // short-name (RUNNER~1) and the runtime resolves to the long form.
+  // realpathSync.native handles both; then normalize separators for compare.
+  const outerReal = fs.realpathSync.native(outer);
+  execSync('git init', { cwd: outerReal, stdio: 'pipe' });
+  execSync('git config user.email "test@test.com"', { cwd: outerReal, stdio: 'pipe' });
+  execSync('git config user.name "Test"', { cwd: outerReal, stdio: 'pipe' });
+  execSync('git config commit.gpgsign false', { cwd: outerReal, stdio: 'pipe' });
+  fs.writeFileSync(path.join(outerReal, 'README.md'), '# outer\n');
+  execSync('git add -A', { cwd: outerReal, stdio: 'pipe' });
+  execSync('git commit -m "initial"', { cwd: outerReal, stdio: 'pipe' });
+
+  const subdir = path.join(outerReal, 'workstreams', 'my-project');
+  fs.mkdirSync(subdir, { recursive: true });
+  return { outer: outerReal, subdir };
+}
+
+// ─── Behavioural tests against the live `init new-project` handler ─────────
+
+test('bug-3491: init new-project reports has_git: true inside parent git worktree', () => {
+  const { outer, subdir } = createOuterRepoWithSubdir();
+  try {
+    const result = runGsdTools('init new-project', subdir);
+    assert.ok(result.success, `init new-project failed: ${result.error}`);
+
+    const payload = JSON.parse(result.output);
+
+    // Core fix: shallow `.git in cwd` check was wrong — we are inside the
+    // outer worktree, so the workflow MUST see has_git: true.
+    assert.strictEqual(
+      payload.has_git,
+      true,
+      'expected has_git=true when cwd is inside an existing git worktree (parent .git)',
+    );
+
+    // The workflow needs the worktree root and a nesting flag to decide
+    // whether to skip `git init` and emit a friendly warning.
+    assert.strictEqual(
+      normalizePath(payload.git_worktree_root),
+      normalizePath(outer),
+      `expected git_worktree_root to be the outer repo (${outer}), got: ${payload.git_worktree_root}`,
+    );
+    assert.strictEqual(
+      payload.in_nested_subdir,
+      true,
+      'expected in_nested_subdir=true when cwd is a subdirectory of the worktree root',
+    );
+  } finally {
+    cleanup(outer);
+  }
+});
+
+test('bug-3491: init new-project reports has_git: true at worktree root with in_nested_subdir: false', () => {
+  const { outer } = createOuterRepoWithSubdir();
+  try {
+    const result = runGsdTools('init new-project', outer);
+    assert.ok(result.success, `init new-project failed: ${result.error}`);
+
+    const payload = JSON.parse(result.output);
+    assert.strictEqual(payload.has_git, true, 'has_git must be true at the worktree root');
+    assert.strictEqual(normalizePath(payload.git_worktree_root), normalizePath(outer));
+    assert.strictEqual(
+      payload.in_nested_subdir,
+      false,
+      'at the worktree root, in_nested_subdir must be false',
+    );
+  } finally {
+    cleanup(outer);
+  }
+});
+
+test('bug-3491: init new-project reports has_git: false outside any git worktree', () => {
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bug-3491-bare-')));
+  try {
+    const result = runGsdTools('init new-project', tmp);
+    assert.ok(result.success, `init new-project failed: ${result.error}`);
+    const payload = JSON.parse(result.output);
+    assert.strictEqual(payload.has_git, false);
+    assert.strictEqual(payload.in_nested_subdir, false);
+    assert.strictEqual(payload.git_worktree_root, null);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('bug-3491: init ingest-docs mirrors the same has_git semantics', () => {
+  // ingest-docs.md has the same shallow check and the same nested-init risk.
+  const { outer, subdir } = createOuterRepoWithSubdir('bug-3491-ingest-');
+  try {
+    const result = runGsdTools('init ingest-docs', subdir);
+    assert.ok(result.success, `init ingest-docs failed: ${result.error}`);
+    const payload = JSON.parse(result.output);
+    assert.strictEqual(
+      payload.has_git,
+      true,
+      'init ingest-docs must also detect parent worktree (#3491 related path)',
+    );
+    assert.strictEqual(normalizePath(payload.git_worktree_root), normalizePath(outer));
+    assert.strictEqual(payload.in_nested_subdir, true);
+  } finally {
+    cleanup(outer);
+  }
+});
+
+// ─── Workflow-text test: the deployed `new-project.md` must gate `git init` ─
+
+test('bug-3491: new-project.md gates `git init` on in_nested_subdir, not just has_git', () => {
+  const content = fs.readFileSync(WORKFLOW_PATH, 'utf-8');
+
+  // The pre-fix workflow had the literal sequence:
+  //
+  //   **If `has_git` is false:** Initialize git:
+  //   ```bash
+  //   git init
+  //   ```
+  //
+  // …which fires for any subdirectory of an existing repo. The fix must
+  // either gate the init on `in_nested_subdir`/worktree-root semantics or
+  // drop the unconditional `git init` block entirely.
+  const unconditionalInitPattern =
+    /\*\*If `has_git` is false:\*\* Initialize git:\s*\r?\n+```bash\s*\r?\ngit init\s*\r?\n```/;
+  assert.ok(
+    !unconditionalInitPattern.test(content),
+    'new-project.md must not run `git init` unconditionally on has_git=false (#3491). ' +
+      'Gate it on `in_nested_subdir === false` so the workflow refuses to create ' +
+      'a nested .git inside an existing worktree.',
+  );
+
+  // The fixed workflow MUST mention the new field so reviewers can see the
+  // gating exists. (Workflow markdown IS the deployed product — testing it
+  // as text is the only end-to-end signal we have.)
+  assert.ok(
+    /in_nested_subdir/.test(content),
+    'new-project.md must reference `in_nested_subdir` after the #3491 fix',
+  );
+});
+  });
+}

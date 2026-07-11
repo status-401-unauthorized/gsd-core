@@ -228,6 +228,33 @@ node scripts/release-notes/format-github-release-notes.cjs \
 Omit `--apply` to print the reformatted body to stdout for review without
 publishing.
 
+### PR title convention (enforced at open time)
+
+Because the changelog is built from PR titles, your **PR title** must follow:
+
+```
+type(#<issue>): short summary
+```
+
+- **Start with the type** — `feat`, `fix`, or any other conventional type
+  (`chore`, `docs`, `refactor`, …). No leading tags or prefixes: a title like
+  `[security] fix(config): …` defeats the `^fix` bucket anchor and silently
+  files the entry under the wrong changelog section.
+- **Put the linked issue ref in the scope** — `(#<digits>)`. This is what
+  renders as a link to the issue in the changelog line. `fix(core): …` buckets
+  correctly but produces a changelog entry with **no issue link**.
+- A breaking-change marker is fine: `feat(#42)!: …`.
+
+Examples: `fix(#1542): roadmap rollback`, `feat(#39): milestone-prefixed phase IDs`,
+`enhance(#1549): add PR-title validator`.
+
+**CI enforcement:** `pr-title-validator.yml` checks the title on open/edit and
+fails with the required format if it doesn't conform. It reuses the same matcher
+the changelog classifier uses (`scripts/release-notes/conventional-title.cjs`), so a title
+that passes the check is guaranteed to bucket and link correctly. Fix a flagged
+title by editing it in place — the check re-runs on edit, no need to recreate
+the PR.
+
 ## Documentation Updates — Update the Relevant Docs
 
 If your PR adds, changes, deprecates, or removes user-visible behavior, you **must** update the relevant documentation in `docs/`. CI will fail any PR whose changeset fragment is typed `Added`, `Changed`, `Deprecated`, or `Removed` without also modifying at least one file under `docs/` ([#3213](https://github.com/open-gsd/gsd-core/issues/3213)).
@@ -790,6 +817,7 @@ The following checks run on every PR in addition to the test suite:
 | Job | What it checks | How to pass |
 |-----|----------------|-------------|
 | `Lint — ESLint` | No source-grep tests (see above), via the `local/no-source-grep` rule | Replace with `runGsdTools()` behavioral tests, or add `// allow-test-rule: <reason>` |
+| `Lint — cross-platform portability` | Windows-portability defects in tests, via `local/no-path-literal-in-assert` (more rules land per [ADR-1703](docs/adr/1703-portability-enforcement-architecture.md)) — e.g. a path-returning call asserted against a hardcoded `/`-literal | Normalize the actual: `String(pathFn(...)).replace(/\\/g, '/')`, or structure platform-specific code behind a `process.platform !== 'win32'` guard. **No `eslint-disable`** — see [cross-platform-portability-rules.md](docs/contributing/cross-platform-portability-rules.md) |
 
 Run locally before pushing: `npm run lint` (or `npx eslint .`)
 
@@ -834,7 +862,7 @@ Defensive normalization at trust boundaries must validate both the value's type 
 
 - **CommonJS** (`.cjs`) — the project uses `require()`, not ESM `import`
 - **No external dependencies in core** — `gsd-tools.cjs` and all lib files use only Node.js built-ins
-- **Conventional commits** — `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `ci:`
+- **Conventional commits** — `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `ci:`. The full grammar is `<type>(<scope>): <subject>` (enforced by `hooks/gsd-validate-commit.sh`; subject ≤72 chars, lowercase, imperative mood, no trailing period). When the work resolves a tracked issue, put the issue number in the scope: `fix(#1520): randomize mktemp temp paths on BSD/macOS`. The same convention applies to PR titles — release notes are grouped by the title's type prefix (`feat` → Feature, `fix` → Fix, everything else → Enhancement).
 
 ## File Structure
 

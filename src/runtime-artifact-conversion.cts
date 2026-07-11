@@ -21,9 +21,82 @@ import os from 'node:os';
 import fs from 'node:fs';
 import commandRoster = require('./command-roster.cjs');
 const { readGsdCommandNames, transformContentToHyphen } = commandRoster;
-const pkg = require('../../../package.json');
 import runtimeNamePolicy = require('./runtime-name-policy.cjs');
 const { getDirName } = runtimeNamePolicy;
+import capabilityRegistry = require('./capability-registry.cjs');
+
+// #1383: resolve GSD's version WITHOUT a top-level
+// `require('../../../package.json')`. That require ran at module load on every
+// gsd-tools invocation (this module sits in the gsd-tools loader chain) and
+// threw `Cannot find module '../../../package.json'` on runtimes whose root has
+// no package.json — notably Codex, where the installer omits the synthetic root
+// package.json — taking the entire CLI down before it did anything. And even
+// where it resolved (Claude's synthetic `{"type":"commonjs"}`), there is no
+// `version` field, so the single consumer below already emitted
+// `version: undefined`. Resolve lazily and defensively instead:
+//   1. Installed trees carry <root>/gsd-core/VERSION (written by the installer);
+//      this module lives at <root>/gsd-core/bin/lib, so VERSION is two dirs up.
+//   2. The source / npm-package tree has no gsd-core/VERSION but carries a real
+//      package.json three dirs up — read it lazily, never at module-load time.
+// A failed/invalid lookup degrades to '' (the caller omits the field) rather
+// than crashing or emitting `version: undefined`. Both sources are validated
+// against the same semver shape the repo's other VERSION reader enforces
+// (src/update-context.cts) so a garbled VERSION file is never emitted verbatim.
+// Exported for the #1383 regression.
+const SEMVER_PREFIX = /^\d+\.\d+\.\d+/; // mirrors src/update-context.cts SEMVER_PREFIX
+function resolveVersionFrom(libDir: string): string {
+  try {
+    const v = fs.readFileSync(path.join(libDir, '..', '..', 'VERSION'), 'utf8').trim();
+    if (SEMVER_PREFIX.test(v)) return v;
+  } catch { /* not an installed tree (no gsd-core/VERSION) */ }
+  try {
+    const pkg = require(path.join(libDir, '..', '..', '..', 'package.json'));
+    if (pkg && typeof pkg.version === 'string' && SEMVER_PREFIX.test(pkg.version)) return pkg.version;
+  } catch { /* runtime root has no package.json (e.g. Codex) */ }
+  return '';
+}
+
+let cachedVersion: string | undefined;
+function gsdVersion(): string {
+  if (cachedVersion === undefined) cachedVersion = resolveVersionFrom(__dirname);
+  return cachedVersion;
+}
+
+/**
+ * Host-specific install behaviors declared on the runtime descriptor
+ * (capabilities/<runtime>/capability.json -> runtime.hostBehaviors). Mirrors
+ * bin/install.js's / install-engine.cts's `_hostBehaviors` (ADR-1239 / #2086
+ * / #2092). Returns {} for runtimes that declare none, so every behavior
+ * branch degrades to the generic path by default. Unlike the bin/install.js
+ * and install-engine.cts variants, this module already imports
+ * `capabilityRegistry` statically (see NON_CLAUDE_RUNTIMES below), so this
+ * reads it directly rather than re-require()-ing inside a try/catch.
+ */
+function _hostBehaviors(runtime: string): Record<string, unknown> {
+  return (
+    (capabilityRegistry &&
+      capabilityRegistry.runtimes &&
+      capabilityRegistry.runtimes[runtime] &&
+      capabilityRegistry.runtimes[runtime].runtime &&
+      capabilityRegistry.runtimes[runtime].runtime.hostBehaviors) ||
+    {}
+  );
+}
+
+/**
+ * Public accessor for the `hostBehaviors.agentFileExtension` descriptor field
+ * (ADR-1239 / #2099 / #2103). Returns the runtime's declared agent-file
+ * destination-suffix rename target (e.g. copilot's `.agent.md`), or
+ * `undefined` when the runtime declares none (the generic no-rename
+ * default). Exported so callers outside this module (surface.cts's
+ * `_syncGsdDir`) can derive the SAME rename decision as
+ * install-engine.cts's staged-copy loop from ONE descriptor read, instead of
+ * duplicating a hardcoded `runtime === 'copilot'` check (#2103 fold).
+ */
+function agentFileExtensionFor(runtime: string): string | undefined {
+  const ext = _hostBehaviors(runtime).agentFileExtension;
+  return typeof ext === 'string' ? ext : undefined;
+}
 
 
 const colorNameToHex = {
@@ -393,11 +466,16 @@ function convertClaudeCommandToClaudeSkill(content, skillName, runtime = null, c
   // Hermes' SKILL.md spec lists `version` as a required frontmatter field.
   // Track GSD's package version so Hermes' skill_view() reports a stable
   // identifier per install.
-  if (runtime === 'hermes') fm += `version: ${yamlQuote(pkg.version)}\n`;
-  // #778 (b) — Qwen-only numeric priority for /skills ordering. Scoped to qwen
-  // so Claude/Hermes skill frontmatter is unchanged (they ignore the field, but
-  // we keep their output byte-stable). skillName is the `gsd-<stem>` dir name.
-  if (runtime === 'qwen') {
+  if (runtime === 'hermes') {
+    const version = gsdVersion();
+    if (version) fm += `version: ${yamlQuote(version)}\n`;
+  }
+  // #778 (b) — numeric priority for /skills ordering, declared on the runtime
+  // descriptor (runtime.hostBehaviors.skillPriorityFrontmatter). Scoped to
+  // runtimes that declare the flag so Claude/Hermes skill frontmatter is
+  // unchanged (they ignore the field, but we keep their output byte-stable).
+  // skillName is the `gsd-<stem>` dir name. (ADR-1239 / #2092)
+  if (_hostBehaviors(runtime).skillPriorityFrontmatter) {
     const stem = typeof skillName === 'string' && skillName.startsWith('gsd-')
       ? skillName.slice(4)
       : skillName;
@@ -442,6 +520,14 @@ function convertGsdCommandReferencesToKimiSkillInvocations(content, cmdNames) {
     .replace(hyphenPattern, (_, cmd) => `/skill:gsd-${cmd}`);
 }
 
+// DEFECT.GENERATIVE-FIX: this body is mirrored in bin/install.js's
+// convertClaudeCommandToKimiSkill (kept for bin/install.js's own
+// module-level export/test surface; dead for the live skills-install path,
+// which routes here via install-engine.cts's SKILLS_CONVERTER_REGISTRY
+// through the kimi capability descriptor's artifactLayout
+// `converter: "convertClaudeCommandToKimiSkill"`). Neither copy re-exports
+// the other — mirror any behavior change into both. Guarded by the
+// output-parity test in tests/runtime-converters.test.cjs (#2095).
 function convertClaudeCommandToKimiSkill(content, skillName, _runtime = null, cmdNames = null) {
   const { frontmatter, body } = extractFrontmatterAndBody(content);
   const kimiSkillName = normalizeKimiSkillName(skillName);
@@ -586,6 +672,15 @@ function buildKimiSubagentYaml({ name, description, tools }) {
   return `${lines.join('\n')}\n`;
 }
 
+// DEFECT.GENERATIVE-FIX: this body is mirrored in bin/install.js's
+// buildKimiAgentArtifacts (kept for bin/install.js's own module-level
+// export/test surface; dead for the live install path, which routes here via
+// runtime-artifact-layout.cts's kimiAgentsKind through a dynamic
+// `conversionExports['buildKimiAgentArtifacts']` lookup against this
+// compiled module). Neither copy re-exports the other — mirror any behavior
+// change into both, including the kimi_cli.tools.agent:Agent grant that
+// enables background dispatch (#2095 Upgrade 2). Guarded by the
+// output-parity test in tests/runtime-converters.test.cjs (#2095).
 function buildKimiAgentArtifacts({
   rootAgent = '',
   subagents = [],
@@ -902,20 +997,18 @@ function convertClaudeToWindsurfMarkdown(content) {
   // Replace subagent_type from Claude to Windsurf format
   converted = converted.replace(/subagent_type="general-purpose"/g, 'subagent_type="generalPurpose"');
   converted = converted.replace(/\$ARGUMENTS\b/g, '{{GSD_ARGS}}');
-  // Replace project-level Claude conventions with Windsurf/Devin equivalents
-  // Workspace skills install to .devin/ (Devin Desktop preferred dir, #1085).
-  // Legacy .windsurf/ is still recognized on read but new installs use .devin/.
-  converted = converted.replace(/`\.\/CLAUDE\.md`/g, '`.devin/rules`');
-  converted = converted.replace(/\.\/CLAUDE\.md/g, '.devin/rules');
-  converted = converted.replace(/`CLAUDE\.md`/g, '`.devin/rules`');
-  converted = converted.replace(/\bCLAUDE\.md\b/g, '.devin/rules');
-  converted = converted.replace(/\.claude\/skills\//g, '.devin/skills/');
-  converted = converted.replace(/\.\/\.claude\//g, './.devin/');
-  converted = converted.replace(/\.claude\//g, '.devin/');
+  // Replace project-level Claude conventions with Windsurf equivalents.
+  converted = converted.replace(/`\.\/CLAUDE\.md`/g, '`.windsurf/rules`');
+  converted = converted.replace(/\.\/CLAUDE\.md/g, '.windsurf/rules');
+  converted = converted.replace(/`CLAUDE\.md`/g, '`.windsurf/rules`');
+  converted = converted.replace(/\bCLAUDE\.md\b/g, '.windsurf/rules');
+  converted = converted.replace(/\.claude\/skills\//g, '.windsurf/skills/');
+  converted = converted.replace(/\.\/\.claude\//g, './.windsurf/');
+  converted = converted.replace(/\.claude\//g, '.windsurf/');
   // Bare forms (no trailing slash) — after slash forms to avoid double-rewrite.
   // Use negative lookahead (?![\w-]) to preserve .claude-plugin and .claudeignore.
-  converted = converted.replace(/~\/\.claude(?![\w-])/g, '~/.devin');
-  converted = converted.replace(/\$HOME\/\.claude(?![\w-])/g, '$HOME/.devin');
+  converted = converted.replace(/~\/\.claude(?![\w-])/g, '~/.windsurf');
+  converted = converted.replace(/\$HOME\/\.claude(?![\w-])/g, '$HOME/.windsurf');
   // Environment variable name rewrite
   converted = converted.replace(/\bCLAUDE_CONFIG_DIR\b/g, 'WINDSURF_CONFIG_DIR');
   // Remove Claude Code-specific bug workarounds before brand replacement
@@ -969,6 +1062,33 @@ function convertClaudeCommandToWindsurfSkill(content, skillName) {
   return `---\nname: ${yamlIdentifier(skillName)}\ndescription: ${yamlQuote(shortDescription)}\n---\n\n${adapter}\n\n${body.trimStart()}`;
 }
 
+function convertClaudeCommandToWindsurfWorkflow(content, commandName) {
+  // #1615 security: commandName flows unsanitized into a markdown body that
+  // Windsurf loads as an LLM-readable workflow. Validate at entry to prevent
+  // (a) prompt injection via newlines / markdown structure in the filename,
+  // (b) path-component injection via .., /, \ in stem → @-reference target.
+  // Pattern: optional gsd- prefix + lowercase alphanumeric + dashes; rejects
+  // everything else. See DEFECT.PROMPT-INJECTION-SCAN-COLLISION and the
+  // PR #1622 security review.
+  if (typeof commandName !== 'string' || !/^(?:gsd-)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(commandName)) {
+    const preview = typeof commandName === 'string' ? JSON.stringify(commandName.slice(0, 60)) : String(commandName);
+    throw new Error(
+      `convertClaudeCommandToWindsurfWorkflow: rejected commandName ${preview}; ` +
+      'must match /^(?:gsd-)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/ (no slashes, backslashes, spaces, dots, trailing dash, or control chars — prevents prompt injection and path-component injection into the workflow body)'
+    );
+  }
+  const converted = convertClaudeToWindsurfMarkdown(content);
+  const { frontmatter } = extractFrontmatterAndBody(converted);
+  const description = frontmatter ? extractFrontmatterField(frontmatter, 'description') : '';
+  const stem = commandName.startsWith('gsd-') ? commandName.slice(4) : commandName;
+  const workflow = `# ${commandName}\n\n${toSingleLine(description || `Run ${commandName}.`)}\n\nRead and execute the GSD command at @~/.claude/gsd-core/commands/gsd/${stem}.md end-to-end. Treat the user's message after /${commandName} as the command arguments.`;
+  const byteLength = Buffer.byteLength(workflow, 'utf8');
+  if (byteLength > 12000) {
+    throw new Error(`Windsurf workflow ${commandName} exceeds 12000 bytes (${byteLength}); extract references before installing`);
+  }
+  return workflow;
+}
+
 // --- Augment converters ---
 // Augment uses a tool set similar to Cursor/Windsurf.
 // Config lives in .augment/ (local) and ~/.augment/ (global).
@@ -1001,6 +1121,11 @@ function convertClaudeToAugmentMarkdown(content) {
   converted = converted.replace(/\bClaude Code\b/g, 'Augment');
   return converted;
 }
+
+// #2097 (ADR-1239): command-body converters selected by descriptor
+// (runtime.hostBehaviors.commandBodyConverter) instead of a runtime-name
+// branch. Degrade-closed: unknown/absent name → no conversion.
+const COMMAND_BODY_CONVERTERS = { convertClaudeToAugmentMarkdown };
 
 function getAugmentSkillAdapterHeader(skillName) {
   return `<augment_skill_adapter>
@@ -1081,6 +1206,12 @@ function convertClaudeToTraeMarkdown(content) {
   return converted;
 }
 
+// DEFECT.GENERATIVE-FIX: this body is mirrored in bin/install.js's
+// convertClaudeCommandToTraeSkill (dead for the live skills-install path,
+// which routes here via install-engine.cts's SKILLS_CONVERTER_REGISTRY; kept
+// for bin/install.js's own module-level export/test surface). Neither copy
+// re-exports the other — mirror any behavior change into both. Guarded by
+// the output-parity test in tests/runtime-converters.test.cjs (#2094).
 function convertClaudeCommandToTraeSkill(content, skillName) {
   const converted = convertClaudeToTraeMarkdown(content);
   const { frontmatter, body } = extractFrontmatterAndBody(converted);
@@ -1095,7 +1226,16 @@ function convertClaudeCommandToTraeSkill(content, skillName) {
   const shortDescription = description.length > 180 ? `${description.slice(0, 177)}...` : description;
   // #2876: quote so YAML flow indicators (`[BETA] …`) don't break Trae's
   // frontmatter parser.
-  return `---\nname: ${yamlIdentifier(skillName)}\ndescription: ${yamlQuote(shortDescription)}\n---\n${body}`;
+  let fm = `---\nname: ${yamlIdentifier(skillName)}\ndescription: ${yamlQuote(shortDescription)}\n`;
+  // #2094: emit `stage:` so Trae's SOLO agent can auto-invoke GSD skills at
+  // the corresponding stage (docs.trae.ai/ide/agent). The field name/schema
+  // is not formally documented (thin SPA docs) — descriptor-driven, single
+  // fixed GSD-side value (runtime.hostBehaviors.soloStageMetadata), inferred/
+  // best-effort.
+  const soloStage = _hostBehaviors('trae').soloStageMetadata as string | undefined;
+  if (soloStage) fm += `stage: ${soloStage}\n`;
+  fm += '---';
+  return `${fm}\n${body}`;
 }
 
 function convertSlashCommandsToCodebuddySkillMentions(content) {
@@ -1675,7 +1815,12 @@ function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOve
 }
 
 // Kilo CLI — same conversion logic as OpenCode, different config paths.
-function convertClaudeToKiloFrontmatter(content, { isAgent = false } = {}) {
+// DEFECT.GENERATIVE-FIX: this body is mirrored in bin/install.js's
+// convertClaudeToKiloFrontmatter (used by bin/install.js's own legacy install
+// path). Neither copy re-exports the other — mirror any behavior change into
+// both. Guarded by the output-parity test in tests/runtime-converters.test.cjs
+// (#2093).
+function convertClaudeToKiloFrontmatter(content, { isAgent = false, modelOverride = null } = {}) {
   // Replace tool name references in content (applies to all files)
   let convertedContent = content;
   convertedContent = convertedContent.replace(/\bAskUserQuestion\b/g, 'question');
@@ -1834,6 +1979,14 @@ function convertClaudeToKiloFrontmatter(content, { isAgent = false } = {}) {
   // For agents: add required Kilo agent fields
   if (isAgent) {
     newLines.push('mode: subagent');
+    // Embed model override from ~/.gsd/defaults.json so model_overrides is
+    // respected on Kilo (which uses static agent frontmatter, not inline
+    // Task() model parameters) — mirrors convertClaudeToOpencodeFrontmatter's
+    // model emission exactly (#2093 UPGRADE 2 / ADR-1239; Kilo is an OpenCode
+    // fork with the same static-frontmatter model constraint). See #2256.
+    if (modelOverride) {
+      newLines.push(['model:', modelOverride].join(' '));
+    }
     newLines.push(...buildKiloAgentPermissionBlock(agentTools));
   }
 
@@ -1903,11 +2056,17 @@ function convertGeminiToolName(claudeTool) {
   // Task/Agent: exclude — agents are auto-registered as callable tools.
   // AskUserQuestion: exclude — Gemini CLI does not expose an ask_user tool;
   // emitting it causes frontmatter validation errors (#3362).
+  // Skill/SlashCommand: exclude — Gemini CLI has no 'skill' built-in tool;
+  // the lowercase fallback would emit an invalid 'skill'/'slashcommand' name
+  // that fails frontmatter validation (tools.N: Invalid tool name) and aborts
+  // the entire agent load (#1394).
   if (
     claudeTool === 'Task' ||
     claudeTool === 'Agent' ||
     claudeTool === 'AskUserQuestion' ||
-    claudeTool === 'ask_user'
+    claudeTool === 'ask_user' ||
+    claudeTool === 'Skill' ||
+    claudeTool === 'SlashCommand'
   ) {
     return null;
   }
@@ -2069,6 +2228,77 @@ function convertClaudeAgentToTraeAgent(content) {
   return `${cleanFrontmatter}\n${body}`;
 }
 
+/**
+ * Convert a Claude agent (.md) to a native Qwen Code subagent file
+ * (`.qwen/agents/gsd-*.md` / `<qwenhome>/agents/gsd-*.md`, ADR-1239 / #2092
+ * Phase B Upgrade 1). Qwen Code is a Claude-dialect host: its docs' "Claude
+ * Code Compatibility Fields" section confirms CC agent files parse under
+ * `.qwen/agents/` (https://qwenlm.github.io/qwen-code-docs/en/users/features/sub-agents),
+ * so — unlike Cursor/Trae/Copilot/Antigravity — tool names pass through
+ * UNCHANGED (no remapping table).
+ *
+ * Emits DETERMINISTIC frontmatter: `name:` + `description:` (mirrors
+ * convertClaudeAgentToCursorAgent), plus `tools:` as a YAML block list when the
+ * source declares one. Qwen's documented `tools:` schema is a YAML array
+ * (`tools:\n- tool1\n- tool2`), not Claude's single-line comma-separated string
+ * — passing the raw single-line string through unchanged would parse as one
+ * malformed tool name and be silently dropped ("Optional fields with invalid
+ * values are silently dropped at parse time" — same docs page). Reuses
+ * `parseFrontmatterTools` (already relied on by the Kimi agent path), which
+ * tolerates BOTH source formats Claude's own agents/*.md files use — the
+ * single-line comma list (most agents) and the YAML block list (e.g.
+ * agents/gsd-nyquist-auditor.md, agents/gsd-security-auditor.md) — so no tools
+ * are lost regardless of which the source agent uses.
+ *
+ * `color` IS preserved: Qwen's docs list `color` under "Claude Code
+ * Compatibility Fields" as a supported optional field, so it is passed
+ * through as a plain scalar (unlike the cursor/trae/augment/windsurf
+ * reduced-frontmatter converters, which drop it — those hosts have no such
+ * compatibility field). `model:` and `approvalMode:` are intentionally NOT
+ * emitted: both are optional per the docs and out of scope for #2092 (model:
+ * would couple to the model catalog and introduce nondeterminism;
+ * approvalMode is a deliberate follow-on).
+ *
+ * Body: preserved verbatim after the qwen branding rewrite (CLAUDE.md /
+ * Claude Code / .claude/ literal-substring values — descriptor-driven via
+ * runtime.hostBehaviors.brandingRewrites, mirrors the qwen case in
+ * _applyRuntimeRewrites). The anchored `~/.claude/` / `$HOME/.claude/` forms
+ * are already rewritten upstream by applyAgentPathRewrites (agentCtx Step 1 in
+ * stageAgentsForRuntimeWithConverter) before this converter runs, so only the
+ * bare/non-anchored forms are handled here — mirrors how
+ * convertClaudeToTraeMarkdown orders its bare-form rewrites after the slash
+ * forms to avoid double-rewriting the same substring.
+ */
+function convertClaudeAgentToQwenAgent(content) {
+  const _b = _hostBehaviors('qwen').brandingRewrites || {};
+  let converted = content;
+  if (_b['CLAUDE.md']) converted = converted.replace(/CLAUDE\.md/g, _b['CLAUDE.md']);
+  if (_b['Claude Code']) converted = converted.replace(/\bClaude Code\b/g, _b['Claude Code']);
+  if (_b['.claude/']) converted = converted.replace(/\.claude\//g, _b['.claude/']);
+
+  const { frontmatter, body } = extractFrontmatterAndBody(converted);
+  if (!frontmatter) return converted;
+
+  const name = extractFrontmatterField(frontmatter, 'name') || 'unknown';
+  const description = extractFrontmatterField(frontmatter, 'description') || '';
+  const tools = parseFrontmatterTools(frontmatter);
+  const color = extractFrontmatterField(frontmatter, 'color');
+
+  let fm = `---\nname: ${yamlIdentifier(name)}\ndescription: ${yamlQuote(toSingleLine(description))}\n`;
+  if (tools.length > 0) {
+    fm += 'tools:\n';
+    for (const tool of tools) {
+      fm += `  - ${yamlIdentifier(tool)}\n`;
+    }
+  }
+  if (color) {
+    fm += `color: ${yamlIdentifier(color)}\n`;
+  }
+  fm += '---';
+
+  return `${fm}\n${body}`;
+}
+
 function convertClaudeAgentToCodebuddyAgent(content) {
   const converted = convertClaudeToCodebuddyMarkdown(content);
 
@@ -2200,10 +2430,51 @@ function convertClaudeCommandToKiloSkill(content, skillName) {
  * @private — exported as `_computePathPrefix` for tests.
  */
 function computePathPrefix({ isGlobal, isOpencode, isWindowsHost: _isWindowsHost, resolvedTarget, homeDir }) {
-  if (isGlobal && resolvedTarget.startsWith(homeDir) && !isOpencode) {
-    return '$HOME' + resolvedTarget.slice(homeDir.length) + '/';
+  // #1615: normalize Windows backslashes to forward slashes. This prefix is
+  // substituted into markdown @-references (e.g. Windsurf workflow files),
+  // which use POSIX paths universally. Idempotent on POSIX (no backslashes).
+  // Without this, path.join on Windows produces a backslash prefix that
+  // leaks into markdown content and breaks cross-platform substring checks.
+  // See DEFECT.WINDOWS-PATH-LEAK-IN-MARKDOWN-CONTENT in CONTEXT.md.
+  const posixTarget = String(resolvedTarget).replace(/\\/g, '/');
+  const posixHome = homeDir ? String(homeDir).replace(/\\/g, '/') : homeDir;
+  if (isGlobal && posixTarget.startsWith(posixHome) && !isOpencode) {
+    return '$HOME' + posixTarget.slice(posixHome.length) + '/';
   }
-  return `${resolvedTarget}/`;
+  return `${posixTarget}/`;
+}
+
+/**
+ * Canonical list of every non-Claude runtime that gsd-core emits artifacts for.
+ * DERIVED from the capability registry (ADR-1239 Phase B, #1679) — the registry's
+ * `runtimes` map is the single source of truth for runtime identity, so the
+ * non-Claude set is its key set minus 'claude'. This replaces a hand-maintained
+ * literal that had to be kept in sync with bin/install.js and getDirName(), and
+ * can no longer drift from the registry. Exported so tests import one source (#1521).
+ */
+const NON_CLAUDE_RUNTIMES: string[] = Object.keys(capabilityRegistry.runtimes)
+  .filter((id) => id !== 'claude')
+  .sort();
+
+/**
+ * #1521: Every non-Claude runtime resolves its own runtime identity from a
+ * runtime-neutral config, and defaults workflow.use_worktrees to false —
+ * GSD's worktree isolation uses Claude Code's isolation="worktree" spawn
+ * parameter, which no other runtime honors. Stamped into the emitted
+ * workflow runtime-resolution blocks. (Generalizes the Codex-only #1515 fix.)
+ *
+ * @private — exported as `_stampNonClaudeRuntimeDefaults` for tests.
+ */
+function _stampNonClaudeRuntimeDefaults(content: string, runtime: string): string {
+  content = content.replace(
+    /config-get workflow\.use_worktrees --raw 2>\/dev\/null \|\| echo "true"/g,
+    'config-get workflow.use_worktrees --default false --raw 2>/dev/null || echo "false"',
+  );
+  content = content.replace(
+    /config-get runtime --default claude --raw 2>\/dev\/null \|\| echo "claude"/g,
+    `config-get runtime --default ${runtime} --raw 2>/dev/null || echo "${runtime}"`,
+  );
+  return content;
 }
 
 /**
@@ -2220,26 +2491,20 @@ function _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal = false, a
   const dirName = getDirName(runtime);
   const normalizedPathPrefix = pathPrefix.replace(/\/$/, '');
 
+  // #1521: stamp runtime identity + use_worktrees=false for every non-Claude runtime
+  // before brand-specific path rewrites, so the replace operates on the pristine
+  // source line and is idempotent regardless of subsequent path substitutions.
+  if (runtime !== 'claude') {
+    content = _stampNonClaudeRuntimeDefaults(content, runtime);
+  }
+
   switch (runtime) {
     case 'codex':
       content = content.replace(/~\/\.claude\//g, pathPrefix);
       content = content.replace(/\$HOME\/\.claude\//g, pathPrefix);
       content = content.replace(/\.\/\.claude\//g, `./${dirName}/`);
       content = content.replace(/~\/\.codex\//g, pathPrefix);
-      // #1515: stamp Codex's own runtime identity + safe worktree default into
-      // emitted workflow runtime-resolution blocks. A Codex install with a
-      // runtime-neutral .planning/config.json must resolve RUNTIME=codex (Codex
-      // cannot honor Claude's isolation="worktree"), and default
-      // workflow.use_worktrees to false so the fail-closed guard lets execution
-      // proceed without worktrees instead of falling back to Claude semantics.
-      content = content.replace(
-        /config-get runtime --default claude --raw 2>\/dev\/null \|\| echo "claude"/g,
-        'config-get runtime --default codex --raw 2>/dev/null || echo "codex"',
-      );
-      content = content.replace(
-        /config-get workflow\.use_worktrees --raw 2>\/dev\/null \|\| echo "true"/g,
-        'config-get workflow.use_worktrees --default false --raw 2>/dev/null || echo "false"',
-      );
+      // #1515 stamp moved to _stampNonClaudeRuntimeDefaults (#1521 generalisation).
       content = processAttribution(content, attribution);
       break;
 
@@ -2284,19 +2549,24 @@ function _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal = false, a
       break;
     }
 
-    case 'augment':
+    case 'augment': {
       content = content.replace(/~\/\.claude\//g, pathPrefix);
       content = content.replace(/\$HOME\/\.claude\//g, pathPrefix);
       content = content.replace(/\.\/\.claude\//g, `./${dirName}/`);
       content = content.replace(/~\/\.claude(?![\w-])/g, normalizedPathPrefix);
       content = content.replace(/\$HOME\/\.claude(?![\w-])/g, normalizedPathPrefix);
       content = content.replace(/\.\/\.claude(?![\w-])/g, `./${dirName}`);
-      content = content.replace(/~\/\.augment\//g, pathPrefix);
-      content = content.replace(/\$HOME\/\.augment\//g, pathPrefix);
-      content = content.replace(/~\/\.augment(?![\w-])/g, normalizedPathPrefix);
-      content = content.replace(/\$HOME\/\.augment(?![\w-])/g, normalizedPathPrefix);
+      // #2097: dot-dir self-references (~/.augment/…) → resolved prefix,
+      // dirName-derived (no runtime literal). getDirName('augment') resolves
+      // to '.augment', so this is byte-identical to the prior hardcoded regexes.
+      const _dd = escapeRegExp(dirName);
+      content = content.replace(new RegExp('~/' + _dd + '/', 'g'), pathPrefix);
+      content = content.replace(new RegExp('\\$HOME/' + _dd + '/', 'g'), pathPrefix);
+      content = content.replace(new RegExp('~/' + _dd + '(?![\\w-])', 'g'), normalizedPathPrefix);
+      content = content.replace(new RegExp('\\$HOME/' + _dd + '(?![\\w-])', 'g'), normalizedPathPrefix);
       content = processAttribution(content, attribution);
       break;
+    }
 
     case 'trae':
       content = content.replace(/~\/\.claude\//g, pathPrefix);
@@ -2305,7 +2575,10 @@ function _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal = false, a
       content = content.replace(/~\/\.claude\b/g, normalizedPathPrefix);
       content = content.replace(/\$HOME\/\.claude\b/g, normalizedPathPrefix);
       content = content.replace(/\.\/\.claude\b/g, `./${dirName}`);
-      content = content.replace(/~\/\.trae\//g, pathPrefix);
+      // #2094: descriptor-driven — dirName resolves to '.trae' via
+      // getDirName()/localConfigDir, so this regex is built rather than
+      // hardcoded as `/~\/\.trae\//g` (byte-identical output for trae).
+      content = content.replace(new RegExp('~/' + escapeRegExp(dirName) + '/', 'g'), pathPrefix);
       content = processAttribution(content, attribution);
       break;
 
@@ -2338,9 +2611,20 @@ function _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal = false, a
       content = processAttribution(content, attribution);
       break;
 
-    case 'qwen':
-      content = content.replace(/CLAUDE\.md/g, 'QWEN.md');
-      content = content.replace(/\bClaude Code\b/g, 'Qwen Code');
+    // Descriptor-driven brand literals (ADR-1239 / #2092): the qwen/hermes
+    // brand VALUES (CLAUDE.md/Claude Code/.claude/ replacements) now read from
+    // runtime.hostBehaviors.brandingRewrites instead of hardcoded literals.
+    // EXACT regexes/order preserved — only the replacement values changed.
+    case 'qwen': {
+      // Guarded (post-review #2092): brandingRewrites is undefined if the
+      // capability registry fails to load — degrade closed (skip the
+      // brand-literal replacements, still apply the non-branding path
+      // rewrites below) instead of throwing on `_b['CLAUDE.md']`.
+      const _b = _hostBehaviors(runtime).brandingRewrites;
+      if (_b) {
+        content = content.replace(/CLAUDE\.md/g, _b['CLAUDE.md']);
+        content = content.replace(/\bClaude Code\b/g, _b['Claude Code']);
+      }
       content = content.replace(/~\/\.claude\//g, pathPrefix);
       content = content.replace(/\$HOME\/\.claude\//g, pathPrefix);
       content = content.replace(/~\/\.qwen\//g, pathPrefix);
@@ -2349,15 +2633,23 @@ function _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal = false, a
       content = content.replace(/\$HOME\/\.claude(?![\w-])/g, normalizedPathPrefix);
       content = content.replace(/~\/\.qwen(?![\w-])/g, normalizedPathPrefix);
       content = content.replace(/\$HOME\/\.qwen(?![\w-])/g, normalizedPathPrefix);
-      content = content.replace(/\.claude\//g, '.qwen/');
+      if (_b) {
+        content = content.replace(/\.claude\//g, _b['.claude/']);
+      }
       content = content.replace(/\.\/\.claude\//g, `./${dirName}/`);
       content = content.replace(/\.\/\.qwen\//g, `./${dirName}/`);
       content = processAttribution(content, attribution);
       break;
+    }
 
-    case 'hermes':
-      content = content.replace(/CLAUDE\.md/g, 'HERMES.md');
-      content = content.replace(/\bClaude Code\b/g, 'Hermes Agent');
+    case 'hermes': {
+      // Guarded (post-review #2092): see qwen case above — same degrade-closed
+      // rationale.
+      const _b = _hostBehaviors(runtime).brandingRewrites;
+      if (_b) {
+        content = content.replace(/CLAUDE\.md/g, _b['CLAUDE.md']);
+        content = content.replace(/\bClaude Code\b/g, _b['Claude Code']);
+      }
       content = content.replace(/~\/\.claude\//g, pathPrefix);
       content = content.replace(/\$HOME\/\.claude\//g, pathPrefix);
       content = content.replace(/~\/\.hermes\//g, pathPrefix);
@@ -2366,11 +2658,14 @@ function _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal = false, a
       content = content.replace(/\$HOME\/\.claude(?![\w-])/g, normalizedPathPrefix);
       content = content.replace(/~\/\.hermes(?![\w-])/g, normalizedPathPrefix);
       content = content.replace(/\$HOME\/\.hermes(?![\w-])/g, normalizedPathPrefix);
-      content = content.replace(/\.claude\//g, '.hermes/');
+      if (_b) {
+        content = content.replace(/\.claude\//g, _b['.claude/']);
+      }
       content = content.replace(/\.\/\.claude\//g, `./${dirName}/`);
       content = content.replace(/\.\/\.hermes\//g, `./${dirName}/`);
       content = processAttribution(content, attribution);
       break;
+    }
 
     case 'kimi':
       content = content.replace(/~\/\.claude\//g, pathPrefix);
@@ -2466,8 +2761,11 @@ function applyRuntimeContentRewritesForCommandsInPlace(stagedDir, runtime, pathP
       if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
       let content = fs.readFileSync(path.join(stagedDir, entry.name), 'utf8');
       content = _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal, attribution);
-      if (runtime === 'augment') {
-        content = convertClaudeToAugmentMarkdown(content);
+      // #2097 (ADR-1239): descriptor-driven — commandBodyConverter name comes
+      // from runtime.hostBehaviors instead of a hardcoded runtime-name branch.
+      const _cmdConv = _hostBehaviors(runtime).commandBodyConverter;
+      if (_cmdConv && COMMAND_BODY_CONVERTERS[_cmdConv]) {
+        content = COMMAND_BODY_CONVERTERS[_cmdConv](content);
       }
       fs.writeFileSync(path.join(tempDir, entry.name), content);
     }
@@ -2506,7 +2804,7 @@ function rewriteStagedSkillBodies(stagedDir, opts) {
   const resolvedTarget = path.resolve(configDir).replace(/\\/g, '/');
   const homeDir = homedir().replace(/\\/g, '/');
   const isGlobal = scope === 'global';
-  const isOpencode = runtime === 'opencode';
+  const isOpencode = false;  // #2087: opencode installs via the combined-family engine path, never through the generic rewrite
   const isWindowsHost = platform === 'win32';
   const pathPrefix = computePathPrefix({ isGlobal, isOpencode, isWindowsHost, resolvedTarget, homeDir });
   const attribution = resolveAttribution ? resolveAttribution(runtime) : undefined;
@@ -2520,6 +2818,13 @@ function rewriteStagedSkillBodies(stagedDir, opts) {
  * Deep public seam (ADR-1508 Phase 2). Derives resolvedTarget/homeDir/isGlobal/pathPrefix/
  * attribution from opts, then delegates to applyRuntimeContentRewritesForCommandsInPlace
  * (single copy+rewrite owner).
+ *
+ * @internal — symmetric companion to rewriteStagedSkillBodies; the deep-seam API for
+ * command bodies. Production callers: applySurface (surface.cts) and the install path
+ * in createRuntimeArtifactInstallPlan (runtime-artifact-install-plan.cts) — both keep
+ * the returned temp dir alive until they have copied its contents out, then clean it up
+ * in their own finally. (A test that treats this as a throwaway shared-tmp path will
+ * race those live temp dirs under --test-concurrency; see #1575/#2090.)
  *
  * @returns {string} path to the temp dir (caller is responsible for cleanup)
  */
@@ -2537,12 +2842,65 @@ function rewriteStagedCommandBodies(stagedDir, opts) {
   const resolvedTarget = path.resolve(configDir).replace(/\\/g, '/');
   const homeDir = homedir().replace(/\\/g, '/');
   const isGlobal = scope === 'global';
-  const isOpencode = runtime === 'opencode';
+  const isOpencode = false;  // #2087: opencode installs via the combined-family engine path, never through the generic rewrite
   const isWindowsHost = platform === 'win32';
   const pathPrefix = computePathPrefix({ isGlobal, isOpencode, isWindowsHost, resolvedTarget, homeDir });
   const attribution = resolveAttribution ? resolveAttribution(runtime) : undefined;
 
   return applyRuntimeContentRewritesForCommandsInPlace(stagedDir, runtime, pathPrefix, isGlobal, attribution);
+}
+
+/**
+ * Normalize `/gsd:<cmd>` colon refs in the agent body to `/gsd-<cmd>` for
+ * runtimes that declare `runtime.hostBehaviors.hyphenNameAgentBody` on their
+ * descriptor (claude / qwen / hermes use hyphen-`name:` frontmatter;
+ * cursor/windsurf/etc self-convert and don't declare the flag). Descriptor-
+ * driven (ADR-1239 / #2092) — folded from the hardcoded
+ * `HYPHEN_NAME_AGENT_RUNTIMES` allow-list set. Mirrors the per-file call in
+ * bin/install.js line 9370 / `shouldNormalizeHyphenNamespaceInAgentBody`.
+ *
+ * @param content   raw agent file content (post-converter)
+ * @param runtime   canonical runtime ID
+ * @param cmdNames  gsd command names from readGsdCommandNames()
+ */
+function normalizeAgentBodyForRuntime(content: string, runtime: string, cmdNames: string[]): string {
+  if (_hostBehaviors(runtime).hyphenNameAgentBody !== true) return content;
+  return transformContentToHyphen(content, cmdNames);
+}
+
+/**
+ * Apply the 4 base `~/.claude/` path-prefix rewrites to a single agent content
+ * string. Mirrors the inline agent loop in bin/install.js lines 9330-9340:
+ *   ~/\.claude/ → pathPrefix
+ *   $HOME/\.claude/ → pathPrefix
+ *   ~/\.claude\b → normalizedPathPrefix
+ *   $HOME/\.claude\b → normalizedPathPrefix
+ *
+ * Skipped for any runtime that declares `hostBehaviors.noPathRewrite`
+ * (descriptor-driven, ADR-1239 / #2096 — folds the prior hardcoded
+ * `runtime === 'antigravity'` literal; Antigravity does NOT do path rewrites
+ * in the inline loop / #2103 — folds the prior hardcoded
+ * `runtime === 'copilot'` literal onto the same descriptor field, since
+ * copilot also skips these rewrites). NO stamp
+ * (_stampNonClaudeRuntimeDefaults) — agents are NOT stamped in the inline loop.
+ *
+ * ADR-1235 §1: pre-converter cross-cutting for descriptor-driven agent pipeline.
+ * Exported as `applyAgentPathRewrites` for testing and for injection into
+ * stageAgentsForRuntimeWithConverter via agentCtx.
+ *
+ * @param content     raw agent file content
+ * @param runtime     canonical runtime ID
+ * @param pathPrefix  trailing-slash path prefix (e.g. '$HOME/.cursor/')
+ * @returns content with path-prefix rewrites applied (or unchanged for noPathRewrite runtimes, e.g. copilot)
+ */
+function applyAgentPathRewrites(content: string, runtime: string, pathPrefix: string): string {
+  if (_hostBehaviors(runtime).noPathRewrite === true) return content;
+  const normalizedPathPrefix = pathPrefix.replace(/\/$/, '');
+  content = content.replace(/~\/\.claude\//g, pathPrefix);
+  content = content.replace(/\$HOME\/\.claude\//g, pathPrefix);
+  content = content.replace(/~\/\.claude\b/g, normalizedPathPrefix);
+  content = content.replace(/\$HOME\/\.claude\b/g, normalizedPathPrefix);
+  return content;
 }
 
 // ── End rewrite engine ────────────────────────────────────────────────────────
@@ -2577,6 +2935,11 @@ function processAttribution(
 
 export = {
   processAttribution,
+  // #2103: public accessor for hostBehaviors.agentFileExtension, exported so
+  // surface.cts's _syncGsdDir can derive the .agent.md rename from the SAME
+  // descriptor read as install-engine.cts (folds a duplicated hardcoded
+  // `runtime === 'copilot'` literal).
+  agentFileExtensionFor,
   yamlIdentifier,
   yamlQuote,
   toSingleLine,
@@ -2595,6 +2958,7 @@ export = {
   convertClaudeCommandToCursorCommand,
   convertClaudeToWindsurfMarkdown,
   convertClaudeCommandToWindsurfSkill,
+  convertClaudeCommandToWindsurfWorkflow,
   convertClaudeToAugmentMarkdown,
   convertClaudeCommandToAugmentSkill,
   convertClaudeToTraeMarkdown,
@@ -2615,8 +2979,16 @@ export = {
   neutralizeAgentReferences,
   convertClaudeCommandToOpencodeSkill,
   convertClaudeCommandToKiloSkill,
+  // #2087 — opencode/kilo command-frontmatter converters, exported so the
+  // layout-driven `convertedCommandsKind` can resolve them by name (routes the
+  // opencode/kilo command install through the engine instead of the bespoke path).
+  convertClaudeToOpencodeFrontmatter,
+  convertClaudeToKiloFrontmatter,
   readGsdCommandNames,
   transformContentToHyphen,
+  // #1383: version resolver (exported for regression test of the Codex
+  // missing-package.json crash + the VERSION-file source of truth).
+  resolveVersionFrom,
   // #1182: agent converters + tool-name table dependency closure
   claudeToCopilotTools,
   convertCopilotToolName,
@@ -2631,6 +3003,11 @@ export = {
   convertClaudeAgentToCodebuddyAgent,
   convertClaudeAgentToClineAgent,
   convertClaudeAgentToCodexAgent,
+  // ADR-1239 / #2092 Phase B Upgrade 1: native .qwen/agents/*.md subagent
+  // projection — registered by name so convertedAgentsKind's
+  // conversionExports[converterName] dispatch (runtime-artifact-layout.cts)
+  // can resolve it from capabilities/qwen/capability.json's agents kind.
+  convertClaudeAgentToQwenAgent,
   // #1511 ADR-1508 Phase 2: rewrite engine deep seam
   // Low-level walkers (pathPrefix + attribution pre-resolved by caller):
   applyRuntimeContentRewritesInPlace,
@@ -2638,6 +3015,12 @@ export = {
   // High-level wrappers (derive pathPrefix + attribution from opts):
   rewriteStagedSkillBodies,
   rewriteStagedCommandBodies,
+  // ADR-1235 §1: descriptor-driven agent cross-cutting
+  applyAgentPathRewrites,
+  normalizeAgentBodyForRuntime,
   _computePathPrefix: computePathPrefix,
   _applyRuntimeRewrites,
+  _stampNonClaudeRuntimeDefaults,
+  // #1521: canonical non-Claude runtime list for test files and tooling
+  NON_CLAUDE_RUNTIMES,
 };

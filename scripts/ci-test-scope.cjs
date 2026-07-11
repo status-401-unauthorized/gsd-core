@@ -118,6 +118,7 @@ const RULES = [
     tests: [
       'tests/semver-compare.test.cjs',
       'tests/bug-10-semver-policy-consolidation.test.cjs',
+      'tests/golden-install-parity.test.cjs', // any src/installer change can alter emitted install artifacts → re-verify golden install parity (drift guard)
     ],
   },
   {
@@ -132,8 +133,16 @@ const RULES = [
       'tests/install-regressions.test.cjs',
       'tests/install-runtime-artifacts.test.cjs',
       'tests/install-path-detection.test.cjs',
-      'tests/release-tarball-smoke.install.test.cjs',
+      // NOTE: release-tarball-smoke.install.test.cjs is intentionally NOT here.
+      // It is a 3–6 min `npm pack` + `npm install -g` integration test with its
+      // OWN dedicated workflow (.github/workflows/install-smoke.yml, triggered on
+      // the production install paths). Running it in the scoped/targeted lane too
+      // is redundant and blows the per-chunk Windows timeout when a broad PR
+      // bundles it with many other changed test files (epic #1969). See the
+      // SCOPED_LANE_EXCLUDE guard below, which also drops it when it is itself a
+      // changed test file.
       'tests/runtime-artifact-layout.test.cjs',
+      'tests/golden-install-parity.test.cjs', // any src/installer change can alter emitted install artifacts → re-verify golden install parity (drift guard)
     ],
   },
   {
@@ -212,17 +221,44 @@ const RULES = [
     ],
   },
   {
-    name: 'configuration',
-    match: path => ['config', 'configuration', 'model-catalog', 'model-profile'].some(k => path.includes(k)),
+     name: 'configuration',
+     match: path => ['config', 'configuration', 'model-catalog', 'model-profile'].some(k => path.includes(k)),
+     tests: [
+       'tests/config.test.cjs',
+       'tests/config-get-default.test.cjs',
+       'tests/configuration-migrate-config.test.cjs',
+       'tests/model-catalog-runtime-defaults.test.cjs',
+       'tests/model-profiles.test.cjs',
+     ],
+   },
+  {
+    // ADR-1703 portability lint surface. Editing a rule, the shared vocab/guard
+    // helpers, or the eslint config that wires them must re-run the rule suites
+    // + the disable-ban. The disable-ban also scans bin/install.js and
+    // scripts/build-hooks.js (the Phase 6 glob-expansion surface), so changes
+    // to those files re-run it too.
+    name: 'portability lint rules (ADR-1703)',
+    match: path => path.startsWith('eslint-rules/') ||
+      path === 'eslint.config.mjs' ||
+      path === 'bin/install.js' ||
+      path === 'scripts/build-hooks.js',
     tests: [
-      'tests/config.test.cjs',
-      'tests/config-get-default.test.cjs',
-      'tests/configuration-migrate-config.test.cjs',
-      'tests/model-catalog-runtime-defaults.test.cjs',
-      'tests/model-profiles.test.cjs',
+      'tests/portability-rule-disable-ban.test.cjs',
+      'tests/portability-vocab-drift.test.cjs',
+      // All nine RuleTester suites (P1–P6) — editing any rule / the shared
+      // vocab+guard helpers / the eslint config re-runs the full rule family.
+      'tests/no-path-literal-in-assert.rule.test.cjs',
+      'tests/no-posix-mode-bit-assert.rule.test.cjs',
+      'tests/no-unguarded-nonportable-exec.rule.test.cjs',
+      'tests/no-crlf-fragile-split.rule.test.cjs',
+      'tests/no-hardcoded-tmp.rule.test.cjs',
+      'tests/no-bare-npm-exec.rule.test.cjs',
+      'tests/require-userprofile-with-home.rule.test.cjs',
+      'tests/normalize-path-in-content.rule.test.cjs',
+      'tests/require-fs-op-fallback.rule.test.cjs',
     ],
   },
-];
+ ];
 
 function usage() {
   return [
@@ -329,7 +365,7 @@ function classify(files) {
     // Determine if this file is product/pipeline code.
     // docs/ and root-level .md files are intentionally excluded.
     if (
-      ['bin/', 'src/', 'gsd-core/', 'agents/', 'commands/', 'hooks/', 'tests/', 'scripts/'].some(p => file.startsWith(p)) ||
+      ['bin/', 'src/', 'gsd-core/', 'agents/', 'commands/', 'hooks/', 'tests/', 'scripts/', 'eslint-rules/'].some(p => file.startsWith(p)) ||
       file === 'package.json' || file === 'package-lock.json' ||
       (file.startsWith('tsconfig') && file.endsWith('.json')) ||
       file.startsWith('.github/rulesets/')
@@ -368,6 +404,17 @@ function classify(files) {
       }
     }
   }
+
+  // Heavy integration tests that own a dedicated workflow must never run in the
+  // scoped/targeted lane — they carry a multi-minute cost that overruns the
+  // per-chunk timeout (worst on Windows) when a broad PR bundles them with many
+  // other changed test files, and their production paths already trigger their
+  // own workflow. Drop them however they entered (matched rule OR changed-file).
+  const SCOPED_LANE_EXCLUDE = new Set([
+    // covered by .github/workflows/install-smoke.yml
+    'tests/release-tarball-smoke.install.test.cjs',
+  ]);
+  for (const f of SCOPED_LANE_EXCLUDE) { targeted.delete(f); windows.delete(f); }
 
   // code_changed: true when product/pipeline OR inert CI changed.
   // Docs-only PRs (neither flag set) get code_changed=false → full matrix skip.

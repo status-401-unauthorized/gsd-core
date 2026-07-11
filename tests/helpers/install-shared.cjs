@@ -12,6 +12,10 @@ const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const assert = require('node:assert/strict');
 
+const {
+  resolveRuntimeArtifactLayout,
+} = require('../../gsd-core/bin/lib/runtime-artifact-layout.cjs');
+
 const INSTALL_SCRIPT = path.join(__dirname, '..', '..', 'bin', 'install.js');
 const MANIFEST_NAME = 'gsd-file-manifest.json';
 
@@ -49,20 +53,20 @@ const RUNTIME_META = {
   codex:        { localDir: '.codex',            globalSuffix: '.codex' },
   copilot:      { localDir: '.github',           globalSuffix: '.copilot' },
   cursor:       { localDir: '.cursor',           globalSuffix: '.cursor' },
-  gemini:       { localDir: '.gemini',           globalSuffix: '.gemini' },
   hermes:       { localDir: '.hermes',           globalSuffix: '.hermes' },
   kimi:         { localDir: '.kimi-code',        globalSuffix: path.join('.config', 'agents') },
   kilo:         { localDir: '.kilo',             globalSuffix: path.join('.config', 'kilo') },
   opencode:     { localDir: '.opencode',         globalSuffix: path.join('.config', 'opencode') },
   qwen:         { localDir: '.qwen',             globalSuffix: '.qwen' },
   trae:         { localDir: '.trae',             globalSuffix: '.trae' },
-  windsurf:     { localDir: '.devin',             globalSuffix: path.join('.codeium', 'windsurf') },
+  windsurf:     { localDir: '.windsurf',          globalSuffix: path.join('.codeium', 'windsurf') },
+  zcode:        { localDir: '.zcode',             globalSuffix: '.zcode' },
 };
 
 // Runtimes that emit per-skill files under skills/ (not rules-based or commands-based)
 const SKILL_RUNTIMES = [
-  'claude', 'opencode', 'gemini', 'kilo', 'codex', 'copilot', 'antigravity',
-  'cursor', 'windsurf', 'augment', 'trae', 'qwen', 'codebuddy',
+  'claude', 'opencode', 'kilo', 'codex', 'copilot', 'antigravity',
+  'cursor', 'augment', 'trae', 'qwen', 'codebuddy',
 ];
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
@@ -112,9 +116,9 @@ function runMinimalInstall({ runtime, scope, extraArgs = [] }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `gsd-${runtime}-${scope}-`));
   try {
     const LOCAL_DIR_NAME = {
-      claude: '.claude', opencode: '.opencode', gemini: '.gemini', kilo: '.kilo',
+      claude: '.claude', opencode: '.opencode', kilo: '.kilo',
       codex: '.codex', copilot: '.github', antigravity: '.agents', cursor: '.cursor',
-      windsurf: '.devin', augment: '.augment', trae: '.trae', qwen: '.qwen',
+      windsurf: '.windsurf', augment: '.augment', trae: '.trae', qwen: '.qwen',
       codebuddy: '.codebuddy', cline: '.',
     };
     let configDir;
@@ -177,9 +181,27 @@ function manifestAgentCount(manifest) {
   return Object.keys(manifest.files).filter((k) => k.startsWith('agents/')).length;
 }
 
-function collectSkillBasenamesOnDisk(configDir) {
+/**
+ * Collect gsd-* skill/command basenames actually present on disk under configDir.
+ *
+ * @param {string} configDir
+ * @param {string} [runtime] - when provided, the skills-kind destination is
+ *   resolved via resolveRuntimeArtifactLayout so a skills-kind `home` override
+ *   (Codex only, ADR-1239 upgrade 3 / #2088: skills -> $HOME/.agents/skills
+ *   instead of configDir/skills) is honored. Omitted callers keep the prior
+ *   configDir/skills default.
+ * @param {string} [scope='global']
+ */
+function collectSkillBasenamesOnDisk(configDir, runtime, scope = 'global') {
   const out = new Set();
-  const skillsDir = path.join(configDir, 'skills');
+  let skillsDir = path.join(configDir, 'skills');
+  if (runtime) {
+    try {
+      const layout = resolveRuntimeArtifactLayout(runtime, configDir, scope);
+      const skillsKind = layout.kinds.find((k) => k.kind === 'skills');
+      if (skillsKind) skillsDir = path.join(skillsKind.home || configDir, skillsKind.destSubpath);
+    } catch { /* fall back to configDir/skills */ }
+  }
   if (fs.existsSync(skillsDir)) {
     for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
       if (entry.isDirectory() && entry.name.startsWith('gsd-')) {
