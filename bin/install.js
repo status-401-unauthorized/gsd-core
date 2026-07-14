@@ -278,6 +278,28 @@ const GSD_CURSOR_HOOK_SCRIPTS = [
 // Marker comment embedded in managed hook entries so GSD can find+remove them.
 const GSD_CURSOR_HOOK_MARKER = 'gsd-managed';
 
+// #2100 Stage 2 — Windsurf/Cascade lifecycle hook constants.
+// Windsurf/Cascade reads hook configs from <project-root>/.windsurf/hooks.json
+// (local) or ~/.codeium/windsurf/hooks.json (global) with the shape
+// { hooks: { <event>: [ { command, ... } ] } } — note: no top-level `version`
+// field, and each entry carries a bare `command` shell string (no `type`
+// field), unlike Cursor's hooks.json. GSD registers two managed BLOCKING
+// hooks (exit code 2 to block, vs. Cursor's stdout-JSON form):
+//   pre_write_code   → gsd-windsurf-pre-write.js    (write-path guard)
+//   pre_run_command  → gsd-windsurf-pre-command.js  (destructive-command guard)
+// Cascade has no context-injection channel, so the 4 advisory hooks GSD
+// registers on Cursor (sessionStart, postToolUse, stop, subagentStart/Stop)
+// have no Windsurf counterpart and are deliberately NOT ported.
+// Cascade hooks docs (reference): https://docs.windsurf.com/llms-full.txt ,
+//                                  https://docs.devin.ai/desktop/cascade/hooks
+const GSD_WINDSURF_PRE_WRITE_HOOK_SCRIPT = 'gsd-windsurf-pre-write.js';
+const GSD_WINDSURF_PRE_COMMAND_HOOK_SCRIPT = 'gsd-windsurf-pre-command.js';
+// All GSD-managed Windsurf hook scripts (used by uninstall cleanup).
+const GSD_WINDSURF_HOOK_SCRIPTS = [
+  GSD_WINDSURF_PRE_WRITE_HOOK_SCRIPT,
+  GSD_WINDSURF_PRE_COMMAND_HOOK_SCRIPT,
+];
+
 // GSD-managed files under hooks/lib/ (helpers required by gsd-*.sh hooks).
 // git-cmd.js does not start with "gsd-" (shared classifier for #3129), gsd-graphify-rebuild.sh does.
 const GSD_HOOK_LIB_FILES = ['git-cmd.js', 'gsd-graphify-rebuild.sh'];
@@ -485,6 +507,7 @@ const {
   installRuntimeArtifacts,
   uninstallRuntimeArtifacts,
   installOpencodeFamilySkills,
+  _installNativePluginIfDeclared,
   _copyStaged,
   hasExistingSymlinkBetween,
   preserveUserArtifacts,
@@ -534,7 +557,7 @@ if (hasMinimal && _profileArgRaw) {
 
 function selectRuntimesFromArgs(runtimeArgs) {
   if (runtimeArgs.includes('--all')) {
-    return ['claude', 'kimi', 'kilo', 'opencode', 'codex', 'copilot', 'antigravity', 'cursor', 'windsurf', 'augment', 'trae', 'qwen', 'hermes', 'codebuddy', 'cline', 'zcode', 'grok'];
+    return ['claude', 'kimi', 'kilo', 'opencode', 'pi', 'codex', 'copilot', 'antigravity', 'cursor', 'windsurf', 'augment', 'trae', 'qwen', 'hermes', 'codebuddy', 'cline', 'zcode', 'grok'];
   }
   if (runtimeArgs.includes('--both')) {
     return ['claude', 'opencode'];
@@ -543,6 +566,7 @@ function selectRuntimesFromArgs(runtimeArgs) {
   const selected = [];
   if (runtimeArgs.includes('--claude')) selected.push('claude');
   if (runtimeArgs.includes('--opencode')) selected.push('opencode');
+  if (runtimeArgs.includes('--pi')) selected.push('pi');
   if (runtimeArgs.includes('--kilo')) selected.push('kilo');
   if (runtimeArgs.includes('--codex')) selected.push('codex');
   if (runtimeArgs.includes('--copilot')) selected.push('copilot');
@@ -689,7 +713,7 @@ const banner = '\n' +
   '  GSD Core ' + dim + 'v' + pkg.version + reset + '\n' +
   '  Git. Ship. Done.\n' +
   '  A meta-prompting, context engineering and spec-driven\n' +
-  '  development workflows for Claude Code, OpenCode, Kimi CLI, Kilo, Codex, Copilot, Antigravity, Cursor, Grok Build, Windsurf, Augment, Trae, Qwen Code, Hermes Agent, Cline, CodeBuddy and ZCode.\n';
+  '  development workflows for Claude Code, OpenCode, Kimi CLI, Kilo, Codex, Copilot, Antigravity, Cursor, Grok Build, Windsurf, Augment, Trae, Qwen Code, Hermes Agent, Cline, CodeBuddy, ZCode and pi.\n';
 
 // Pure seam: parse --config-dir / -c from an arbitrary args array.
 // Returns the path string, '' for an empty equals-form value, or null when the
@@ -746,7 +770,7 @@ if (hasUninstall) {
 
 // Show help if requested
 if (hasHelp) {
-  console.log(`  ${yellow}Usage:${reset} npx ${pkg.name} [options]\n\n  ${yellow}Options:${reset}\n    ${cyan}-g, --global${reset}              Install globally (to config directory)\n    ${cyan}-l, --local${reset}               Install locally (to current directory)\n    ${cyan}--claude${reset}                  Install for Claude Code only\n    ${cyan}--opencode${reset}                Install for OpenCode only\n    ${cyan}--kilo${reset}                    Install for Kilo only\n    ${cyan}--codex${reset}                   Install for Codex only\n    ${cyan}--kimi${reset}                    Install for Kimi CLI only\n    ${cyan}--copilot${reset}                 Install for Copilot only\n    ${cyan}--antigravity${reset}             Install for Antigravity only\n    ${cyan}--cursor${reset}                  Install for Cursor only\n    ${cyan}--windsurf${reset}                Install for Windsurf only\n    ${cyan}--augment${reset}                 Install for Augment only\n    ${cyan}--trae${reset}                    Install for Trae only\n    ${cyan}--qwen${reset}                    Install for Qwen Code only\n    ${cyan}--hermes${reset}                  Install for Hermes Agent only\n    ${cyan}--cline${reset}                   Install for Cline only\n    ${cyan}--codebuddy${reset}              Install for CodeBuddy only\n    ${cyan}--zcode${reset}                  Install for ZCode only\n    ${cyan}--grok${reset}                    Install for Grok Build only\n    ${cyan}--all${reset}                     Install for all runtimes\n    ${cyan}-u, --uninstall${reset}           Uninstall GSD (remove all GSD files)\n    ${cyan}-c, --config-dir <path>${reset}   Specify custom config directory\n    ${cyan}-h, --help${reset}                Show this help message\n    ${cyan}--force-statusline${reset}        Replace existing statusline config\n    ${cyan}--portable-hooks${reset}          Emit \$HOME-relative hook paths in settings.json\n                              (for WSL/Docker bind-mount setups; also GSD_PORTABLE_HOOKS=1)\n    ${cyan}--profile=<name>${reset}         Install a named skill profile. Profiles:\n                              core     — ${PROFILES.core.length} main-loop skills incl. phase (~130 desc tokens)\n                              standard — ${PROFILES.standard.length} skills incl. phase, review, config (~700)\n                              full     — all skills (default)\n                              Composable: --profile=core,audit installs union of closures.\n                              Profile is persisted and respected by \`gsd update\`.\n    ${cyan}--minimal${reset}                 Alias for --profile=core (back-compat).\n                              Cuts cold-start overhead from ~12k tokens to ~700.\n                              Alias: --core-only.\n\n  ${yellow}Examples:${reset}\n    ${dim}# Interactive install (prompts for runtime and location)${reset}\n    npx ${pkg.name}\n\n    ${dim}# Install for Claude Code globally${reset}\n    npx ${pkg.name} --claude --global\n\n    ${dim}# Install for Kilo globally${reset}\n    npx ${pkg.name} --kilo --global\n\n    ${dim}# Install for Codex globally${reset}\n    npx ${pkg.name} --codex --global\n\n    ${dim}# Install for Kimi CLI globally${reset}\n    npx ${pkg.name} --kimi --global\n\n    ${dim}# Install for Kimi CLI under ~/.kimi-code${reset}\n    npx ${pkg.name} --kimi --global --config-dir ~/.kimi-code\n\n    ${dim}# Install for Copilot globally${reset}\n    npx ${pkg.name} --copilot --global\n\n    ${dim}# Install for Copilot locally${reset}\n    npx ${pkg.name} --copilot --local\n\n    ${dim}# Install for Antigravity globally${reset}\n    npx ${pkg.name} --antigravity --global\n\n    ${dim}# Install for Antigravity locally${reset}\n    npx ${pkg.name} --antigravity --local\n\n    ${dim}# Install for Cursor globally${reset}\n    npx ${pkg.name} --cursor --global\n\n    ${dim}# Install for Cursor locally${reset}\n    npx ${pkg.name} --cursor --local\n\n    ${dim}# Install for Windsurf globally${reset}\n    npx ${pkg.name} --windsurf --global\n\n    ${dim}# Install for Windsurf locally${reset}\n    npx ${pkg.name} --windsurf --local\n\n    ${dim}# Install for Augment globally${reset}\n    npx ${pkg.name} --augment --global\n\n    ${dim}# Install for Augment locally${reset}\n    npx ${pkg.name} --augment --local\n\n    ${dim}# Install for Trae globally${reset}\n    npx ${pkg.name} --trae --global\n\n    ${dim}# Install for Trae locally${reset}\n    npx ${pkg.name} --trae --local\n\n    ${dim}# Install for Hermes Agent globally${reset}\n    npx ${pkg.name} --hermes --global\n\n    ${dim}# Install for Hermes Agent locally${reset}\n    npx ${pkg.name} --hermes --local\n\n    ${dim}# Install for Cline globally${reset}\n    npx ${pkg.name} --cline --global\n\n    ${dim}# Install for Cline locally${reset}\n    npx ${pkg.name} --cline --local\n\n    ${dim}# Install for CodeBuddy globally${reset}\n    npx ${pkg.name} --codebuddy --global\n\n    ${dim}# Install for CodeBuddy locally${reset}\n    npx ${pkg.name} --codebuddy --local\n\n    ${dim}# Install for all runtimes globally${reset}\n    npx ${pkg.name} --all --global\n\n    ${dim}# Install to custom config directory${reset}\n    npx ${pkg.name} --kilo --global --config-dir ~/.kilo-work\n\n    ${dim}# Install to current project only${reset}\n    npx ${pkg.name} --claude --local\n\n    ${dim}# Uninstall GSD from Cursor globally${reset}\n    npx ${pkg.name} --cursor --global --uninstall\n\n  ${yellow}Notes:${reset}\n    The --config-dir option is useful when you have multiple configurations.\n    It takes priority over CLAUDE_CONFIG_DIR / OPENCODE_CONFIG_DIR / KILO_CONFIG_DIR / CODEX_HOME / KIMI_CONFIG_DIR / COPILOT_CONFIG_DIR / COPILOT_HOME / ANTIGRAVITY_CONFIG_DIR / CURSOR_CONFIG_DIR / WINDSURF_CONFIG_DIR / AUGMENT_CONFIG_DIR / TRAE_CONFIG_DIR / QWEN_CONFIG_DIR / HERMES_HOME / CLINE_CONFIG_DIR / CODEBUDDY_CONFIG_DIR environment variables.\n    Kimi CLI defaults to the first existing generic skills root: ${cyan}~/.config/agents/skills${reset}, then ${cyan}~/.agents/skills${reset}; if neither exists, GSD creates ${cyan}~/.config/agents${reset}.\n    Use ${cyan}--config-dir ~/.kimi-code${reset} or ${cyan}KIMI_CONFIG_DIR=~/.kimi-code${reset} for brand-specific Kimi installs.\n`);
+  console.log(`  ${yellow}Usage:${reset} npx ${pkg.name} [options]\n\n  ${yellow}Options:${reset}\n    ${cyan}-g, --global${reset}              Install globally (to config directory)\n    ${cyan}-l, --local${reset}               Install locally (to current directory)\n    ${cyan}--claude${reset}                  Install for Claude Code only\n    ${cyan}--opencode${reset}                Install for OpenCode only\n    ${cyan}--pi${reset}                      Install for pi only\n    ${cyan}--kilo${reset}                    Install for Kilo only\n    ${cyan}--codex${reset}                   Install for Codex only\n    ${cyan}--kimi${reset}                    Install for Kimi CLI only\n    ${cyan}--copilot${reset}                 Install for Copilot only\n    ${cyan}--antigravity${reset}             Install for Antigravity only\n    ${cyan}--cursor${reset}                  Install for Cursor only\n    ${cyan}--windsurf${reset}                Install for Windsurf only\n    ${cyan}--augment${reset}                 Install for Augment only\n    ${cyan}--trae${reset}                    Install for Trae only\n    ${cyan}--qwen${reset}                    Install for Qwen Code only\n    ${cyan}--hermes${reset}                  Install for Hermes Agent only\n    ${cyan}--cline${reset}                   Install for Cline only\n    ${cyan}--codebuddy${reset}              Install for CodeBuddy only\n    ${cyan}--zcode${reset}                  Install for ZCode only\n    ${cyan}--grok${reset}                    Install for Grok Build only\n    ${cyan}--all${reset}                     Install for all runtimes\n    ${cyan}-u, --uninstall${reset}           Uninstall GSD (remove all GSD files)\n    ${cyan}-c, --config-dir <path>${reset}   Specify custom config directory\n    ${cyan}-h, --help${reset}                Show this help message\n    ${cyan}--force-statusline${reset}        Replace existing statusline config\n    ${cyan}--portable-hooks${reset}          Emit \$HOME-relative hook paths in settings.json\n                              (for WSL/Docker bind-mount setups; also GSD_PORTABLE_HOOKS=1)\n    ${cyan}--profile=<name>${reset}         Install a named skill profile. Profiles:\n                              core     — ${PROFILES.core.length} main-loop skills incl. phase (~130 desc tokens)\n                              standard — ${PROFILES.standard.length} skills incl. phase, review, config (~700)\n                              full     — all skills (default)\n                              Composable: --profile=core,audit installs union of closures.\n                              Profile is persisted and respected by \`gsd update\`.\n    ${cyan}--minimal${reset}                 Alias for --profile=core (back-compat).\n                              Cuts cold-start overhead from ~12k tokens to ~700.\n                              Alias: --core-only.\n\n  ${yellow}Examples:${reset}\n    ${dim}# Interactive install (prompts for runtime and location)${reset}\n    npx ${pkg.name}\n\n    ${dim}# Install for Claude Code globally${reset}\n    npx ${pkg.name} --claude --global\n\n    ${dim}# Install for Kilo globally${reset}\n    npx ${pkg.name} --kilo --global\n\n    ${dim}# Install for Codex globally${reset}\n    npx ${pkg.name} --codex --global\n\n    ${dim}# Install for Kimi CLI globally${reset}\n    npx ${pkg.name} --kimi --global\n\n    ${dim}# Install for Kimi CLI under ~/.kimi-code${reset}\n    npx ${pkg.name} --kimi --global --config-dir ~/.kimi-code\n\n    ${dim}# Install for Copilot globally${reset}\n    npx ${pkg.name} --copilot --global\n\n    ${dim}# Install for Copilot locally${reset}\n    npx ${pkg.name} --copilot --local\n\n    ${dim}# Install for Antigravity globally${reset}\n    npx ${pkg.name} --antigravity --global\n\n    ${dim}# Install for Antigravity locally${reset}\n    npx ${pkg.name} --antigravity --local\n\n    ${dim}# Install for Cursor globally${reset}\n    npx ${pkg.name} --cursor --global\n\n    ${dim}# Install for Cursor locally${reset}\n    npx ${pkg.name} --cursor --local\n\n    ${dim}# Install for Windsurf globally${reset}\n    npx ${pkg.name} --windsurf --global\n\n    ${dim}# Install for Windsurf locally${reset}\n    npx ${pkg.name} --windsurf --local\n\n    ${dim}# Install for Augment globally${reset}\n    npx ${pkg.name} --augment --global\n\n    ${dim}# Install for Augment locally${reset}\n    npx ${pkg.name} --augment --local\n\n    ${dim}# Install for Trae globally${reset}\n    npx ${pkg.name} --trae --global\n\n    ${dim}# Install for Trae locally${reset}\n    npx ${pkg.name} --trae --local\n\n    ${dim}# Install for Hermes Agent globally${reset}\n    npx ${pkg.name} --hermes --global\n\n    ${dim}# Install for Hermes Agent locally${reset}\n    npx ${pkg.name} --hermes --local\n\n    ${dim}# Install for Cline globally${reset}\n    npx ${pkg.name} --cline --global\n\n    ${dim}# Install for Cline locally${reset}\n    npx ${pkg.name} --cline --local\n\n    ${dim}# Install for CodeBuddy globally${reset}\n    npx ${pkg.name} --codebuddy --global\n\n    ${dim}# Install for CodeBuddy locally${reset}\n    npx ${pkg.name} --codebuddy --local\n\n    ${dim}# Install for all runtimes globally${reset}\n    npx ${pkg.name} --all --global\n\n    ${dim}# Install to custom config directory${reset}\n    npx ${pkg.name} --kilo --global --config-dir ~/.kilo-work\n\n    ${dim}# Install to current project only${reset}\n    npx ${pkg.name} --claude --local\n\n    ${dim}# Uninstall GSD from Cursor globally${reset}\n    npx ${pkg.name} --cursor --global --uninstall\n\n  ${yellow}Notes:${reset}\n    The --config-dir option is useful when you have multiple configurations.\n    It takes priority over CLAUDE_CONFIG_DIR / OPENCODE_CONFIG_DIR / KILO_CONFIG_DIR / CODEX_HOME / KIMI_CONFIG_DIR / COPILOT_CONFIG_DIR / COPILOT_HOME / ANTIGRAVITY_CONFIG_DIR / CURSOR_CONFIG_DIR / WINDSURF_CONFIG_DIR / AUGMENT_CONFIG_DIR / TRAE_CONFIG_DIR / QWEN_CONFIG_DIR / HERMES_HOME / CLINE_CONFIG_DIR / CODEBUDDY_CONFIG_DIR environment variables.\n    Kimi CLI defaults to the first existing generic skills root: ${cyan}~/.config/agents/skills${reset}, then ${cyan}~/.agents/skills${reset}; if neither exists, GSD creates ${cyan}~/.config/agents${reset}.\n    Use ${cyan}--config-dir ~/.kimi-code${reset} or ${cyan}KIMI_CONFIG_DIR=~/.kimi-code${reset} for brand-specific Kimi installs.\n`);
   process.exit(0);
 }
 
@@ -1118,9 +1142,10 @@ function writeSettings(settingsPath, settings) {
  * Used by Codex TOML and OpenCode agent file generators to embed per-agent
  * model assignments so that model_overrides is respected on non-Claude runtimes (#2256).
  */
-function readGsdGlobalModelOverrides() {
+function readGsdGlobalModelOverrides(options = {}) {
   try {
-    const defaultsPath = path.join(os.homedir(), '.gsd', 'defaults.json');
+    const home = options.homedir ? options.homedir() : os.homedir();
+    const defaultsPath = path.join(home, '.gsd', 'defaults.json');
     if (!fs.existsSync(defaultsPath)) return null;
     const raw = fs.readFileSync(defaultsPath, 'utf-8');
     const parsed = JSON.parse(raw);
@@ -1157,8 +1182,8 @@ function readGsdGlobalModelOverrides() {
  * Returns a plain `{ agentName: modelId }` object, or `null` when neither
  * source defines `model_overrides`.
  */
-function readGsdEffectiveModelOverrides(targetDir = null) {
-  const global = readGsdGlobalModelOverrides();
+function readGsdEffectiveModelOverrides(targetDir = null, options = {}) {
+  const global = readGsdGlobalModelOverrides(options);
 
   let projectOverrides = null;
   if (targetDir) {
@@ -5823,6 +5848,37 @@ function removeCursorHooksJson(targetDir) {
 }
 
 /**
+ * #2100 Stage 2 — Write GSD-managed Windsurf/Cascade lifecycle hooks into
+ * <targetDir>/hooks.json. Both managed hook scripts
+ * (gsd-windsurf-pre-write.js, gsd-windsurf-pre-command.js) are copied from
+ * the GSD hooks/ source to <targetDir>/hooks/ first, so the hooks.json
+ * entries never reference a script that wasn't installed. Mirrors
+ * writeCursorHooksJson's structure; Cascade's blocking protocol (exit code 2)
+ * and entry shape (bare `command` string, no `type` field) are distinct from
+ * Cursor's.
+ *
+ * @param {string} targetDir - The Windsurf config dir (global: ~/.codeium/windsurf; local: .windsurf)
+ * @param {string} src       - The GSD install source root (for copying hook scripts)
+ * @param {{ platform?: string }} opts
+ * @returns {{ hooksJsonPath: string, changed: boolean }}
+ */
+function writeWindsurfHooksJson(targetDir, src, opts) {
+  return hooksSurface.writeWindsurfHooksJson(targetDir, src, opts);
+}
+
+/**
+ * Remove all GSD-managed Windsurf/Cascade lifecycle hook entries from
+ * hooks.json. User-owned entries are preserved. If the file becomes empty,
+ * it is removed.
+ *
+ * @param {string} targetDir - The Windsurf config dir
+ * @returns {{ changed: boolean }}
+ */
+function removeWindsurfHooksJson(targetDir) {
+  return hooksSurface.removeWindsurfHooksJson(targetDir);
+}
+
+/**
  * #786 — Build the GSD-managed GitHub Copilot lifecycle hook config object.
  *
  * Returns the verbatim JSON shape Copilot CLI expects:
@@ -6856,7 +6912,8 @@ function uninstall(isGlobal, runtime = DEFAULT_RUNTIME) {
   // #2098: isCodebuddy dropped — unused in this function.
   // #2099: isCopilot dropped — both Copilot side-effect branches below are now
   // gated on resolveInstallPlan(runtime).installSurface === 'copilot-instructions'.
-  const { isOpencode, isCodex, isCursor, isWindsurf, isAugment, isQwen, isHermes, isCline } = runtimeFlags(runtime);
+  // #2100: isWindsurf dropped — unused in this function.
+  const { isOpencode, isCodex, isCursor, isAugment, isQwen, isHermes, isCline } = runtimeFlags(runtime);
   const dirName = getDirName(runtime);
 
   // Get the target directory based on runtime and install type. Cline local
@@ -7197,6 +7254,38 @@ function uninstall(isGlobal, runtime = DEFAULT_RUNTIME) {
     try {
       if (fs.existsSync(hooksDir) && fs.readdirSync(hooksDir).length === 0) {
         fs.rmdirSync(hooksDir);
+      }
+    } catch { /* best-effort */ }
+  }
+
+  // 1b-windsurf. Descriptor-driven hook-bus cleanup (ADR-1239 / #2100 Stage 2):
+  // remove GSD-managed Cascade hook entries from hooks.json and clean up the
+  // managed hook scripts. Gated on resolveInstallPlan(runtime).hooksSurface
+  // === 'windsurf-hooks-json' (mirrors the kimi-hooks-toml gate above) —
+  // NOT the shared hostBehaviors.hooksJsonSurface flag the Cursor block above
+  // uses, since that flag drives Cursor's own remove function + script list
+  // and is not (and must not be) set for Windsurf.
+  if (resolveInstallPlan(runtime).hooksSurface === 'windsurf-hooks-json') {
+    const windsurfHooksJsonCleanup = removeWindsurfHooksJson(targetDir);
+    if (windsurfHooksJsonCleanup.changed) {
+      removedCount++;
+      console.log(`  ${green}✓${reset} Removed GSD-managed Windsurf hooks from hooks.json`);
+    }
+    // Remove all GSD-managed hook scripts (pre_write_code, pre_run_command).
+    const windsurfHooksDir = path.join(targetDir, 'hooks');
+    for (const script of GSD_WINDSURF_HOOK_SCRIPTS) {
+      const p = path.join(windsurfHooksDir, script);
+      try {
+        if (fs.existsSync(p)) {
+          fs.unlinkSync(p);
+          removedCount++;
+        }
+      } catch { /* best-effort */ }
+    }
+    // Prune hooks/ if empty.
+    try {
+      if (fs.existsSync(windsurfHooksDir) && fs.readdirSync(windsurfHooksDir).length === 0) {
+        fs.rmdirSync(windsurfHooksDir);
       }
     } catch { /* best-effort */ }
   }
@@ -8247,7 +8336,9 @@ function writeManifest(configDir, runtime = DEFAULT_RUNTIME, options = {}) {
   // #2098: isCodebuddy dropped — unused in this function.
   // #2099: isCopilot dropped — was only used in the hooks-tracking conditional
   // above, now covered by hostBehaviors.skipSharedHooksInstall.
-  const { isOpencode, isCodex, isCursor, isWindsurf, isAugment, isQwen, isHermes, isCline } = runtimeFlags(runtime);
+  // #2100: isWindsurf dropped — was only used in the hooks-tracking conditional
+  // above, now covered by hostBehaviors.skipSharedHooksInstall.
+  const { isOpencode, isCodex, isCursor, isAugment, isQwen, isHermes, isCline } = runtimeFlags(runtime);
   const gsdDir = path.join(configDir, 'gsd-core');
   // #1367: Claude local now writes flat gsd-*.md files at commands/ (not commands/gsd/).
   // Claude local uses flatCommandsDir instead for manifest recording.
@@ -8361,7 +8452,9 @@ function writeManifest(configDir, runtime = DEFAULT_RUNTIME, options = {}) {
   // the redundant `&& !isKimi` was removed so its hook files are tracked too.
   // #2099: Copilot's exclusion is likewise descriptor-driven (copilot declares
   // skipSharedHooksInstall:true) — the redundant `&& !isCopilot` was removed.
-  if (!isCodex && _hostBehaviors(runtime).skipSharedHooksInstall !== true && !isWindsurf) {
+  // #2100: Windsurf's exclusion is likewise descriptor-driven (windsurf declares
+  // skipSharedHooksInstall:true) — the redundant `&& !isWindsurf` was removed.
+  if (!isCodex && _hostBehaviors(runtime).skipSharedHooksInstall !== true) {
     const hooksDir = path.join(configDir, 'hooks');
     if (fs.existsSync(hooksDir)) {
       // Drive from INSTALLED_HOOK_FILES (the canonical HOOKS_TO_COPY set from
@@ -8771,7 +8864,17 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // .agent.md suffix now lives on hostBehaviors.agentFileExtension in
   // src/install-engine.cts, and the skipSharedHooksInstall check above no
   // longer needs `&& !isCopilot`.
-  const { isOpencode, isZcode, isCodex, isCursor, isWindsurf, isAugment, isTrae, isQwen, isHermes, isCline } = runtimeFlags(runtime);
+  // #2100: isWindsurf dropped — its four former isWindsurf-gated branches
+  // (legacy .devin/skills/gsd-* cleanup, the #1629 command-bodies copy, the
+  // workflow-verification report, and the shared-hooks-install exclusion) are
+  // now descriptor-driven via hostBehaviors.legacyDevinSkillsCleanup,
+  // hostBehaviors.installsCommandBodiesForWorkflowDelegation,
+  // hostBehaviors.verificationStyle === 'windsurf-workflows', and
+  // hostBehaviors.skipSharedHooksInstall respectively; its legacy-agent-loop
+  // converter arm was likewise unreachable dead code (windsurf is in
+  // _DESCRIPTOR_AGENTS_RUNTIMES) and was removed above.
+  // #2101: isZcode dropped — folded onto hostBehaviors.skipSharedHooksInstall.
+  const { isOpencode, isCodex, isCursor, isAugment, isTrae, isQwen, isHermes, isCline } = runtimeFlags(runtime);
   const plan = resolveInstallPlan(runtime);
   const dirName = getDirName(runtime);
   const src = path.join(__dirname, '..');
@@ -9281,7 +9384,10 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     // dirs from pre-#1615 installs. #1615 moved Windsurf to .windsurf/workflows/
     // but never cleaned up the old .devin/skills/ layout (#1085). User-owned
     // content is preserved (non-gsd- dirs, gsd-dev-preferences, symlinks).
-    if (isWindsurf && !isGlobal) {
+    // Descriptor-driven (ADR-1239 / #2100): folded from `isWindsurf` into
+    // hostBehaviors.legacyDevinSkillsCleanup (windsurf is the only runtime that
+    // declares it, so this is byte-parity).
+    if (_hostBehaviors(runtime).legacyDevinSkillsCleanup && !isGlobal) {
       const removedCount = cleanupWindsurfLegacyDevinSkills(process.cwd());
       if (removedCount > 0) {
         console.log(`  ${green}✓${reset} Removed ${removedCount} legacy .devin/skills/gsd-* dir(s) (pre-#1615 Windsurf layout)`);
@@ -9328,7 +9434,11 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       } else {
         failures.push('agents/gsd.yaml');
       }
-    } else if (isWindsurf) {
+    // Descriptor-driven (ADR-1239 / #2100): folded from `isWindsurf` into
+    // hostBehaviors.verificationStyle === 'windsurf-workflows' (extends the
+    // same mechanism the 'kimi' verificationStyle branch above uses; windsurf
+    // is the only runtime that declares this value, so this is byte-parity).
+    } else if (_hostBehaviors(runtime).verificationStyle === 'windsurf-workflows') {
       if (isGlobal) {
         console.log(`  ${green}✓${reset} Windsurf global install skipped workflow artifacts (workspace-only)`);
       } else {
@@ -9398,6 +9508,16 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     // Descriptor-driven (ADR-1239 / #2090): folded from `isCline` into
     // hostBehaviors.localCommandsViaRules.
     console.log(`  ${green}✓${reset} Cline: commands will be available via .clinerules`);
+  } else if (_hostBehaviors(runtime).pluginOnlyInstall) {
+    // pi (ADR-1239 / #2102 Stage 1): plugin-only install — pi's /gsd command is
+    // registered programmatically by the native extension (pi/gsd.cjs →
+    // extensions/gsd.cjs, staged separately below) and dispatches in-process
+    // through the embedded gsd-core command-routing hub. pi has no host-read
+    // markdown surface (unlike Claude/OpenCode/etc., which scan commands/ or
+    // command/ directories), so writing flat gsd-<cmd>.md files here would be
+    // dead weight the extension never reads. Skip the flat-commands fallback
+    // entirely for pluginOnlyInstall runtimes.
+    console.log(`  ${green}✓${reset} pi: /gsd registered via native extension (no declarative command files)`);
   } else {
     // Claude Code local: flat gsd-<cmd>.md layout — Claude Code registers
     // commands from .claude/commands/ using the filename stem as the command
@@ -9468,6 +9588,18 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     }
   }
 
+  // Native-extension/plugin staging for runtimes OUTSIDE the layout-driven
+  // _isSkillsRuntime branch above (ADR-1239 / #2102 Stage 1: pi). OpenCode/Kilo
+  // already get their nativePlugin file from installOpencodeFamilyArtifacts
+  // (called inside the _isSkillsRuntime branch, since both declare a non-empty
+  // artifactLayout) — guard on `!_isSkillsRuntime` so this standalone call never
+  // double-stages their plugin file. A runtime like pi, whose artifactLayout is
+  // intentionally empty for both scopes (`_isSkillsRuntime` is false), still
+  // needs its declared hostBehaviors.nativePlugin file copied into targetDir.
+  if (!_isSkillsRuntime && _hostBehaviors(runtime).nativePlugin) {
+    _installNativePluginIfDeclared(runtime, targetDir, _hostBehaviors(runtime), src);
+  }
+
   // Copy gsd-core skill with path replacement
   // Preserve user-generated files before the wipe-and-copy so they survive re-install
   const skillSrc = path.join(src, 'gsd-core');
@@ -9519,7 +9651,11 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // this copy, every /gsd-* workflow in Cascade references a missing file and the LLM
   // cannot execute the command body. Surfaced by the #1629 regression test after the
   // original adversarial review of #1622 missed it.
-  if (isWindsurf && !isGlobal) {
+  // Descriptor-driven (ADR-1239 / #2100): folded from `isWindsurf` into
+  // hostBehaviors.installsCommandBodiesForWorkflowDelegation (windsurf is the
+  // only runtime that declares it, so this is byte-parity — the #1629 fix
+  // itself is unchanged).
+  if (_hostBehaviors(runtime).installsCommandBodiesForWorkflowDelegation && !isGlobal) {
     const commandsSrc = path.join(src, 'commands', 'gsd');
     const commandsDest = path.join(skillDest, 'commands', 'gsd');
     if (fs.existsSync(commandsSrc)) {
@@ -9589,8 +9725,10 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // `--minimal` actually shrinks a previously-full install.
   // For Codex this also covers per-agent `.toml` files alongside the `.md`
   // sources so a full → minimal switch doesn't leave stale registrations.
-  // Skipped for descriptor-agent runtimes (installRuntimeArtifacts prunes).
-  if (!_DESCRIPTOR_AGENTS_RUNTIMES.has(runtime) && fs.existsSync(agentsDest)) {
+  // Skipped for descriptor-agent runtimes (installRuntimeArtifacts prunes) and
+  // for pluginOnlyInstall runtimes (pi, ADR-1239 / #2102 Stage 1 — no agents/
+  // dir is ever written for them, see the leading branch below).
+  if (!_DESCRIPTOR_AGENTS_RUNTIMES.has(runtime) && !_hostBehaviors(runtime).pluginOnlyInstall && fs.existsSync(agentsDest)) {
     for (const file of fs.readdirSync(agentsDest)) {
       if (
         file.startsWith('gsd-') &&
@@ -9601,7 +9739,12 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     }
   }
 
-  if (_DESCRIPTOR_AGENTS_RUNTIMES.has(runtime)) {
+  if (_hostBehaviors(runtime).pluginOnlyInstall) {
+    // pi (ADR-1239 / #2102 Stage 1): programmatic dispatch has no named-dispatch
+    // subagent toolkit (dispatch.subagentToolkit: "undocumented", no Agent-tool
+    // equivalent) and no host-read markdown surface — skip writing agents/ entirely.
+    console.log(`  ${green}✓${reset} pi: no subagent files (programmatic dispatch, no named-dispatch toolkit)`);
+  } else if (_DESCRIPTOR_AGENTS_RUNTIMES.has(runtime)) {
     // installRuntimeArtifacts already wrote agents + handles stale-file cleanup
     // via its own prune pass. No further action needed.
     console.log(`  ${dim}↳${reset} Agents installed via descriptor-driven layout (${runtime})`);
@@ -9697,8 +9840,13 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
         // conversion is applied pre-staging via the descriptor's
         // artifactLayout.converter (runtime-artifact-layout.cts), independent
         // of this legacy loop.
-        } else if (isWindsurf) {
-          content = convertClaudeAgentToWindsurfAgent(content);
+        // #2100: `else if (isWindsurf)` arm dropped — windsurf is ALSO in
+        // _DESCRIPTOR_AGENTS_RUNTIMES (line ~9575 above), so this whole
+        // `else if (fs.existsSync(agentsSrc))` branch is unreachable for it;
+        // isWindsurf was therefore always false here, making the arm dead.
+        // Its content conversion is applied pre-staging via the descriptor's
+        // artifactLayout.converter (convertClaudeAgentToWindsurfAgent),
+        // independent of this legacy loop.
         } else if (_hostBehaviors(runtime).frontmatterDialect === 'cline') {
           // Descriptor-driven (ADR-1239 / #2090): folded from `isCline` into
           // hostBehaviors.frontmatterDialect === 'cline'.
@@ -9922,7 +10070,8 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // skipSharedHooksInstall:true) — the redundant `&& !isKilo` was removed.
   // #2094: Trae's exclusion is likewise descriptor-driven (trae declares
   // skipSharedHooksInstall:true) — the redundant `&& !isTrae` was removed.
-  // ZCode still has an empty hostBehaviors, so `&& !isZcode` stays.
+  // #2101: ZCode's exclusion is likewise descriptor-driven (zcode declares
+  // skipSharedHooksInstall:true) — the redundant `&& !isZcode` was removed.
   // #2095: Kimi's exclusion is likewise descriptor-driven (kimi declares
   // skipSharedHooksInstall:true) — kimi's shared hooks/ + package.json marker
   // are instead installed into its OWN native hook root (~/.kimi, resolved by
@@ -9931,7 +10080,9 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // Agent-Skills configDir GSD installs skills/agents into for kimi.
   // #2099: Copilot's exclusion is likewise descriptor-driven (copilot declares
   // skipSharedHooksInstall:true) — the redundant `&& !isCopilot` was removed.
-  if (!isCodex && _hostBehaviors(runtime).skipSharedHooksInstall !== true && !isWindsurf && !isZcode) {
+  // #2100: Windsurf's exclusion is likewise descriptor-driven (windsurf declares
+  // skipSharedHooksInstall:true) — the redundant `&& !isWindsurf` was removed.
+  if (!isCodex && _hostBehaviors(runtime).skipSharedHooksInstall !== true) {
     if (!installSharedHooksBundle(targetDir)) {
       failures.push('hooks');
     }
@@ -10556,7 +10707,11 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     } else {
       console.log(`  ${green}✓${reset} Cursor lifecycle hooks already up to date`);
     }
-    // Re-run the manifest pass so the hook scripts + hooks.json are hash-tracked.
+    // Re-run the manifest pass to capture any files the hooks-json write path
+    // produced. NOTE: hooks.json and the gsd-cursor-*.js scripts are NOT
+    // manifest-tracked (verified) — uninstall removes them explicitly via
+    // removeCursorHooksJson + its script list, and reconcile is idempotent.
+    // The re-run is retained for parity with the settings.json install path.
     writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
     persistActiveProfileMarker();
     return { settingsPath: null, settings: null, statuslineCommand: null, updateBannerCommand: null, runtime, configDir: targetDir };
@@ -10624,6 +10779,34 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       // Re-hash so gsd-lifecycle.json is tracked in the file manifest.
       writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
     }
+
+    // ADR-1239 / #2100 Stage 2: Windsurf's own independent hooksSurface —
+    // Cascade's native hooks.json blocking hook bus (pre_write_code,
+    // pre_run_command), wired via runtime-hooks-surface.cts exactly like
+    // Cursor's writeCursorHooksJson but with Cascade's exit-code-2 blocking
+    // protocol instead of Cursor's stdout-JSON form. Unlike kimi's branch
+    // above, this is NOT gated to `isGlobal` — Windsurf has no
+    // hostBehaviors.localInstallDeferred early-return, so both local
+    // (.windsurf/hooks.json) and global (~/.codeium/windsurf/hooks.json)
+    // installs reach this branch and must get the hook bus wired.
+    if (plan.hooksSurface === 'windsurf-hooks-json') {
+      const windsurfHookResult = writeWindsurfHooksJson(targetDir, src, {
+        platform: process.platform,
+      });
+      if (windsurfHookResult.changed) {
+        console.log(`  ${green}✓${reset} Configured Windsurf lifecycle hooks (pre_write_code, pre_run_command)`);
+      } else {
+        console.log(`  ${green}✓${reset} Windsurf lifecycle hooks already up to date`);
+      }
+      // Re-run the manifest pass, mirroring the cursor writer's pattern above
+      // for parity. This does NOT hash-track hooks.json or the
+      // gsd-windsurf-*.js scripts (same as cursor): uninstall removes them
+      // explicitly via removeWindsurfHooksJson, and reconcileWindsurfHooksJson
+      // is idempotent on repeated installs, so manifest tracking isn't needed
+      // for correctness here.
+      writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
+    }
+
     persistActiveProfileMarker();
     return { settingsPath: null, settings: null, statuslineCommand: null, updateBannerCommand: null, runtime, configDir: targetDir };
   }
@@ -10935,7 +11118,8 @@ function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallS
   // #2096: isAntigravity dropped — unused in this function.
   // #2098: isCodebuddy dropped — unused in this function.
   // #2099: isCopilot dropped — unused in this function.
-  const { isOpencode, isCodex, isCursor, isWindsurf, isAugment, isQwen, isHermes, isCline } = runtimeFlags(runtime);
+  // #2100: isWindsurf dropped — unused in this function.
+  const { isOpencode, isCodex, isCursor, isAugment, isQwen, isHermes, isCline } = runtimeFlags(runtime);
   const plan = resolveInstallPlan(runtime);
 
   if (shouldInstallStatusline && plan.writesSharedSettings && !_hostBehaviors(runtime).skipSettingsUi) {
@@ -11181,13 +11365,14 @@ const runtimeMap = {
   '11': 'kimi',
   '12': 'kilo',
   '13': 'opencode',
-  '14': 'qwen',
-  '15': 'trae',
-  '16': 'windsurf',
-  '17': 'zcode'
+  '14': 'pi',
+  '15': 'qwen',
+  '16': 'trae',
+  '17': 'windsurf',
+  '18': 'zcode'
 };
-const allRuntimes = ['claude', 'antigravity', 'augment', 'cline', 'codebuddy', 'codex', 'copilot', 'cursor', 'grok', 'hermes', 'kimi', 'kilo', 'opencode', 'qwen', 'trae', 'windsurf', 'zcode'];
-const ALL_RUNTIMES_OPTION = '18';
+const allRuntimes = ['claude', 'antigravity', 'augment', 'cline', 'codebuddy', 'codex', 'copilot', 'cursor', 'grok', 'hermes', 'kimi', 'kilo', 'opencode', 'pi', 'qwen', 'trae', 'windsurf', 'zcode'];
+const ALL_RUNTIMES_OPTION = '19';
 
 /**
  * Build the runtime-selection prompt text shown by the interactive installer.
@@ -11208,11 +11393,12 @@ function buildRuntimePromptText() {
   ${cyan}11${reset}) Kimi         ${dim}(~/.config/agents, then ~/.agents if existing)${reset}
   ${cyan}12${reset}) Kilo         ${dim}(~/.config/kilo)${reset}
   ${cyan}13${reset}) OpenCode     ${dim}(~/.config/opencode)${reset}
-  ${cyan}14${reset}) Qwen Code    ${dim}(~/.qwen)${reset}
-  ${cyan}15${reset}) Trae         ${dim}(~/.trae)${reset}
-  ${cyan}16${reset}) Windsurf     ${dim}(~/.codeium/windsurf)${reset}
-  ${cyan}17${reset}) ZCode        ${dim}(~/.zcode)${reset}
-  ${cyan}18${reset}) All
+  ${cyan}14${reset}) pi           ${dim}(~/.pi/agent)${reset}
+  ${cyan}15${reset}) Qwen Code    ${dim}(~/.qwen)${reset}
+  ${cyan}16${reset}) Trae         ${dim}(~/.trae)${reset}
+  ${cyan}17${reset}) Windsurf     ${dim}(~/.codeium/windsurf)${reset}
+  ${cyan}18${reset}) ZCode        ${dim}(~/.zcode)${reset}
+  ${cyan}19${reset}) All
 
   ${dim}Select multiple: 1,2,6 or 1 2 6${reset}
 `;
@@ -11223,7 +11409,7 @@ function buildRuntimePromptText() {
  * Pure function — exported so tests can verify split/dedupe/fallback behavior.
  *  - Accepts comma- and/or whitespace-separated choices
  *  - Deduplicates while preserving order
- *  - Maps option 16 ("All") to every runtime
+ *  - Maps option 19 ("All") to every runtime
  *  - Falls back to ['claude'] when nothing valid is selected
  */
 function parseRuntimeInput(answer) {
@@ -11759,8 +11945,8 @@ const _LEGACY_SCAN_SUBDIR_NAMES = [
   '.agents',    // antigravity local form (canonical, #791)
   '.agent',     // antigravity local form (legacy, backward-compat)
   '.cursor',
-  '.devin',     // windsurf local form (canonical, #1085; Devin Desktop preferred dir)
-  '.windsurf',  // windsurf local form (legacy, backward-compat with pre-#1085 installs)
+  '.devin',     // windsurf local form (legacy, pre-#1615; Devin Desktop preferred dir, #1085)
+  '.windsurf',  // windsurf local form (canonical since #1615; capability.json localConfigDir)
   '.codeium/windsurf',
   '.augment',
   '.trae',
@@ -12071,6 +12257,11 @@ module.exports = {
     reconcileCursorHooksJson,
     writeCursorHooksJson,
     removeCursorHooksJson,
+    GSD_WINDSURF_PRE_WRITE_HOOK_SCRIPT,
+    GSD_WINDSURF_PRE_COMMAND_HOOK_SCRIPT,
+    GSD_WINDSURF_HOOK_SCRIPTS,
+    writeWindsurfHooksJson,
+    removeWindsurfHooksJson,
     stripGsdFromAgentsMd,
     GSD_AGENTS_MD_MARKER,
     GSD_AGENTS_MD_CLOSE_MARKER,

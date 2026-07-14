@@ -26,7 +26,11 @@ const VOLATILE_FILES = new Set([
   '.gsd-source',
   'gsd-core/CHANGELOG.md',
 ]);
-const HOOK_CONFIG_FILES = new Set(['settings.json', 'hooks.json']);
+// Must match tests/golden-install-parity.test.cjs exactly — settings.local.json
+// (Claude LOCAL hook surface, #338/#2086) embeds the same platform-varying
+// node-runner command and is excluded there; omitting it here mis-generated the
+// claude-local fixture (#2100).
+const HOOK_CONFIG_FILES = new Set(['settings.json', 'settings.local.json', 'hooks.json']);
 // Kimi's native config.toml (#2095) — see tests/golden-install-parity.test.cjs'
 // HOOK_CONFIG_RELATIVE_PATHS comment for why this is an exact relative-path
 // exclusion rather than a HOOK_CONFIG_FILES basename entry (a basename entry
@@ -65,6 +69,7 @@ function cleanup(root) {
 // With no args, regenerates ALL runtimes. With args, only the named runtimes.
 const targets = process.argv.slice(2).length > 0 ? process.argv.slice(2) : Object.keys(RUNTIME_META);
 fs.mkdirSync(FIXTURE_DIR, { recursive: true });
+
 for (const runtime of targets) {
   if (!Object.prototype.hasOwnProperty.call(RUNTIME_META, runtime)) {
     process.stderr.write(`[gen] unknown runtime '${runtime}' (not in RUNTIME_META) — skipping\n`);
@@ -81,3 +86,17 @@ for (const runtime of targets) {
   fs.writeFileSync(fixturePath, JSON.stringify(actual, null, 2) + '\n', 'utf8');
   process.stdout.write(`[gen] ${runtime}: wrote ${Object.keys(actual).length} file hashes -> ${fixturePath}\n`);
 }
+
+// Also regenerate the claude LOCAL legacy-layout fixture (claude-local.json).
+// This layout is distinct from the global install (commands/gsd-*.md +
+// agents/gsd-*.md) and has its own parity assertion in the test harness.
+const { configDir: localConfigDir, root: localRoot } = runMinimalInstall({ runtime: 'claude', scope: 'local' });
+let localActual;
+try {
+  localActual = buildParityManifest(localConfigDir, localRoot);
+} finally {
+  cleanup(localRoot);
+}
+const localFixturePath = path.join(FIXTURE_DIR, 'claude-local.json');
+fs.writeFileSync(localFixturePath, JSON.stringify(localActual, null, 2) + '\n', 'utf8');
+process.stdout.write(`[gen] claude-local: wrote ${Object.keys(localActual).length} file hashes -> ${localFixturePath}\n`);

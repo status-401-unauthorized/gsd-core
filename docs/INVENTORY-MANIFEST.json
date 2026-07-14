@@ -371,6 +371,7 @@
       "loop-host-contract.cjs",
       "loop-resolver.cjs",
       "markdown-sectionizer.cjs",
+      "markdown-table.cjs",
       "mcp-server.cjs",
       "milestone.cjs",
       "model-adapter.cjs",
@@ -446,7 +447,8 @@
       "workstream-name-policy.cjs",
       "workstream.cjs",
       "worktree-base-ref.cjs",
-      "worktree-safety.cjs"
+      "worktree-safety.cjs",
+      "write-set.cjs"
     ],
     "hooks": [
       "gsd-check-update-worker.js",
@@ -469,6 +471,8 @@
       "gsd-statusline.js",
       "gsd-update-banner.js",
       "gsd-validate-commit.sh",
+      "gsd-windsurf-pre-command.js",
+      "gsd-windsurf-pre-write.js",
       "gsd-workflow-guard.js",
       "gsd-worktree-path-guard.js"
     ]
