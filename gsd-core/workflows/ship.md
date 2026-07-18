@@ -324,7 +324,7 @@ If `REVIEW_CMD` is non-empty and not `"null"`, run the external review:
    Construct a review prompt containing the diff, diff stats, and phase context, then pipe it to the configured command:
    ```bash
    REVIEW_PROMPT="You are reviewing a pull request.\n\nDiff stats:\n${DIFF_STATS}\n\nPhase context:\n${STATE_STATUS}\n\nFull diff:\n${DIFF}\n\nRespond with JSON: { \"verdict\": \"APPROVED\" or \"REVISE\", \"confidence\": 0-100, \"summary\": \"...\", \"issues\": [{\"severity\": \"...\", \"file\": \"...\", \"line_range\": \"...\", \"description\": \"...\", \"suggestion\": \"...\"}] }"
-   REVIEW_OUTPUT=$(echo "${REVIEW_PROMPT}" | timeout 120 ${REVIEW_CMD} 2>/tmp/gsd-review-stderr.log)
+   REVIEW_OUTPUT=$(echo "${REVIEW_PROMPT}" | gsd_run run-with-timeout 120 -- ${REVIEW_CMD} 2>/tmp/gsd-review-stderr.log)
    REVIEW_EXIT=$?
    ```
 
