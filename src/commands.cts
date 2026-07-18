@@ -30,7 +30,7 @@ import roadmapParserMod = require('./roadmap-parser.cjs');
 const { extractCurrentMilestone, stripShippedMilestones: _stripShippedMilestones, getMilestoneInfo, getMilestonePhaseFilter, getRoadmapPhaseInternal } = roadmapParserMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import modelResolverMod = require('./model-resolver.cjs');
-const { resolveModelInternal, resolveEffortInternal, resolveFastModeInternal, resolveEffortForTier, resolveGranularityInternal, assertValidGranularityOverride } = modelResolverMod;
+const { resolveModelInternal, resolveModelForTier, resolveEffortInternal, resolveFastModeInternal, resolveEffortForTier, resolveGranularityInternal, assertValidGranularityOverride } = modelResolverMod;
 import { renderEffortForRuntime, RUNTIMES_WITH_FAST_MODE } from './model-catalog.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspace = require('./planning-workspace.cjs');
@@ -165,7 +165,7 @@ function cmdListTodos(cwd: string, area: string | undefined, raw: boolean): void
   const pendingDir = path.join(planningDir(cwd), 'todos', 'pending');
 
   let count = 0;
-  const todos: Array<{ file: string; created: string; title: string; area: string; path: string }> = [];
+  const todos: Array<{ file: string; created: string; title: string; area: string; path: string; severity?: string }> = [];
 
   try {
     const files = fs.readdirSync(pendingDir).filter(f => f.endsWith('.md'));
@@ -176,6 +176,9 @@ function cmdListTodos(cwd: string, area: string | undefined, raw: boolean): void
       const createdMatch = content.match(/^created:\s*(.+)$/m);
       const titleMatch = content.match(/^title:\s*(.+)$/m);
       const areaMatch = content.match(/^area:\s*(.+)$/m);
+      // #2337: surface severity when present. Omit the key entirely for todos
+      // with no severity line so existing consumers of this JSON are unaffected.
+      const severityMatch = content.match(/^severity:\s*(.+)$/m);
 
       const todoArea = areaMatch ? areaMatch[1].trim() : 'general';
 
@@ -189,6 +192,7 @@ function cmdListTodos(cwd: string, area: string | undefined, raw: boolean): void
         title: titleMatch ? titleMatch[1].trim() : 'Untitled',
         area: todoArea,
         path: toPosixPath(path.relative(cwd, path.join(pendingDir, file))),
+        ...(severityMatch ? { severity: severityMatch[1].trim() } : {}),
       });
     }
   } catch { /* intentionally empty */ }
@@ -488,7 +492,16 @@ function cmdResolveExecution(cwd: string, agentType: string | undefined, raw: bo
   opts = opts || {};
   const config = loadConfig(cwd);
   const profile = (config['model_profile'] as string) || 'balanced';
-  const model = resolveModelInternal(cwd, agentType!);
+  // #2068: resolve the model per-attempt so dynamic_routing escalates the MODEL
+  // (heavy tier) alongside effort. Gated on an explicit --attempt exactly like the
+  // effort resolution below, so the two fields stay symmetric: with no --attempt
+  // the model comes from the classic profile path (unchanged for everyone,
+  // including dynamic_routing-enabled users who don't pass --attempt), and only an
+  // explicit attempt routes through the tier ladder. resolveModelForTier itself
+  // still falls back to resolveModelInternal when dynamic_routing is off.
+  const model = (opts.attempt !== undefined && opts.attempt !== null)
+    ? resolveModelForTier(cwd, agentType!, opts.attempt)
+    : resolveModelInternal(cwd, agentType!);
 
   const effortOpts: Record<string, unknown> = {};
   if (typeof opts.effortOverride === 'string') effortOpts['override'] = opts.effortOverride;

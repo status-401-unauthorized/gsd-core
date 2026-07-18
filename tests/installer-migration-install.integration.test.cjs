@@ -35,10 +35,14 @@ const RUNTIME_INSTALL_CONTRACTS = {
   gemini: { surface: 'commands-gsd', settings: true, packageJson: true },
   hermes: { surface: 'hermes-skills', settings: true, packageJson: true },
   kimi: { surface: 'kimi-skills-agents', settings: false, packageJson: false },
-  // #1821: Kilo (hooksSurface:none, no plugin surface) no longer receives the
-  // dead hook scripts or the CommonJS package.json marker.
-  kilo: { surface: 'flat-command', settings: false, packageJson: false },
-  opencode: { surface: 'flat-command', settings: true, packageJson: true },
+  // #2305: Kilo's native plugin spawns the staged guard hooks, so it receives
+  // the shared hooks bundle + the CommonJS package.json marker, like OpenCode.
+  // (#1821 excluded Kilo on the false premise that it had no plugin surface.)
+  kilo: { surface: 'flat-command', settings: false, packageJson: true },
+  // #2329: OpenCode discovers commands from the PLURAL `commands/` dir — the
+  // singular `command/` (still correct for Kilo) made all /gsd-* commands
+  // invisible to OpenCode. commandDirName overrides the flat-command default.
+  opencode: { surface: 'flat-command', settings: true, packageJson: true, commandDirName: 'commands' },
   // #2102 Stage 1/2: pi is a PLUGIN-ONLY install (hostBehaviors.pluginOnlyInstall)
   // for commands/agents/skills — NO commands/, agents/, or skills/ dir. pi's
   // /gsd command is registered programmatically by the native extension
@@ -49,9 +53,9 @@ const RUNTIME_INSTALL_CONTRACTS = {
   // compact bridges) and its /gsd tokenizer requires hooks/lib/git-cmd.js, so
   // `hostBehaviors.skipSharedHooksInstall` was removed — pi now receives
   // hooks/ + hooks/lib/ + the {"type":"commonjs"} package.json marker, exactly
-  // like OpenCode (architecturally identical: hooksSurface:'none' + a native
-  // plugin that spawns the staged hooks), NOT like Kilo/ZCode (no plugin
-  // surface, where the same hooks are genuinely dead weight).
+  // like OpenCode and (since #2305) Kilo — architecturally identical:
+  // hooksSurface:'none' + a native plugin that spawns the staged hooks — NOT
+  // like ZCode (no plugin surface, where the same hooks are dead weight).
   pi: { surface: 'plugin-only', settings: false, packageJson: true },
   qwen: { surface: 'flat-skills', settings: true, packageJson: true },
   trae: { surface: 'flat-skills', settings: false, packageJson: false },
@@ -272,9 +276,11 @@ function assertFreshInstallContract(runtime, targetDir) {
       'Hermes should install the nested GSD category description'
     );
   } else if (contract.surface === 'flat-command') {
+    // #2329: dir name is per-runtime (opencode='commands', kilo stays 'command').
+    const commandDirName = contract.commandDirName || 'command';
     assert.ok(
-      listDirNames(targetDir, 'command').some((name) => name.startsWith('gsd-') && name.endsWith('.md')),
-      `${runtime} should install flattened command markdown files`
+      listDirNames(targetDir, commandDirName).some((name) => name.startsWith('gsd-') && name.endsWith('.md')),
+      `${runtime} should install flattened command markdown files in ${commandDirName}/`
     );
   } else if (contract.surface === 'plugin-only') {
     // #2102 Stage 1/2: pi — PLUGIN-ONLY install for commands/agents/skills

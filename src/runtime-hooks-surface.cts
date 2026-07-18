@@ -49,7 +49,7 @@ const {
   isManagedHookBasename: (scriptPath: string, opts?: { surface?: string }) => boolean;
   isManagedHookCommand: (cmd: string | null | undefined, opts?: { surface?: string; includeLegacyAliases?: boolean; configDir?: string }) => boolean;
   projectLegacySettingsHookCommand: (opts: { absoluteRunner: string; scriptPath: string; scriptToken: string; runtime: string; platform: string }) => string | null;
-  projectManagedHookCommand: (opts: { absoluteRunner: string; scriptPath: string; runtime: string; platform: string }) => string | null;
+  projectManagedHookCommand: (opts: { absoluteRunner: string; scriptPath: string; runtime: string; platform: string; hookShell?: string }) => string | null;
   projectPortableHookBaseDir: (opts: { configDir: string; homeDir: string }) => string;
   projectCodexHookTomlCommand: (opts: { absoluteRunner: string; scriptPath: string; platform: string }) => string;
   shellHookOmitsBashRunner: (opts: { platform: string; runtime: string; isShellHook: boolean }) => boolean;
@@ -354,6 +354,24 @@ function normalizeNodePath(execPath: string, opts?: NodeNormOpts): string {
   );
   if (miseMatch) {
     const shim = `${miseMatch[1]}/shims/node${miseMatch[2] || ''}`;
+    if (existsSync(shim)) return shim;
+  }
+
+  // volta pins a concrete node image at <VOLTA_HOME>/tools/image/node/<ver>/bin/node
+  // (Windows: <VOLTA_HOME>/tools/image/node/<ver>/node.exe — volta's own layout
+  // puts node.exe at the image root, no bin/). `volta uninstall node@<ver>` prunes
+  // that image, so a baked hook command 404s — the same ephemeral-path failure
+  // #977 fixed for fnm and #1619 for mise. The stable alias is the shim
+  // <VOLTA_HOME>/bin/node, a symlink to volta-shim that always resolves to the
+  // active pin. Derive <VOLTA_HOME> from execPath rather than the env so a custom
+  // VOLTA_HOME and the Windows %LOCALAPPDATA%\Volta default both work (#2185's
+  // reasoning), and only rewrite when the shim exists — otherwise fall back to
+  // the raw execPath unchanged.
+  const voltaMatch = normalizedForMatch.match(
+    /^(.*)\/tools\/image\/node\/[^/]+\/(?:bin\/)?node(\.exe)?$/,
+  );
+  if (voltaMatch) {
+    const shim = `${voltaMatch[1]}/bin/node${voltaMatch[2] || ''}`;
     if (existsSync(shim)) return shim;
   }
   return execPath;
@@ -828,6 +846,7 @@ interface BuildHookCommandOpts {
   portableHooks?: boolean;
   platform?: string;
   runtime?: string;
+  hookShell?: string;
   env?: NodeJS.ProcessEnv;
   existsSync?: (p: string) => boolean;
 }
@@ -836,6 +855,7 @@ function buildHookCommand(configDir: string, hookName: string, opts?: BuildHookC
   if (!opts) opts = {};
   const platform = opts.platform || process.platform;
   const runtime = opts.runtime || 'generic';
+  const hookShell = opts.hookShell;
   const isShellHook = hookName.endsWith('.sh');
 
   if (shellHookOmitsBashRunner({ platform, runtime, isShellHook })) {
@@ -863,6 +883,7 @@ function buildHookCommand(configDir: string, hookName: string, opts?: BuildHookC
       scriptPath: `${portableBaseDir}/hooks/${hookName}`,
       runtime: opts.runtime || 'generic',
       platform,
+      hookShell,
     });
   }
 
@@ -872,6 +893,7 @@ function buildHookCommand(configDir: string, hookName: string, opts?: BuildHookC
     scriptPath: hooksPath,
     runtime,
     platform,
+    hookShell,
   });
 }
 

@@ -573,6 +573,20 @@ describe('uninstall skills cleanup — hermes', () => {
 
 // ─── Section 4: No Claude references leak into non-Claude runtimes ────────────
 
+// #2284(b): a `<runtime_compatibility>...</runtime_compatibility>` block (e.g.
+// execute-phase.md/plan-phase.md's "**Subagent spawning is runtime-specific:**"
+// table) INTENTIONALLY retains "Claude Code" as a COMPARISON-RUNTIME LABEL —
+// "- **Claude Code:** Uses `Agent(subagent_type=..., ...)`" documents how
+// Claude Code behaves for a reader on ANY installed runtime; it is never a
+// host-self-reference the install is supposed to rebrand away. Strip these
+// blocks before the leak scan below so that legitimate retention doesn't trip
+// the "zero Claude references" invariant — everything OUTSIDE a
+// `runtime_compatibility` block is still held to zero, so an actual leaked
+// self-reference elsewhere in the file still fails this test.
+function stripRuntimeCompatibilityBlocks(content) {
+  return content.replace(/<runtime_compatibility>[\s\S]*?<\/runtime_compatibility>/g, '');
+}
+
 for (const runtime of ['hermes', 'qwen']) {
   describe(`no Claude references leak into ${runtime} install`, () => {
     let tmpDir;
@@ -628,7 +642,9 @@ for (const runtime of ['hermes', 'qwen']) {
         path.basename(f) !== 'CHANGELOG.md'
       );
       const leaks = allFiles.filter(f => {
-        const c = fs.readFileSync(f, 'utf8');
+        // #2284(b): exempt `<runtime_compatibility>` comparison-table content
+        // — see the exemption's rationale above the `for` loop.
+        const c = stripRuntimeCompatibilityBlocks(fs.readFileSync(f, 'utf8'));
         return /\bCLAUDE\.md\b/.test(c) || /\bClaude Code\b/.test(c) || /\.claude\//.test(c);
       }).map(f => path.relative(tmpDir, f));
       assert.strictEqual(leaks.length, 0, `Leaking: ${leaks.join(', ')}`);
@@ -1829,6 +1845,83 @@ describe('normalizeNodePath — mise versioned path → sibling shim (#1619)', (
     assert.equal(
       normalizeNodePath('/opt/homebrew/bin/node', { existsSync: () => true }),
       '/opt/homebrew/bin/node');
+  });
+});
+
+// ─── normalizeNodePath — volta versioned image path → stable shim (#2335) ────
+//
+// Bug #2335: the volta analog of #977 (fnm) / #1619 (mise) / #2185 (Homebrew).
+// `resolveNodeRunner()` bakes process.execPath into managed hook commands, and
+// node realpaths execPath, so under volta it resolves to the concrete image
+// `<VOLTA_HOME>/tools/image/node/<ver>/bin/node` (Windows: `<...>/<ver>/node.exe`
+// — volta's own layout puts node.exe at the image root, no bin/). `volta
+// uninstall node@<ver>` prunes that image, after which every managed hook 404s.
+// The stable alias is the shim `<VOLTA_HOME>/bin/node`, a symlink to volta-shim
+// that always resolves to the active pin. <VOLTA_HOME> is derived from the path
+// (not env) so a custom VOLTA_HOME and the Windows %LOCALAPPDATA%\Volta default
+// both work — same reasoning as the Homebrew branch (#2185). Rewrite only when
+// the shim exists; otherwise fall back to raw execPath, like the mise branch.
+describe('normalizeNodePath — volta image path → sibling shim (#2335)', () => {
+  const VOLTA_HOME = '/Users/u/.volta';
+  const VOLTA_NODE_PINNED = `${VOLTA_HOME}/tools/image/node/18.17.1/bin/node`;
+  const VOLTA_SHIM = `${VOLTA_HOME}/bin/node`;
+  const VOLTA_WIN_HOME = 'C:/Users/u/AppData/Local/Volta';
+  const VOLTA_WIN_NODE = `${VOLTA_WIN_HOME}/tools/image/node/22.1.0/node.exe`; // no bin/ on Windows
+  const VOLTA_WIN_SHIM = `${VOLTA_WIN_HOME}/bin/node.exe`;
+  const VOLTA_CUSTOM_HOME = '/opt/volta-home';
+  const VOLTA_CUSTOM_NODE = `${VOLTA_CUSTOM_HOME}/tools/image/node/20.0.0/bin/node`;
+  const VOLTA_CUSTOM_SHIM = `${VOLTA_CUSTOM_HOME}/bin/node`;
+
+  test('POSIX pinned image path + shim exists → sibling shim', () => {
+    assert.equal(
+      normalizeNodePath(VOLTA_NODE_PINNED, { existsSync: p => p === VOLTA_SHIM }),
+      VOLTA_SHIM);
+  });
+
+  test('Windows node.exe + shim exists → bin/node.exe (.exe preserved)', () => {
+    assert.equal(
+      normalizeNodePath(VOLTA_WIN_NODE, { existsSync: p => p === VOLTA_WIN_SHIM }),
+      VOLTA_WIN_SHIM);
+  });
+
+  test('backslash Windows path normalizes the same as forward-slash', () => {
+    assert.equal(
+      normalizeNodePath(VOLTA_WIN_NODE.replace(/\//g, '\\'),
+        { existsSync: p => p === VOLTA_WIN_SHIM }),
+      VOLTA_WIN_SHIM);
+  });
+
+  test('custom VOLTA_HOME layout → shim derived from execPath, not env', () => {
+    assert.equal(
+      normalizeNodePath(VOLTA_CUSTOM_NODE, { existsSync: p => p === VOLTA_CUSTOM_SHIM }),
+      VOLTA_CUSTOM_SHIM);
+  });
+
+  test('no regression: shim absent → falls back to raw execPath unchanged', () => {
+    assert.equal(
+      normalizeNodePath(VOLTA_NODE_PINNED, { existsSync: () => false }),
+      VOLTA_NODE_PINNED);
+  });
+
+  test('volta shim itself is already stable → left unchanged (idempotent)', () => {
+    assert.equal(
+      normalizeNodePath(VOLTA_SHIM, { existsSync: () => true }),
+      VOLTA_SHIM);
+  });
+
+  test('a non-node volta image (yarn) is not rewritten to the node shim', () => {
+    const yarnImage = `${VOLTA_HOME}/tools/image/yarn/1.22.19/bin/yarn`;
+    assert.equal(
+      normalizeNodePath(yarnImage, { existsSync: () => true }),
+      yarnImage);
+  });
+
+  test('mise path is unaffected by the volta branch (no cross-manager capture)', () => {
+    const miseShim = '/Users/u/.local/share/mise/shims/node';
+    assert.equal(
+      normalizeNodePath('/Users/u/.local/share/mise/installs/node/26.3.0/bin/node',
+        { existsSync: p => p === miseShim }),
+      miseShim);
   });
 });
 
