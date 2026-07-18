@@ -9,6 +9,14 @@ const fs = require('fs');
 const path = require('path');
 const { runGsdTools, cleanup } = require('./helpers.cjs');
 const { createFixture } = require('./fixtures/index.cjs');
+const { toPosixPath } = require('../gsd-core/bin/lib/shell-command-projection.cjs');
+
+// #2376: init onboard's onboarding_summary_path / next_action.summary_path are
+// now absolute (anchored on the project root) so a spawned subagent with a
+// different cwd still resolves them correctly.
+function absPlanningPath(base, ...segments) {
+  return toPosixPath(path.join(base, '.planning', ...segments));
+}
 
 const ROOT = path.join(__dirname, '..');
 const CMD_PATH = path.join(ROOT, 'commands', 'gsd', 'onboard.md');
@@ -142,7 +150,7 @@ describe('init onboard public CLI projection', () => {
     assert.strictEqual(parsed.has_codebase_map, true);
     assert.deepStrictEqual(parsed.missing_codebase_map_files, []);
     assert.strictEqual(parsed.onboarding_summary_exists, true);
-    assert.strictEqual(parsed.onboarding_summary_path, '.planning/onboarding/SUMMARY.md');
+    assert.strictEqual(parsed.onboarding_summary_path, absPlanningPath(tmpDir, 'onboarding', 'SUMMARY.md'));
     assert.strictEqual(parsed.text_mode, true);
   });
 
@@ -224,7 +232,7 @@ describe('init onboard public CLI projection', () => {
     // Once project setup is complete, a fast map must not misroute back to the
     // pre-new-project complete-map handoff; onboarding advances to the summary.
     assert.strictEqual(parsed.next_action.kind, 'write-summary');
-    assert.strictEqual(parsed.next_action.summary_path, '.planning/onboarding/SUMMARY.md');
+    assert.strictEqual(parsed.next_action.summary_path, absPlanningPath(tmpDir, 'onboarding', 'SUMMARY.md'));
   });
 
   test('fast mode routes incomplete planning to partial-planning before the complete-map gate (regression #1990: fast map gate misroute)', () => {
@@ -301,7 +309,7 @@ describe('init onboard public CLI projection', () => {
     assert.ok(result.success, `init onboard should succeed: ${result.error}`);
     assert.deepStrictEqual(JSON.parse(result.output).next_action, {
       kind: 'write-summary',
-      summary_path: '.planning/onboarding/SUMMARY.md',
+      summary_path: absPlanningPath(tmpDir, 'onboarding', 'SUMMARY.md'),
       reason: 'Onboarding summary is missing.',
     });
 
