@@ -25,6 +25,9 @@ const {
 const {
   convertClaudeCommandToGrokSkill,
   convertClaudeAgentToGrokAgent,
+  convertClaudeToGrokMarkdown,
+  rewriteClaudeToolsToGrok,
+  mapClaudeToolsListToGrok,
 } = require('../gsd-core/bin/lib/runtime-artifact-conversion.cjs');
 const { catalog } = require('../gsd-core/bin/lib/model-catalog.cjs');
 
@@ -150,6 +153,11 @@ Read CLAUDE.md for project rules.
     assert.match(out, /exit_plan_mode/);
     assert.match(out, /spawn_subagent\(/);
     assert.match(out, /ask_user_question/);
+    // File I/O mapping table must be present in the adapter (not only orchestration).
+    assert.match(out, /search_replace/);
+    assert.match(out, /read_file/);
+    assert.match(out, /run_terminal_command/);
+    assert.match(out, /File I\/O and shell/);
     // Body rewrites CLAUDE.md → AGENTS.md; adapter may still mention CLAUDE.md as a source mapping.
     const body = out.split('</grok_skill_adapter>')[1] || '';
     assert.match(body, /AGENTS\.md/);
@@ -172,6 +180,113 @@ Body here. Uses Task(subagent_type="x") — should not nest.
     assert.match(out, /isolation\?=/);
     assert.match(out, /Max spawn depth is 1/);
     assert.match(out, /isolation="worktree"/);
+    // tools: frontmatter mapped to Grok names in role header
+    assert.match(out, /tools: read_file, search_replace, run_terminal_command/);
+    assert.match(out, /search_replace only/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Full Claude → Grok tool-name rewrite (Write/Read/Bash/… → Grok natives)
+// ---------------------------------------------------------------------------
+
+describe('rewriteClaudeToolsToGrok / convertClaudeToGrokMarkdown', () => {
+  test('mapClaudeToolsListToGrok maps Claude allowlists and keeps mcp wildcards', () => {
+    assert.equal(
+      mapClaudeToolsListToGrok('Read, Write, Edit, Bash, Grep, Glob, Skill, WebSearch, WebFetch'),
+      'read_file, search_replace, search_replace, run_terminal_command, grep, list_dir, read_file, web_search, open_page',
+    );
+    assert.equal(
+      mapClaudeToolsListToGrok('Read, mcp__context7__*, Bash'),
+      'read_file, mcp__context7__*, run_terminal_command',
+    );
+    // Idempotent on already-Grok names
+    assert.equal(
+      mapClaudeToolsListToGrok('read_file, search_replace, run_terminal_command'),
+      'read_file, search_replace, run_terminal_command',
+    );
+  });
+
+  test('rewrites Write/Read ban phrases and anti-heredoc mandates', () => {
+    const src = `
+**ALWAYS use the Write tool to create files** — never use \`Bash(cat << 'EOF')\` or heredoc commands for file creation.
+If the prompt contains a required_reading block, you MUST use the \`Read\` tool to load every file.
+3. **Do NOT use \`Bash(cat << 'EOF')\` or heredoc** for file creation. Use the \`Write\` tool.
+`;
+    const out = rewriteClaudeToolsToGrok(src);
+    assert.match(out, /ALWAYS use search_replace to create files/);
+    assert.match(out, /MUST use the `read_file` tool/);
+    assert.match(out, /Use the `search_replace` tool/);
+    assert.doesNotMatch(out, /Write tool/);
+    assert.doesNotMatch(out, /`Read` tool/);
+    assert.doesNotMatch(out, /`Bash\(cat/);
+    assert.match(out, /run_terminal_command/);
+  });
+
+  test('rewrites orchestration + discovery tool call forms', () => {
+    const src = `
+Agent(
+  prompt=ui_research_prompt,
+  subagent_type="gsd-ui-researcher",
+)
+Use AskUserQuestion for the choice.
+Task(subagent_type="gsd-planner", prompt="...")
+TodoWrite for checklist.
+WebSearch and WebFetch for docs.
+Codebase Grep/Glob for tokens.
+Skill(skill="gsd-plan-phase")
+`;
+    const out = convertClaudeToGrokMarkdown(src);
+    assert.match(out, /spawn_subagent\(/);
+    assert.doesNotMatch(out, /\bAgent\(/);
+    assert.doesNotMatch(out, /\bTask\(/);
+    assert.match(out, /ask_user_question/);
+    assert.doesNotMatch(out, /AskUserQuestion/);
+    assert.match(out, /todo_write/);
+    assert.doesNotMatch(out, /TodoWrite/);
+    assert.match(out, /web_search/);
+    assert.match(out, /open_page/);
+    assert.match(out, /grep\/list_dir/);
+    assert.match(out, /open and follow ~\/\.grok\/skills\/gsd-plan-phase\/SKILL\.md/);
+  });
+
+  test('ui-researcher-style body no longer mandates Write for UI-SPEC', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'agents', 'gsd-ui-researcher.md'),
+      'utf8',
+    );
+    const out = convertClaudeAgentToGrokAgent(src);
+    assert.match(out, /<grok_agent_role>/);
+    assert.match(out, /tools: read_file, search_replace/);
+    assert.match(out, /ALWAYS use search_replace to create files/);
+    assert.doesNotMatch(out, /ALWAYS use the Write tool/);
+    assert.doesNotMatch(out, /use the `Read` tool/);
+    assert.match(out, /use the `read_file` tool/);
+    assert.doesNotMatch(out, /`Bash\(cat << 'EOF'\)`/);
+    // Narrative "Write to:" paths may remain; tool-mandate language must not.
+    assert.doesNotMatch(out, /Use the `Write` tool/);
+  });
+
+  test('ui-phase workflow body maps Agent/AskUserQuestion to Grok tools', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'gsd-core', 'workflows', 'ui-phase.md'),
+      'utf8',
+    );
+    const out = convertClaudeToGrokMarkdown(src);
+    assert.match(out, /spawn_subagent\(/);
+    assert.doesNotMatch(out, /\bAgent\(/);
+    assert.match(out, /ask_user_question/);
+    // Remaining AskUserQuestion only acceptable if none
+    assert.doesNotMatch(out, /AskUserQuestion/);
+    // TEXT_MODE prose may still mention the Claude name as historical — after rewrite it should say ask_user_question
+    assert.match(out, /replace every `?ask_user_question`? call/i);
+  });
+
+  test('rewriteClaudeToolsToGrok is idempotent', () => {
+    const src = 'ALWAYS use the Write tool. Agent(prompt="x") AskUserQuestion TodoWrite Bash(ls)';
+    const once = rewriteClaudeToolsToGrok(src);
+    const twice = rewriteClaudeToolsToGrok(once);
+    assert.equal(twice, once);
   });
 });
 
@@ -204,7 +319,41 @@ test('grok --global: writes gsd-lifecycle.json + skills/agents under config dir'
     const body = fs.readFileSync(skillMd, 'utf8');
     assert.match(body, /<grok_skill_adapter>/);
     assert.match(body, /enter_plan_mode|spawn_subagent/);
+    assert.match(body, /search_replace/, 'skill adapter must document search_replace for file create/edit');
   }
 
   assert.match(stdout, /Grok lifecycle hook/i);
+});
+
+test('grok --global: installed agent + ui-phase workflow use Grok tool names', (t) => {
+  const { root, configDir } = runMinimalInstall({ runtime: 'grok', scope: 'global' });
+  t.after(() => cleanup(root));
+
+  // Agent converter applied: role header + no Write-tool mandate
+  const agentPath = path.join(configDir, 'agents', 'gsd-ui-researcher.md');
+  assert.ok(fs.existsSync(agentPath), 'gsd-ui-researcher agent must install');
+  const agentBody = fs.readFileSync(agentPath, 'utf8');
+  assert.match(agentBody, /<grok_agent_role>/);
+  assert.match(agentBody, /search_replace/);
+  assert.match(agentBody, /read_file/);
+  assert.doesNotMatch(agentBody, /ALWAYS use the Write tool/);
+  assert.doesNotMatch(agentBody, /use the `Read` tool/);
+
+  // Pack workflows rewritten via RUNTIME_CONTENT_DISPATCH.grok
+  const uiPhasePath = path.join(configDir, 'gsd-core', 'workflows', 'ui-phase.md');
+  assert.ok(fs.existsSync(uiPhasePath), 'ui-phase workflow must install under gsd-core/workflows');
+  const workflowBody = fs.readFileSync(uiPhasePath, 'utf8');
+  assert.match(workflowBody, /spawn_subagent\(/);
+  assert.doesNotMatch(workflowBody, /\bAgent\(/);
+  assert.match(workflowBody, /ask_user_question/);
+  assert.doesNotMatch(workflowBody, /AskUserQuestion/);
+
+  // ui-phase skill still points at the rewritten workflow
+  const skillPath = path.join(configDir, 'skills', 'gsd-ui-phase', 'SKILL.md');
+  if (fs.existsSync(skillPath)) {
+    const skillBody = fs.readFileSync(skillPath, 'utf8');
+    assert.match(skillBody, /<grok_skill_adapter>/);
+    assert.match(skillBody, /File I\/O and shell/);
+    assert.match(skillBody, /search_replace/);
+  }
 });

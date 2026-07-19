@@ -7510,6 +7510,12 @@ const _stampNonClaudeRuntimeDefaults = runtimeArtifactConversion._stampNonClaude
  *
  * ctx = { isCommand, isGlobal, dirName, pathPrefix, entryName, runtime }
  */
+// Grok pack bodies (gsd-core/workflows, references, templates, …) go through
+// copyWithPathReplacement → RUNTIME_CONTENT_DISPATCH. Skills/agents use the
+// dedicated convertClaudeCommandToGrokSkill / convertClaudeAgentToGrokAgent
+// converters; both share convertClaudeToGrokMarkdown for tool-name rewrites.
+const convertClaudeToGrokMarkdown = runtimeArtifactConversion.convertClaudeToGrokMarkdown;
+
 const RUNTIME_CONTENT_DISPATCH = {
   opencode: {
     md: (content) => convertClaudeToOpencodeFrontmatter(content),
@@ -7519,6 +7525,11 @@ const RUNTIME_CONTENT_DISPATCH = {
   },
   codex: {
     md: (content) => convertClaudeToCodexMarkdown(content),
+  },
+  // Full Claude→Grok tool + ban-phrase rewrite for workflows/references/templates
+  // so ui-phase.md Agent()/AskUserQuestion/Write-tool prose becomes Grok-native.
+  grok: {
+    md: (content) => convertClaudeToGrokMarkdown(content),
   },
   copilot: {
     mdSkipGenericRewrite: true,
@@ -10739,7 +10750,10 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // brandingRewrites-only branch).
   // cline remains excluded: rules-only local branch + local/global complication
   // that the descriptor-driven path does not handle correctly.
-  const _DESCRIPTOR_AGENTS_RUNTIMES = new Set(['cursor', 'windsurf', 'augment', 'trae', 'codebuddy', 'copilot', 'antigravity', 'qwen', 'kimi']);
+  // grok: convertClaudeAgentToGrokAgent via artifactLayout (must stay here —
+  // without exclusion the legacy loop below path-rewrites agents RAW and
+  // overwrites the descriptor-written bodies, dropping tool-name rewrites).
+  const _DESCRIPTOR_AGENTS_RUNTIMES = new Set(['cursor', 'windsurf', 'augment', 'trae', 'codebuddy', 'copilot', 'antigravity', 'qwen', 'kimi', 'grok']);
 
   // Always remove stale gsd-* agents first so re-installing with
   // `--minimal` actually shrinks a previously-full install.

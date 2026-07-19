@@ -1565,48 +1565,332 @@ function convertClaudeCommandToCodexSkill(content, skillName) {
 }
 
 /**
+ * Claude Code tool token → Grok Build tool name.
+ * MCP wildcards (mcp__…) and already-Grok names pass through unchanged.
+ * Skill has no Grok tool — callers that need a file tool use read_file to open SKILL.md.
+ */
+const CLAUDE_TO_GROK_TOOLS = Object.freeze({
+  Read: 'read_file',
+  Write: 'search_replace',
+  Edit: 'search_replace',
+  MultiEdit: 'search_replace',
+  Bash: 'run_terminal_command',
+  Grep: 'grep',
+  Glob: 'list_dir',
+  Skill: 'read_file',
+  WebSearch: 'web_search',
+  WebFetch: 'open_page',
+  TodoWrite: 'todo_write',
+  AskUserQuestion: 'ask_user_question',
+  request_user_input: 'ask_user_question',
+  Agent: 'spawn_subagent',
+  Task: 'spawn_subagent',
+  SlashCommand: 'skill_invocation',
+});
+
+/** Map a comma-separated Claude tools: frontmatter / allowlist string to Grok names. */
+function mapClaudeToolsListToGrok(toolsList) {
+  if (!toolsList || typeof toolsList !== 'string') return '';
+  return toolsList
+    .split(',')
+    .map((part) => {
+      const token = part.trim();
+      if (!token) return '';
+      if (token.startsWith('mcp__') || token.includes('*')) return token;
+      return CLAUDE_TO_GROK_TOOLS[token] || token;
+    })
+    .filter(Boolean)
+    .join(', ');
+}
+
+/**
+ * Rewrite Claude tool *names and ban phrases* to Grok Build tools.
+ * Pure and intended to be idempotent on already-converted content.
+ * Does not rewrite paths or product branding (see convertClaudeToGrokMarkdown).
+ */
+function rewriteClaudeToolsToGrok(content) {
+  let converted = content;
+
+  // ── Phrase-level ban / mandate language (Write / Edit / Read / Bash) ──
+  // Order: most specific first so "ALWAYS use the Write tool" is not half-matched.
+  converted = converted.replace(
+    /\bALWAYS use the Write tool(?: to create files)?\b/g,
+    'ALWAYS use search_replace to create files',
+  );
+  converted = converted.replace(
+    /\bAlways use the Write tool\b/g,
+    'Always use search_replace',
+  );
+  converted = converted.replace(
+    /\bUse the Write tool to create files\b/g,
+    'Use search_replace to create files',
+  );
+  converted = converted.replace(
+    /\bUse the Write tool\b/g,
+    'Use search_replace',
+  );
+  converted = converted.replace(
+    /\buse the Write tool\b/g,
+    'use search_replace',
+  );
+  converted = converted.replace(
+    /\buse Write tool\b/g,
+    'use search_replace',
+  );
+  converted = converted.replace(
+    /\bIf the Write tool errors\b/g,
+    'If search_replace errors',
+  );
+  converted = converted.replace(
+    /\ba single `Write` call\b/g,
+    'a single `search_replace` call',
+  );
+  converted = converted.replace(
+    /\bsingle oversized `Write`\b/g,
+    'single oversized `search_replace`',
+  );
+  converted = converted.replace(
+    /\bIf a `Write` fails\b/g,
+    'If a `search_replace` fails',
+  );
+  converted = converted.replace(
+    /\b`Write` the file\b/g,
+    '`search_replace` the file',
+  );
+  converted = converted.replace(
+    /\bthen `Edit` it\b/g,
+    'then `search_replace` it',
+  );
+  converted = converted.replace(
+    /\bone section per `Edit`\b/g,
+    'one section per `search_replace`',
+  );
+  converted = converted.replace(
+    /\bWrite tool is only for\b/g,
+    'search_replace is only for',
+  );
+  converted = converted.replace(
+    /\bDirect Write tool usage\b/g,
+    'Direct search_replace usage',
+  );
+  converted = converted.replace(
+    /\bNo direct Write\/Edit\b/g,
+    'No direct search_replace',
+  );
+  converted = converted.replace(
+    /\bDO NOT use Write tool\b/g,
+    'DO NOT use search_replace',
+  );
+  converted = converted.replace(
+    /\bnot Write tool\b/g,
+    'not search_replace',
+  );
+  converted = converted.replace(
+    /\bWrite tool\b/g,
+    'search_replace',
+  );
+  converted = converted.replace(
+    /\bEdit tool \(preferred\)\b/g,
+    'search_replace (preferred)',
+  );
+  converted = converted.replace(
+    /\bEdit tool\b/g,
+    'search_replace',
+  );
+  converted = converted.replace(
+    /\buse the Edit tool\b/g,
+    'use search_replace',
+  );
+  converted = converted.replace(
+    /\busing Edit tool\b/g,
+    'using search_replace',
+  );
+  converted = converted.replace(
+    /\bMUST use the `Read` tool\b/g,
+    'MUST use the `read_file` tool',
+  );
+  converted = converted.replace(
+    /\buse the `Read` tool\b/g,
+    'use the `read_file` tool',
+  );
+  converted = converted.replace(
+    /\buse the Read tool\b/g,
+    'use the read_file tool',
+  );
+  converted = converted.replace(
+    /\bRead tool\b/g,
+    'read_file tool',
+  );
+
+  // Anti-heredoc mandates — keep the prohibition, name the Grok shell tool.
+  converted = converted.replace(
+    /never use `Bash\(cat << 'EOF'\)` or heredoc commands for file creation/gi,
+    "never use `run_terminal_command` with heredoc (`cat << 'EOF'`) for file creation",
+  );
+  converted = converted.replace(
+    /Never use `Bash\(cat << 'EOF'\)` or heredoc commands for file creation/g,
+    "Never use `run_terminal_command` with heredoc (`cat << 'EOF'`) for file creation",
+  );
+  converted = converted.replace(
+    /Do NOT use `Bash\(cat << 'EOF'\)` or heredoc/g,
+    "Do NOT use `run_terminal_command` with heredoc (`cat << 'EOF'`)",
+  );
+  converted = converted.replace(
+    /never use `Bash\(cat << 'EOF'\)` or heredoc/gi,
+    "never use `run_terminal_command` with heredoc (`cat << 'EOF'`)",
+  );
+  converted = converted.replace(
+    /never create files via `Bash\(cat << 'EOF'\)`/gi,
+    "never create files via `run_terminal_command` heredoc (`cat << 'EOF'`)",
+  );
+  converted = converted.replace(
+    /Never use `Bash\(cat << 'EOF'\)`/g,
+    "Never use `run_terminal_command` with heredoc (`cat << 'EOF'`)",
+  );
+  converted = converted.replace(
+    /`Bash\(cat << 'EOF'\)`/g,
+    "`run_terminal_command` heredoc (`cat << 'EOF'`)",
+  );
+  converted = converted.replace(
+    /\bBash\(cat << 'EOF'\)/g,
+    "run_terminal_command heredoc (cat << 'EOF')",
+  );
+
+  // Backticked Claude tool names → Grok
+  converted = converted.replace(/`Write`/g, '`search_replace`');
+  converted = converted.replace(/`Edit`/g, '`search_replace`');
+  converted = converted.replace(/`MultiEdit`/g, '`search_replace`');
+  converted = converted.replace(/`Read`/g, '`read_file`');
+  converted = converted.replace(/`Bash`/g, '`run_terminal_command`');
+  converted = converted.replace(/`Grep`/g, '`grep`');
+  converted = converted.replace(/`Glob`/g, '`list_dir`');
+  converted = converted.replace(/`WebSearch`/g, '`web_search`');
+  converted = converted.replace(/`WebFetch`/g, '`open_page`');
+  converted = converted.replace(/`TodoWrite`/g, '`todo_write`');
+  converted = converted.replace(/`AskUserQuestion`/g, '`ask_user_question`');
+  converted = converted.replace(/`Skill`/g, '`read_file`');
+  converted = converted.replace(/`Task`/g, '`spawn_subagent`');
+  converted = converted.replace(/`Agent`/g, '`spawn_subagent`');
+
+  // Slash-separated discovery shorthand (tool strategy tables)
+  converted = converted.replace(/\bGrep\/Glob\b/g, 'grep/list_dir');
+  converted = converted.replace(/\bGlob\/Grep\b/g, 'list_dir/grep');
+  converted = converted.replace(/\bRead\/Write\b/g, 'read_file/search_replace');
+  converted = converted.replace(/\bWrite\/Edit\b/g, 'search_replace');
+
+  // tools: frontmatter / allowlist lines (before generic word maps)
+  converted = converted.replace(/^tools:\s*(.+)$/gm, (_, list) => `tools: ${mapClaudeToolsListToGrok(list)}`);
+
+  // Comma-separated Claude tool token runs (e.g. "Read, Write, Edit, Bash, Grep")
+  const claudeToolToken =
+    'Read|Write|Edit|MultiEdit|Bash|Grep|Glob|Skill|WebSearch|WebFetch|TodoWrite|AskUserQuestion|Agent|Task|SlashCommand';
+  const toolListRe = new RegExp(
+    `\\b(?:${claudeToolToken})(?:\\s*,\\s*(?:${claudeToolToken}|mcp__[^\\s,]+))+\\b`,
+    'g',
+  );
+  converted = converted.replace(toolListRe, (match) => mapClaudeToolsListToGrok(match));
+
+  // Function-call forms
+  converted = converted.replace(/\bAskUserQuestion\b/g, 'ask_user_question');
+  converted = converted.replace(/\brequest_user_input\b/g, 'ask_user_question');
+  converted = converted.replace(/\bTodoWrite\b/g, 'todo_write');
+  converted = converted.replace(/\bSlashCommand\b/g, 'skill_invocation');
+  converted = converted.replace(/\bTask\(/g, 'spawn_subagent(');
+  converted = converted.replace(/\bspawn_agent\(/g, 'spawn_subagent(');
+  converted = converted.replace(/\bAgent\(/g, 'spawn_subagent(');
+  converted = converted.replace(/\bBash\(/g, 'run_terminal_command(');
+  converted = converted.replace(/\bWrite\(/g, 'search_replace(');
+  converted = converted.replace(/\bEdit\(/g, 'search_replace(');
+  converted = converted.replace(/\bMultiEdit\(/g, 'search_replace(');
+  converted = converted.replace(/\bRead\(/g, 'read_file(');
+  converted = converted.replace(/\bGrep\(/g, 'grep(');
+  converted = converted.replace(/\bGlob\(/g, 'list_dir(');
+  converted = converted.replace(/\bWebSearch\b/g, 'web_search');
+  converted = converted.replace(/\bWebFetch\b/g, 'open_page');
+  // Skill tool does not exist on Grok — rewrite common Skill(skill="…") forms to prose.
+  converted = converted.replace(
+    /\bSkill\(\s*skill\s*=\s*["']([^"']+)["']\s*\)/g,
+    'open and follow ~/.grok/skills/$1/SKILL.md',
+  );
+  converted = converted.replace(
+    /\bSkill\(\s*["']([^"']+)["']\s*\)/g,
+    'open and follow ~/.grok/skills/$1/SKILL.md',
+  );
+  converted = converted.replace(
+    /\bSkill\(/g,
+    '/* no Skill tool — open ~/.grok/skills/<name>/SKILL.md via read_file */(',
+  );
+
+  // Matcher strings in commented hooks: "Write|Edit" → Grok names
+  converted = converted.replace(
+    /matcher:\s*"Write\|Edit"/g,
+    'matcher: "search_replace"',
+  );
+  converted = converted.replace(
+    /matcher:\s*'Write\|Edit'/g,
+    "matcher: 'search_replace'",
+  );
+
+  return converted;
+}
+
+/**
  * Grok Build skill adapter — maps Claude/Codex invocation patterns to Grok tools.
- * Shorter than the Codex adapter: Grok has first-class spawn_subagent and skills
- * are invoked by name (no Skill(gsd:*) prefix noise).
+ * Grok has first-class spawn_subagent; skills are invoked by name (no Skill tool).
  *
  * Kept in sync with Grok Build user-guide (skills, subagents, plan mode) as of
  * Grok 4.5 / CLI 0.2.9x: max spawn depth 1, background subagents +
  * get_command_or_subagent_output, capability_mode / isolation worktrees,
- * enter_plan_mode / exit_plan_mode, update_goal.
+ * enter_plan_mode / exit_plan_mode, todo_write / update_goal.
  */
 function getGrokSkillAdapterHeader(skillName) {
   return `<grok_skill_adapter>
 Skill: ${skillName}
 
-Runtime mapping (Claude / Codex → Grok Build):
+## Orchestration (Claude / Codex → Grok Build)
 - Task(subagent_type=..., prompt=...) / spawn_agent(...) → spawn_subagent(subagent_type=..., prompt=..., description=..., background?=..., capability_mode?=..., isolation?=...)
-- Agent(type) / typed agent roles → spawn_subagent with subagent_type matching the agent name when installed under ~/.grok/agents/gsd-*.md, else general-purpose + role preamble
+- Agent(...) / typed agent roles in workflows → spawn_subagent with subagent_type matching the agent name when installed under ~/.grok/agents/gsd-*.md, else general-purpose + role preamble
 - Background / parallel child work → spawn_subagent(..., background=true) then get_command_or_subagent_output(task_ids=[...]) (or monitor for long streams)
 - Isolation for file-mutating children → isolation="worktree" (mutually exclusive with cwd); default isolation is none (shared workspace)
 - Tool restriction on children → capability_mode: read-only | read-write | execute | all
-- AskUserQuestion / request_user_input → ask_user_question
-- TodoWrite / update_plan → keep as structured steps in your reply; track multi-step goals via update_goal when available
+- AskUserQuestion / request_user_input → ask_user_question (options: label + description; multi_select when needed)
+- TodoWrite → todo_write (structured step list). Use update_goal only for high-level goal progress, not task checklists.
 - Plan Mode (design before edits) → enter_plan_mode then exit_plan_mode after the plan is written (Grok reads the plan file from disk)
-- SlashCommand /skill:gsd-* → invoke the matching gsd-* skill by name (already installed as ~/.grok/skills/gsd-*/SKILL.md)
-- Project rules (Claude project-rules file / AGENTS.md) → AGENTS.md (repo root or .grok/ project rules)
+- SlashCommand / Skill(skill="gsd-*") /skill:gsd-* → there is no Skill tool; open and follow ~/.grok/skills/gsd-*/SKILL.md (or invoke the matching slash skill by name)
+- Project rules (CLAUDE.md) → AGENTS.md (repo root or .grok/ project rules)
 - ~/.claude/ and ~/.codex/ paths in instructions → ~/.grok/ (or $GROK_HOME)
 
-Subagent depth: Grok allows one level of spawn_subagent nesting. Orchestrator skills (plan-phase, execute-phase, autonomous) run at depth 0 and spawn executors/verifiers; do not nest another spawner inside a child (spawn_subagent from a child fails with a depth-limit error).
+## File I/O and shell (Claude → Grok Build) — CRITICAL
+Grok does **not** expose Write, Read, Edit, Bash, Grep, Glob, WebSearch, or WebFetch.
+Using those names fails and causes trial-and-error loops. Map every occurrence:
+
+| Claude name | Grok tool | Notes |
+|-------------|-----------|--------|
+| Read | read_file | Load files listed in required_reading / files_to_read |
+| Write / Edit / MultiEdit | search_replace | Create **and** edit files (including UI-SPEC.md, PLAN.md, VERIFICATION.md) |
+| Bash | run_terminal_command | Shell only — **never** heredoc file creation |
+| Grep | grep | Content search |
+| Glob | list_dir + grep | No recursive Glob tool; use list_dir or run_terminal_command with find/rg --files |
+| WebSearch | web_search | |
+| WebFetch | open_page / open_page_with_find | |
+| TodoWrite | todo_write | |
+
+**Create artifacts with search_replace**, not Write and not run_terminal_command heredocs.
+If a workflow or agent body still says "Write tool" or Agent(...), treat it as the Grok mapping above.
+
+## Subagent depth
+Grok allows one level of spawn_subagent nesting. Orchestrator skills (plan-phase, execute-phase, autonomous, ui-phase) run at depth 0 and spawn executors/verifiers/researchers; do not nest another spawner inside a child (spawn_subagent from a child fails with a depth-limit error).
 
 When a typed GSD agent is unavailable as a subagent_type, inject its agent file role/purpose as a preamble and spawn general-purpose. Label results as "generic-agent workaround".
 </grok_skill_adapter>`;
 }
 
+/**
+ * Full Claude→Grok body rewrite for skills, agents, and pack markdown
+ * (workflows / references / templates) installed under ~/.grok.
+ */
 function convertClaudeToGrokMarkdown(content) {
-  let converted = content;
-  // Claude / Codex tool names → Grok Build tools
-  converted = converted.replace(/\bAskUserQuestion\b/g, 'ask_user_question');
-  converted = converted.replace(/\brequest_user_input\b/g, 'ask_user_question');
-  converted = converted.replace(/\bTodoWrite\b/g, 'update_goal');
-  converted = converted.replace(/\bSlashCommand\b/g, 'skill');
-  converted = converted.replace(/\bTask\(/g, 'spawn_subagent(');
-  converted = converted.replace(/\bspawn_agent\(/g, 'spawn_subagent(');
-  converted = converted.replace(/\bAgent\(/g, 'spawn_subagent(');
+  let converted = rewriteClaudeToolsToGrok(content);
   // Path + branding rewrites
   converted = converted.replace(/\$HOME\/\.claude\//g, '$HOME/.grok/');
   converted = converted.replace(/~\/\.claude\//g, '~/.grok/');
@@ -1615,6 +1899,10 @@ function convertClaudeToGrokMarkdown(content) {
   converted = converted.replace(/~\/\.claude\b/g, '~/.grok');
   converted = converted.replace(/\$HOME\/\.codex\//g, '$HOME/.grok/');
   converted = converted.replace(/~\/\.codex\//g, '~/.grok/');
+  // Relative project skill roots often still say .claude/skills
+  converted = converted.replace(/\.claude\/skills\//g, '.grok/skills/');
+  converted = converted.replace(/`\.\/CLAUDE\.md`/g, '`./AGENTS.md`');
+  converted = converted.replace(/\.\/CLAUDE\.md/g, './AGENTS.md');
   converted = converted.replace(/CLAUDE\.md/g, 'AGENTS.md');
   converted = neutralizeAgentReferences(converted, 'AGENTS.md');
   // Claude Code product name → Grok Build
@@ -1646,14 +1934,17 @@ function convertClaudeAgentToGrokAgent(content) {
 
   const name = extractFrontmatterField(frontmatter, 'name') || 'unknown';
   const description = extractFrontmatterField(frontmatter, 'description') || '';
-  const tools = extractFrontmatterField(frontmatter, 'tools') || '';
+  const rawTools = extractFrontmatterField(frontmatter, 'tools') || '';
+  // Frontmatter tools: may already be rewritten by convertClaudeToGrokMarkdown;
+  // mapClaudeToolsListToGrok is idempotent for Grok names and mcp__ wildcards.
+  const tools = mapClaudeToolsListToGrok(rawTools);
 
   const roleHeader = `<grok_agent_role>
 role: ${name}
 tools: ${tools}
 purpose: ${toSingleLine(description)}
 spawn_hint: spawn_subagent(subagent_type="${name}", prompt=..., description=..., background?=false, capability_mode?="all", isolation?="none")
-notes: Max spawn depth is 1 (this agent must not spawn further subagents). Prefer isolation="worktree" when editing files in parallel with the parent. Use background=true + get_command_or_subagent_output for long-running work.
+notes: Max spawn depth is 1 (this agent must not spawn further subagents). Prefer isolation="worktree" when editing files in parallel with the parent. Use background=true + get_command_or_subagent_output for long-running work. Create/edit files with search_replace only — never Write, and never run_terminal_command heredocs. Read files with read_file.
 </grok_agent_role>`;
 
   const cleanFrontmatter = `---\nname: ${yamlQuote(name)}\ndescription: ${yamlQuote(toSingleLine(description))}\nprompt_mode: full\n---`;
@@ -2695,6 +2986,10 @@ function _applyRuntimeRewrites(content, runtime, pathPrefix, isGlobal = false, a
       break;
 
     case 'grok':
+      // Paths/branding only. Tool-name rewrites run in convertClaudeToGrokMarkdown
+      // (skill/agent converters + RUNTIME_CONTENT_DISPATCH.grok for pack bodies).
+      // Do NOT re-run rewriteClaudeToolsToGrok here — it would corrupt the
+      // grok_skill_adapter mapping tables that still name Claude tools as sources.
       content = content.replace(/CLAUDE\.md/g, 'AGENTS.md');
       content = content.replace(/\bClaude Code\b/g, 'Grok Build');
       content = content.replace(/~\/\.claude\//g, pathPrefix);
@@ -2990,6 +3285,9 @@ export = {
   convertClaudeToCodexMarkdown,
   convertClaudeCommandToCodexSkill,
   getGrokSkillAdapterHeader,
+  CLAUDE_TO_GROK_TOOLS,
+  mapClaudeToolsListToGrok,
+  rewriteClaudeToolsToGrok,
   convertClaudeToGrokMarkdown,
   convertClaudeCommandToGrokSkill,
   convertClaudeAgentToGrokAgent,
