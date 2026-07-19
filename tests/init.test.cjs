@@ -44,6 +44,9 @@ describe('init commands', () => {
     assert.strictEqual(output.state_path, absPlanningPath(tmpDir, 'STATE.md'));
     assert.strictEqual(output.roadmap_path, absPlanningPath(tmpDir, 'ROADMAP.md'));
     assert.strictEqual(output.config_path, absPlanningPath(tmpDir, 'config.json'));
+    // #2376: execute-phase.md's verify_phase_goal step reads this instead of
+    // hardcoding '.planning/REQUIREMENTS.md' into the gsd-verifier spawn prompt.
+    assert.strictEqual(output.requirements_path, absPlanningPath(tmpDir, 'REQUIREMENTS.md'));
   });
 
   test('init execute-phase respects model_overrides for executor_model', () => {
@@ -2602,6 +2605,43 @@ describe('#2376 — init.* path fields resolve when process cwd differs from --c
     assert.ok(fs.existsSync(todo.path), `todo.path must resolve to the real file: "${todo.path}"`);
   });
 
+  test('init new-project emits absolute requirements_path/roadmap_path/config_path/research_dir (previously absent)', () => {
+    fs.writeFileSync(path.join(projectDir, '.planning', 'REQUIREMENTS.md'), '# Requirements\n');
+    fs.writeFileSync(path.join(projectDir, '.planning', 'ROADMAP.md'), '# Roadmap\n');
+    fs.writeFileSync(path.join(projectDir, '.planning', 'config.json'), '{}\n');
+    fs.mkdirSync(path.join(projectDir, '.planning', 'research'), { recursive: true });
+
+    const result = runGsdTools(['init', 'new-project', '--cwd', projectDir], decoyDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    for (const field of ['requirements_path', 'roadmap_path', 'config_path', 'research_dir']) {
+      assert.ok(field in output, `cmdInitNewProject must now emit ${field} (#2376)`);
+      const value = output[field];
+      assert.ok(path.isAbsolute(value), `${field} must be absolute, got: "${value}"`);
+      assert.ok(fs.existsSync(value), `${field} must resolve to the real file/dir: "${value}"`);
+    }
+  });
+
+  test('init new-milestone emits absolute requirements_path/config_path/research_dir/milestones_path (previously absent)', () => {
+    fs.writeFileSync(path.join(projectDir, '.planning', 'REQUIREMENTS.md'), '# Requirements\n');
+    fs.writeFileSync(path.join(projectDir, '.planning', 'config.json'), '{}\n');
+    fs.writeFileSync(path.join(projectDir, '.planning', 'MILESTONES.md'), '# Milestones\n');
+    fs.mkdirSync(path.join(projectDir, '.planning', 'research'), { recursive: true });
+
+    const result = runGsdTools(['init', 'new-milestone', '--cwd', projectDir], decoyDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    for (const field of ['requirements_path', 'config_path', 'research_dir', 'milestones_path']) {
+      assert.ok(field in output, `cmdInitNewMilestone must now emit ${field} (#2376)`);
+      const value = output[field];
+      assert.ok(path.isAbsolute(value), `${field} must be absolute, got: "${value}"`);
+      assert.ok(fs.existsSync(value), `${field} must resolve to the real file/dir: "${value}"`);
+    }
+  });
+
+  // allow-test-rule: source-text-is-the-product (see #2376)
   test('gsd-core/workflows/verify-work.md plan_gap_closure step references {state_path}/{roadmap_path}, not bare .planning literals', () => {
     const wfPath = path.join(__dirname, '..', 'gsd-core', 'workflows', 'verify-work.md');
     const content = fs.readFileSync(wfPath, 'utf8');
@@ -2612,6 +2652,68 @@ describe('#2376 — init.* path fields resolve when process cwd differs from --c
     assert.ok(step.includes('{roadmap_path}'), 'plan_gap_closure must reference {roadmap_path} from init JSON, not a bare literal');
     assert.ok(!step.includes('.planning/STATE.md'), 'plan_gap_closure must not hardcode .planning/STATE.md (#2376)');
     assert.ok(!step.includes('.planning/ROADMAP.md'), 'plan_gap_closure must not hardcode .planning/ROADMAP.md (#2376)');
+  });
+
+  // allow-test-rule: source-text-is-the-product (see #2376)
+  test('gsd-core/workflows/diagnose-issues.md debug agent spawn references {state_path}, not a bare .planning literal', () => {
+    const wfPath = path.join(__dirname, '..', 'gsd-core', 'workflows', 'diagnose-issues.md');
+    const content = fs.readFileSync(wfPath, 'utf8');
+    assert.ok(content.includes('{state_path}'), 'debug agent spawn must reference {state_path} from init JSON, not a bare literal');
+    assert.ok(!content.includes('.planning/STATE.md'), 'debug agent spawn must not hardcode .planning/STATE.md (#2376)');
+  });
+
+  // allow-test-rule: source-text-is-the-product (see #2376)
+  test('gsd-core/workflows/execute-phase.md verify_phase_goal step references {requirements_path}, not a bare .planning literal', () => {
+    const wfPath = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-phase.md');
+    const content = fs.readFileSync(wfPath, 'utf8');
+    const stepMatch = content.match(/<step name="verify_phase_goal">[\s\S]*?<\/step>/);
+    assert.ok(stepMatch, 'verify_phase_goal step should exist in execute-phase.md');
+    const step = stepMatch[0];
+    assert.ok(step.includes('{requirements_path}'), 'verify_phase_goal must reference {requirements_path} from init JSON, not a bare literal');
+    assert.ok(!step.includes('.planning/REQUIREMENTS.md'), 'verify_phase_goal must not hardcode .planning/REQUIREMENTS.md (#2376)');
+  });
+
+  // allow-test-rule: source-text-is-the-product (see #2376)
+  //
+  // Checks verbatim presence of the exact edited <files_to_read>/output blocks
+  // rather than scanning the whole file for absence of the old literals: several
+  // of those literals (e.g. .planning/PROJECT.md, .planning/config.json) remain
+  // legitimately elsewhere in this file in orchestrator-local bash/doc-table
+  // text that never reaches a spawned subagent — only the three specific
+  // Agent(prompt=...) blocks touched by #2376 needed to change.
+  test('gsd-core/workflows/new-project.md synthesizer/roadmapper spawns reference {research_dir}/{project_path}/{requirements_path}/{roadmap_path}/{config_path}, not bare .planning literals', () => {
+    const wfPath = path.join(__dirname, '..', 'gsd-core', 'workflows', 'new-project.md');
+    const content = fs.readFileSync(wfPath, 'utf8');
+
+    assert.ok(content.includes(
+      '<files_to_read>\n- {research_dir}/STACK.md\n- {research_dir}/FEATURES.md\n- {research_dir}/ARCHITECTURE.md\n- {research_dir}/PITFALLS.md\n</files_to_read>'
+    ), 'research-synthesizer spawn must read from {research_dir}, not bare .planning/research/*.md literals');
+    assert.ok(content.includes('Write to: {research_dir}/SUMMARY.md'),
+      'research-synthesizer spawn must write to {research_dir}/SUMMARY.md, not a bare literal');
+
+    assert.ok(content.includes(
+      '<files_to_read>\n- {project_path} (Project context)\n- {requirements_path} (v1 Requirements)\n- {research_dir}/SUMMARY.md (Research findings - if exists)\n- {config_path} (Granularity and mode settings)\n</files_to_read>'
+    ), 'roadmapper spawn must read from {project_path}/{requirements_path}/{research_dir}/{config_path}, not bare .planning literals');
+
+    assert.ok(content.includes(
+      '<files_to_read>\n  - {roadmap_path} (Current roadmap to revise)\n  </files_to_read>'
+    ), 'roadmapper revision spawn must read {roadmap_path}, not a bare .planning/ROADMAP.md literal');
+  });
+
+  // allow-test-rule: source-text-is-the-product (see #2376)
+  test('gsd-core/workflows/new-milestone.md synthesizer/roadmapper spawns reference {research_dir}/{project_path}/{requirements_path}/{config_path}/{milestones_path}, not bare .planning literals', () => {
+    const wfPath = path.join(__dirname, '..', 'gsd-core', 'workflows', 'new-milestone.md');
+    const content = fs.readFileSync(wfPath, 'utf8');
+
+    assert.ok(content.includes(
+      '<files_to_read>\n- {research_dir}/STACK.md\n- {research_dir}/FEATURES.md\n- {research_dir}/ARCHITECTURE.md\n- {research_dir}/PITFALLS.md\n</files_to_read>'
+    ), 'research-synthesizer spawn must read from {research_dir}, not bare .planning/research/*.md literals');
+    assert.ok(content.includes('Write to: {research_dir}/SUMMARY.md'),
+      'research-synthesizer spawn must write to {research_dir}/SUMMARY.md, not a bare literal');
+
+    assert.ok(content.includes(
+      '<files_to_read>\n- {project_path}\n- {requirements_path}\n- {research_dir}/SUMMARY.md (if exists)\n- {config_path}\n- {milestones_path}\n</files_to_read>'
+    ), 'roadmapper spawn must read from {project_path}/{requirements_path}/{research_dir}/{config_path}/{milestones_path}, not bare .planning literals');
   });
 });
 

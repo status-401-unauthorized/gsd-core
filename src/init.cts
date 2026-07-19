@@ -440,6 +440,9 @@ function cmdInitExecutePhase(
     state_path: toPosixPath(path.join(planningDir(cwd), 'STATE.md')),
     roadmap_path: toPosixPath(path.join(planningDir(cwd), 'ROADMAP.md')),
     config_path: toPosixPath(path.join(planningDir(cwd), 'config.json')),
+    // #2376: execute-phase.md's verify_phase_goal step reads this instead of
+    // hardcoding '.planning/REQUIREMENTS.md' into the gsd-verifier spawn prompt.
+    requirements_path: toPosixPath(path.join(planningDir(cwd), 'REQUIREMENTS.md')),
   };
 
   if (options['validate']) {
@@ -702,6 +705,12 @@ function cmdInitNewProject(cwd: string, raw: boolean): void {
 
     // #2376: absolute — see comment on phase_dir in cmdInitExecutePhase.
     project_path: toPosixPath(path.join(planningDir(cwd), 'PROJECT.md')),
+    // #2376: new-project.md's research-synthesizer/roadmapper spawn prompts
+    // read these instead of hardcoding '.planning/...' literals.
+    requirements_path: toPosixPath(path.join(planningDir(cwd), 'REQUIREMENTS.md')),
+    roadmap_path: toPosixPath(path.join(planningDir(cwd), 'ROADMAP.md')),
+    config_path: toPosixPath(path.join(planningDir(cwd), 'config.json')),
+    research_dir: toPosixPath(path.join(planningRoot(cwd), 'research')),
   };
 
   output(withProjectRoot(cwd, result), raw);
@@ -755,6 +764,12 @@ function cmdInitNewMilestone(cwd: string, raw: boolean): void {
     project_path: toPosixPath(path.join(planningDir(cwd), 'PROJECT.md')),
     roadmap_path: toPosixPath(path.join(planningDir(cwd), 'ROADMAP.md')),
     state_path: toPosixPath(path.join(planningDir(cwd), 'STATE.md')),
+    // #2376: new-milestone.md's research-synthesizer/roadmapper spawn prompts
+    // read these instead of hardcoding '.planning/...' literals.
+    requirements_path: toPosixPath(path.join(planningDir(cwd), 'REQUIREMENTS.md')),
+    config_path: toPosixPath(path.join(planningDir(cwd), 'config.json')),
+    research_dir: toPosixPath(path.join(planningRoot(cwd), 'research')),
+    milestones_path: toPosixPath(path.join(planningDir(cwd), 'MILESTONES.md')),
   };
 
   output(withProjectRoot(cwd, result), raw);
