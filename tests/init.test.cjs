@@ -2641,6 +2641,28 @@ describe('#2376 — init.* path fields resolve when process cwd differs from --c
     }
   });
 
+  test('init ingest-docs emits absolute requirements_path/roadmap_path/state_path/intel_dir/conflicts_path (previously absent)', () => {
+    fs.writeFileSync(path.join(projectDir, '.planning', 'REQUIREMENTS.md'), '# Requirements\n');
+    fs.writeFileSync(path.join(projectDir, '.planning', 'ROADMAP.md'), '# Roadmap\n');
+    fs.writeFileSync(path.join(projectDir, '.planning', 'STATE.md'), '# State\n');
+    fs.mkdirSync(path.join(projectDir, '.planning', 'intel'), { recursive: true });
+
+    const result = runGsdTools(['init', 'ingest-docs', '--cwd', projectDir], decoyDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    for (const field of ['requirements_path', 'roadmap_path', 'state_path', 'intel_dir']) {
+      assert.ok(field in output, `cmdInitIngestDocs must now emit ${field} (#2376)`);
+      const value = output[field];
+      assert.ok(path.isAbsolute(value), `${field} must be absolute, got: "${value}"`);
+      assert.ok(fs.existsSync(value), `${field} must resolve to the real file/dir: "${value}"`);
+    }
+    // conflicts_path is written by the synthesizer, not present at init time —
+    // assert absolute-shape only, not existence.
+    assert.ok('conflicts_path' in output, 'cmdInitIngestDocs must now emit conflicts_path (#2376)');
+    assert.ok(path.isAbsolute(output.conflicts_path), `conflicts_path must be absolute, got: "${output.conflicts_path}"`);
+  });
+
   // allow-test-rule: source-text-is-the-product (see #2376)
   test('gsd-core/workflows/verify-work.md plan_gap_closure step references {state_path}/{roadmap_path}, not bare .planning literals', () => {
     const wfPath = path.join(__dirname, '..', 'gsd-core', 'workflows', 'verify-work.md');
@@ -2714,6 +2736,27 @@ describe('#2376 — init.* path fields resolve when process cwd differs from --c
     assert.ok(content.includes(
       '<files_to_read>\n- {project_path}\n- {requirements_path}\n- {research_dir}/SUMMARY.md (if exists)\n- {config_path}\n- {milestones_path}\n</files_to_read>'
     ), 'roadmapper spawn must read from {project_path}/{requirements_path}/{research_dir}/{config_path}/{milestones_path}, not bare .planning literals');
+  });
+
+  // allow-test-rule: source-text-is-the-product (see #2376)
+  test('gsd-core/workflows/ingest-docs.md classifier/synthesizer/roadmapper spawns reference {intel_dir}/{conflicts_path}/{project_path}/{requirements_path}/{roadmap_path}/{state_path}, not bare .planning literals', () => {
+    const wfPath = path.join(__dirname, '..', 'gsd-core', 'workflows', 'ingest-docs.md');
+    const content = fs.readFileSync(wfPath, 'utf8');
+
+    assert.ok(content.includes('`OUTPUT_DIR` — `{intel_dir}/classifications`'),
+      'gsd-doc-classifier spawn OUTPUT_DIR must reference {intel_dir}, not a bare .planning/intel/classifications/ literal');
+
+    assert.ok(content.includes(
+      'CLASSIFICATIONS_DIR: {intel_dir}/classifications\n    INTEL_DIR: {intel_dir}\n    CONFLICTS_PATH: {conflicts_path}'
+    ), 'gsd-doc-synthesizer spawn must reference {intel_dir}/{conflicts_path}, not bare .planning literals');
+
+    assert.ok(content.includes(
+      'Intel: {intel_dir}/SYNTHESIS.md (entry point)\n    Per-type intel: {intel_dir}/decisions.md, {intel_dir}/requirements.md, {intel_dir}/constraints.md, {intel_dir}/context.md'
+    ), 'gsd-roadmapper spawn must reference {intel_dir}, not bare .planning/intel/*.md literals');
+
+    assert.ok(content.includes(
+      'Produce:\n    - {project_path}\n    - {requirements_path}\n    - {roadmap_path}\n    - {state_path}'
+    ), 'gsd-roadmapper spawn Produce block must reference absolute path fields, not bare .planning literals');
   });
 });
 

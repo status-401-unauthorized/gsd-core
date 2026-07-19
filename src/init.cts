@@ -835,8 +835,18 @@ function cmdInitIngestDocs(cwd: string, raw: boolean): void {
     project_exists: pathExistsInternal(cwd, '.planning/PROJECT.md'),
     planning_exists: fs.existsSync(planningRoot(cwd)),
     ...getInitGitState(cwd),
-    // #2376: absolute — see comment on phase_dir in cmdInitExecutePhase.
+    // #2376: absolute — see comment on phase_dir in cmdInitExecutePhase. The
+    // classify_parallel/synthesize/route_new_mode spawns in ingest-docs.md
+    // (gsd-doc-classifier, gsd-doc-synthesizer, gsd-roadmapper) previously
+    // hardcoded bare '.planning/intel/...', '.planning/PROJECT.md', etc.
+    // literals into their Agent(prompt=...) blocks; those now interpolate
+    // these fields instead.
     project_path: toPosixPath(path.join(planningDir(cwd), 'PROJECT.md')),
+    requirements_path: toPosixPath(path.join(planningDir(cwd), 'REQUIREMENTS.md')),
+    roadmap_path: toPosixPath(path.join(planningDir(cwd), 'ROADMAP.md')),
+    state_path: toPosixPath(path.join(planningDir(cwd), 'STATE.md')),
+    intel_dir: toPosixPath(path.join(planningDir(cwd), 'intel')),
+    conflicts_path: toPosixPath(path.join(planningDir(cwd), 'INGEST-CONFLICTS.md')),
     commit_docs: config.commit_docs,
   };
   output(withProjectRoot(cwd, result), raw);
