@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { runGsdTools, cleanup } = require('./helpers.cjs');
 const { createFixture, seedPhase } = require('./fixtures/index.cjs');
-const { createTempProject } = require('./helpers.cjs');
+const { createTempProject, createTempDir } = require('./helpers.cjs');
 const { toPosixPath } = require('../gsd-core/bin/lib/shell-command-projection.cjs');
 
 // #2376: init.* path-shaped output fields (state_path, roadmap_path, phase_dir,
@@ -2509,7 +2509,6 @@ describe('#1912 — init.progress fails safe in workstream mode with no active w
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('#2376 — init.* path fields resolve when process cwd differs from --cwd project root', () => {
-  const { createTempDir } = require('./helpers.cjs');
   let projectDir;
   let decoyDir;
 
@@ -2661,6 +2660,20 @@ describe('#2376 — init.* path fields resolve when process cwd differs from --c
     // assert absolute-shape only, not existence.
     assert.ok('conflicts_path' in output, 'cmdInitIngestDocs must now emit conflicts_path (#2376)');
     assert.ok(path.isAbsolute(output.conflicts_path), `conflicts_path must be absolute, got: "${output.conflicts_path}"`);
+  });
+
+  test('init map-codebase emits absolute codebase_dir that resolves from a different process cwd', () => {
+    const codebaseDir = path.join(projectDir, '.planning', 'codebase');
+    fs.mkdirSync(codebaseDir, { recursive: true });
+    fs.writeFileSync(path.join(codebaseDir, 'STACK.md'), '# Stack');
+
+    const result = runGsdTools(['init', 'map-codebase', '--cwd', projectDir], decoyDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.ok('codebase_dir' in output, 'cmdInitMapCodebase must emit codebase_dir (#2376)');
+    assert.ok(path.isAbsolute(output.codebase_dir), `codebase_dir must be absolute, got: "${output.codebase_dir}"`);
+    assert.ok(fs.existsSync(output.codebase_dir), `codebase_dir must resolve to the real directory: "${output.codebase_dir}"`);
   });
 
   // allow-test-rule: source-text-is-the-product (see #2376)
