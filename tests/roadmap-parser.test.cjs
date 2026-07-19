@@ -1025,6 +1025,15 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { runGsdTools, cleanup } = require('./helpers.cjs');
+const { toPosixPath } = require('../gsd-core/bin/lib/shell-command-projection.cjs');
+
+// #2376: init.* path-shaped output fields (expected_phase_dir, phase_dir, …)
+// are now absolute — anchored on the project root — instead of relative to the
+// orchestrator's own cwd, so a spawned subagent whose actual process cwd
+// differs from the project root still resolves them correctly.
+function absPlanningPath(base, ...segments) {
+  return toPosixPath(path.join(base, '.planning', ...segments));
+}
 
 // ---------------------------------------------------------------------------
 // Shared fixture content
@@ -1095,7 +1104,7 @@ describe('bug #730 — milestone (Phase Details) section scope resolution', () =
     assert.strictEqual(out.phase_found, true, `phase_found should be true; got phase_found=${out.phase_found}, expected_phase_dir=${out.expected_phase_dir}`);
     assert.strictEqual(out.phase_name, 'Feature', `phase_name should be 'Feature'; got '${out.phase_name}'`);
     assert.strictEqual(out.padded_phase, '02', `padded_phase should be '02'; got '${out.padded_phase}'`);
-    assert.strictEqual(out.expected_phase_dir, '.planning/phases/02-feature', `expected_phase_dir should be '.planning/phases/02-feature'; got '${out.expected_phase_dir}'`);
+    assert.strictEqual(out.expected_phase_dir, absPlanningPath(dir, 'phases', '02-feature'), `expected_phase_dir should be '${absPlanningPath(dir, 'phases', '02-feature')}'; got '${out.expected_phase_dir}'`);
   });
 
   // -------------------------------------------------------------------------
@@ -1212,7 +1221,7 @@ describe('bug #730 — milestone (Phase Details) section scope resolution', () =
       assert.strictEqual(out.phase_found, true, `phase_found should be true; got phase_found=${out.phase_found}`);
       assert.strictEqual(out.phase_name, 'Polish', `phase_name should be 'Polish'; got '${out.phase_name}'`);
       assert.strictEqual(out.padded_phase, '03', `padded_phase should be '03'; got '${out.padded_phase}'`);
-      assert.strictEqual(out.expected_phase_dir, '.planning/phases/03-polish', `expected_phase_dir should be '.planning/phases/03-polish'; got '${out.expected_phase_dir}'`);
+      assert.strictEqual(out.expected_phase_dir, absPlanningPath(localDir, 'phases', '03-polish'), `expected_phase_dir should be '${absPlanningPath(localDir, 'phases', '03-polish')}'; got '${out.expected_phase_dir}'`);
     } finally {
       cleanup(localDir);
     }
@@ -1276,7 +1285,7 @@ describe('bug #730 — milestone (Phase Details) section scope resolution', () =
       const out = JSON.parse(r.output);
       assert.strictEqual(out.phase_found, true, `phase_found should be true; got phase_found=${out.phase_found}, output=${JSON.stringify(out)}`);
       assert.strictEqual(out.phase_name, 'Beta', `phase_name should be 'Beta' (v3.0-B section), not '${out.phase_name}' (would indicate v3.0-A cross-pollination)`);
-      assert.strictEqual(out.expected_phase_dir, '.planning/phases/02-beta', `expected_phase_dir should be '.planning/phases/02-beta'; got '${out.expected_phase_dir}'`);
+      assert.strictEqual(out.expected_phase_dir, absPlanningPath(localDir, 'phases', '02-beta'), `expected_phase_dir should be '${absPlanningPath(localDir, 'phases', '02-beta')}'; got '${out.expected_phase_dir}'`);
     } finally {
       cleanup(localDir);
     }

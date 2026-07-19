@@ -13,6 +13,15 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const { runGsdTools, createTempProject, cleanup } = require('./helpers.cjs');
+const { toPosixPath } = require('../gsd-core/bin/lib/shell-command-projection.cjs');
+
+// #2376: init.* path-shaped output fields (task_dir, quick_dir, …) are now
+// absolute — anchored on the project root — instead of relative to the
+// orchestrator's own cwd, so a spawned subagent whose actual process cwd
+// differs from the project root still resolves them correctly.
+function absPlanningPath(base, ...segments) {
+  return toPosixPath(path.join(base, '.planning', ...segments));
+}
 
 const COMMANDS_DIR = path.join(__dirname, '..', 'commands', 'gsd');
 const WORKFLOWS_DIR = path.join(__dirname, '..', 'gsd-core', 'workflows');
@@ -176,8 +185,11 @@ describe('quick task: research file in task directory', () => {
 
     const output = JSON.parse(result.output);
     assert.ok(output.task_dir, 'task_dir should be non-null');
+    // #2376: task_dir is now absolute (anchored on tmpDir), not the historical
+    // relative literal.
+    const quickDirAbs = absPlanningPath(tmpDir, 'quick');
     assert.ok(
-      output.task_dir.startsWith('.planning/quick/'),
+      output.task_dir.startsWith(`${quickDirAbs}/`),
       'task_dir should be under .planning/quick/'
     );
 
