@@ -29,6 +29,7 @@ import runtimeNamePolicy = require('./runtime-name-policy.cjs');
 import installProfiles = require('./install-profiles.cjs');
 import installerMigrations = require('./installer-migrations.cjs');
 import { posixNormalize } from './shell-command-projection.cjs';
+import { isPathConfined } from './external-descriptor-trust.cjs';
 
 const { processAttribution } = runtimeArtifactConversion;
 // resolveRuntimeArtifactLayout: accessed via module ref (not destructured) so
@@ -134,6 +135,7 @@ function convertClaudeCommandToKiloSkill(content: string, skillName: string): st
 const SKILLS_CONVERTER_REGISTRY: Record<string, (content: string, skillName: string) => string> = {
   convertClaudeCommandToOpencodeSkill,
   convertClaudeCommandToKiloSkill,
+  convertClaudeCommandToKimiCodeSkill: runtimeArtifactConversion.convertClaudeCommandToKimiCodeSkill,
 };
 
 // ---------------------------------------------------------------------------
@@ -181,19 +183,97 @@ function restoreUserArtifacts(destDir: string, saved: Map<string, string>): void
 // ---------------------------------------------------------------------------
 
 /**
- * Returns true if any path component between `root` and `fullPath` is a
- * symbolic link (which could redirect writes outside the install root).
+ * Opt-in for intentional symlinked-dest layouts (#2393). When the env var is
+ * set to "1" or "true", `hasExistingSymlinkBetween` follows symlinks instead of
+ * refusing them, EXCEPT for two load-bearing cases that always refuse regardless
+ * of opt-in (preserving ADR-1239 Phase B's threat model):
+ *
+ *   (a) The `fullPath` itself, before any symlink resolution, escapes `root`
+ *       via `..`-traversal — protects against untrusted `destSubpath` strings
+ *       like `../../etc`. This is the line `resolvedFullPath !== resolvedRoot
+ *       && !resolvedFullPath.startsWith(resolvedRoot + path.sep)` below.
+ *   (b) A symlink's resolved real path equals the install root itself — this
+ *       would let `_removeGsdEntries` (the prune pass) wipe the install root,
+ *       which is the config-root-wipe threat from #1704 threat model item (b).
+ *
+ * What opt-in RELAXES specifically: the "pre-existing symlink that points
+ * outside configHome" refusal — threat (c) in #1704. The user has asserted
+ * they own and trust the symlink target. The default (no env var) keeps all
+ * three refusals, exactly the pre-#2393 behavior.
+ *
+ * Cross-platform note: on Windows, `fs.lstatSync().isSymbolicLink()` returns
+ * true for both symbolic links and NTFS junctions (Node ≥ 16), so Mamiki's
+ * Junction case (#2393 comment) is handled by the same code path as POSIX
+ * symlinks.
+ *
+ * @returns true when the caller MUST refuse; false when writes may proceed.
  */
-function hasExistingSymlinkBetween(root: string, fullPath: string): boolean {
+function isSymlinkedDestOptIn(): boolean {
+  const v = process.env.GSD_ALLOW_SYMLINKED_DEST;
+  return v === '1' || v === 'true';
+}
+
+/**
+ * Returns true if any path component between `root` and `fullPath` is a
+ * symbolic link that would redirect writes outside the install root in a way
+ * the caller must refuse.
+ *
+ * When `options.allowOptInFollow` is true (caller checked `isSymlinkedDestOptIn`),
+ * symlinks are followed instead of refused, except for the two always-refuse
+ * cases documented on `isSymlinkedDestOptIn` — (a) path-traversal in `fullPath`
+ * itself, (b) a resolved symlink target that equals the install root (would let
+ * the prune pass wipe it).
+ */
+function hasExistingSymlinkBetween(
+  root: string,
+  fullPath: string,
+  options: { allowOptInFollow?: boolean } = {},
+): boolean {
   const resolvedRoot = path.resolve(root);
   const resolvedFullPath = path.resolve(fullPath);
+  // (a) Path-traversal refusal — ALWAYS enforced, even with opt-in. An untrusted
+  // destSubpath string that escapes the install root via '..' is rejected
+  // regardless of user opt-in state (ADR-1239 Phase B threat (a)).
   if (resolvedFullPath !== resolvedRoot && !resolvedFullPath.startsWith(resolvedRoot + path.sep)) {
     return true;
   }
 
+  // #2393 (security-review finding): realpathSync fully resolves all symlink
+  // components, path.resolve only normalizes lexically. On macOS, /var is a
+  // symlink to /private/var — so resolvedRoot='/var/foo/.claude' but its real
+  // path is '/private/var/foo/.claude'. A symlink whose real target equals the
+  // install root (the threat-(b) wipe case) would compare unequal without this
+  // normalization, defeating the guard exactly in the reporter's case (Azd325,
+  // nix-darwin: ~/.claude is itself a symlink). Compute realRoot once; fall
+  // back to the lexical form on any realpath failure (broken/missing/exotic FS)
+  // — threat (a) above still confines regardless.
+  let realRoot: string;
+  try {
+    realRoot = fs.existsSync(resolvedRoot) ? fs.realpathSync(resolvedRoot) : resolvedRoot;
+  } catch {
+    realRoot = resolvedRoot;
+  }
+
+  const allowFollow = options.allowOptInFollow === true;
+
+  // #2393: when root itself is a symlink (e.g. nix-darwin manages ~/.claude as a
+  // symlink to a dotfiles repo — Azd325's #2393 report), the pre-#2393 guard
+  // refused unconditionally via an early return before the component loop. The
+  // wipe threat (b) does NOT apply to the root itself being a symlink: destDir is
+  // a CHILD of root, and resolving root gives root's target — there is no
+  // circular back-reference to root from a path that descends from a resolved
+  // root. So under opt-in, just follow the root symlink and continue the walk.
+  // Default behavior (no opt-in) preserves the pre-#2393 refuse.
   let cursor = resolvedRoot;
   if (fs.existsSync(cursor) && fs.lstatSync(cursor).isSymbolicLink()) {
-    return true;
+    if (!allowFollow) return true;
+    try {
+      cursor = fs.realpathSync(cursor);
+    } catch {
+      // realpathSync failed (broken symlink, permission denied, exotic FS) — refuse,
+      // matching fail-closed posture.
+      return true;
+    }
   }
 
   const relative = path.relative(resolvedRoot, resolvedFullPath);
@@ -201,7 +281,34 @@ function hasExistingSymlinkBetween(root: string, fullPath: string): boolean {
     if (!segment) continue;
     cursor = path.join(cursor, segment);
     if (!fs.existsSync(cursor)) return false;
-    if (fs.lstatSync(cursor).isSymbolicLink()) return true;
+    if (fs.lstatSync(cursor).isSymbolicLink()) {
+      if (!allowFollow) return true;
+      // Opt-in active: follow the symlink. Refuse if the resolved target is the
+      // install root itself (threat (b) — would let _removeGsdEntries wipe the
+      // root). Other targets are acceptable per the user's explicit opt-in. A
+      // broken symlink (realpathSync throws) is still refused.
+      //
+      // Threat (b) check uses BOTH lexical and real forms of root to defend
+      // against macOS /var ↔ /private/var-style normalization gaps: realpathSync
+      // fully resolves, path.resolve only normalizes lexically, so a root path
+      // containing a symlink component would compare unequal to a realtarget
+      // that matches by real path. Compare both.
+      //
+      // Transitivity note: once followed, the walk continues from the resolved
+      // real path WITHOUT re-checking that further segments stay inside any
+      // confining boundary. The user's opt-in asserts trust in the target dir
+      // AND any further symlinks reachable through it — transitive and unbounded
+      // by design (one opt-in trusts the whole reachable tree). This is the
+      // documented opt-in semantics; do not add a "follow one symlink only"
+      // expectation here without revisiting the threat model.
+      try {
+        const realTarget = fs.realpathSync(cursor);
+        if (realTarget === realRoot || realTarget === resolvedRoot) return true; // (b)
+        cursor = realTarget;
+      } catch {
+        return true;
+      }
+    }
   }
 
   return false;
@@ -248,9 +355,10 @@ function migrateLegacyDevPreferencesToSkill(targetDir: string, saved: Map<string
   if (fs.existsSync(skillFile)) return false;
   // Symlink-escape guard: reject if any path component between targetDir and
   // skillDir is a symlink that would redirect writes outside the config root.
-  if (hasExistingSymlinkBetween(path.resolve(targetDir), skillDir)) {
+  // #2393: honor GSD_ALLOW_SYMLINKED_DEST for intentional user-owned symlink layouts.
+  if (hasExistingSymlinkBetween(path.resolve(targetDir), skillDir, { allowOptInFollow: isSymlinkedDestOptIn() })) {
     throw new Error(
-      `migrateLegacyDevPreferencesToSkill: skillDir "${skillDir}" contains a symlink escaping the install root "${targetDir}" — refusing to write`,
+      `migrateLegacyDevPreferencesToSkill: skillDir "${skillDir}" contains a symlink the install root "${targetDir}" does not trust — refusing to write. If this is an intentional user-owned symlink layout, re-run with GSD_ALLOW_SYMLINKED_DEST=1.`,
     );
   }
   try {
@@ -302,9 +410,10 @@ function _copyStaged(stagedDir: string, destDir: string, kind: any, configDir: s
   const resolvedDest = runtimeArtifactInstallPlan.assertDestWithinConfigHome(installRoot, destDir);
   // Symlink-escape guard: reject if any path component between the install root and
   // destDir is a symlink that would redirect writes outside the install root.
-  if (hasExistingSymlinkBetween(path.resolve(installRoot), resolvedDest)) {
+  // #2393: honor GSD_ALLOW_SYMLINKED_DEST for intentional user-owned symlink layouts.
+  if (hasExistingSymlinkBetween(path.resolve(installRoot), resolvedDest, { allowOptInFollow: isSymlinkedDestOptIn() })) {
     throw new Error(
-      `_copyStaged: destDir "${destDir}" contains a symlink escaping the install root "${installRoot}" — refusing to write`,
+      `_copyStaged: destDir "${destDir}" contains a symlink the install root "${installRoot}" does not trust — refusing to write. If this is an intentional user-owned symlink layout, re-run with GSD_ALLOW_SYMLINKED_DEST=1.`,
     );
   }
   // Use the validated absolute path for the actual writes below.
@@ -625,7 +734,7 @@ function installRuntimeArtifacts(
     // _runLegacyInstallMigrations below entirely (early return), so their
     // legacy-directory cleanup needs its own pre-materialization hook here.
     _migrateLegacyOpencodeCommandDir(runtime, configDir, behaviors);
-    installOpencodeFamilyArtifacts(runtime, configDir, scope, resolvedProfile, resolveAttribution, behaviors);
+    installOpencodeFamilyArtifacts(runtime, configDir, scope, resolvedProfile, resolveAttribution, behaviors, capabilityRegistry);
     return;
   }
 
@@ -663,9 +772,12 @@ function installRuntimeArtifacts(
       // resolved alternate root instead, matching assertDestWithinConfigHome's
       // own root selection in createRuntimeArtifactInstallPlan.
       const installRoot = (kind && typeof kind.home === 'string' && kind.home !== '') ? kind.home : configDir;
-      if (hasExistingSymlinkBetween(path.resolve(installRoot), dest)) {
+      // #2393: honor GSD_ALLOW_SYMLINKED_DEST for intentional user-owned symlink layouts.
+      // Threat model from #1704 / ADR-1239 Phase B preserved: path-traversal and
+      // resolved-target-equals-root still refuse regardless of opt-in.
+      if (hasExistingSymlinkBetween(path.resolve(installRoot), dest, { allowOptInFollow: isSymlinkedDestOptIn() })) {
         throw new Error(
-          `installRuntimeArtifacts: destDir "${dest}" contains a symlink escaping the install root "${installRoot}" — refusing to create`,
+          `installRuntimeArtifacts: destDir "${dest}" contains a symlink the install root "${installRoot}" does not trust — refusing to create. If this is an intentional user-owned symlink layout (e.g. externalized skills/hooks dir, multi-account configHome, or a dotfiles-managed configHome), re-run with GSD_ALLOW_SYMLINKED_DEST=1.`,
         );
       }
       fs.mkdirSync(dest, { recursive: true });
@@ -760,6 +872,17 @@ function installRuntimeArtifacts(
  * @param rawCommandsDir - staged RAW Claude command dir (caller's _stageSkills output)
  * @param pathPrefix - computed config-path prefix for body rewrites
  * @param resolveAttribution - injection: (runtime) => attribution string | undefined
+ * @param resolvedProfile - #2362: from resolveProfile()/resolveEffectiveProfile(); only
+ *   `.skills` is consulted (either the `'*'` full-profile sentinel or a concrete Set
+ *   of stems), and only to gate which THIRD-PARTY capability stems are candidates for
+ *   staging below. Absent -> no third-party skills staged (fail closed).
+ * @param capabilityRegistry - #2362: optional composed capability registry
+ *   (capabilityClusters view). When present, installed third-party capability
+ *   skills bound to their declaring capId are unioned into the staged output —
+ *   the actual #2322 seam (install-profiles.cts stageSkillsForRuntimeAsSkills)
+ *   this bespoke OpenCode/Kilo writer never called. Absent -> no third-party
+ *   skills staged (fail closed), matching the seam's own optional-registry
+ *   contract.
  * @returns number of gsd-* skill directories written
  */
 function installOpencodeFamilySkills(
@@ -768,6 +891,8 @@ function installOpencodeFamilySkills(
   rawCommandsDir: string,
   pathPrefix: string,
   resolveAttribution: ResolveAttribution = () => undefined,
+  resolvedProfile?: any,
+  capabilityRegistry?: any,
 ): number {
   const layout: any = runtimeArtifactLayout.resolveRuntimeArtifactLayout(runtime, targetDir);
   const skillsKindEntry = layout.kinds.find((k: any) => k.kind === 'skills');
@@ -791,9 +916,10 @@ function installOpencodeFamilySkills(
   const dest = runtimeArtifactInstallPlan.assertDestWithinConfigHome(targetDir, skillsKindEntry.destSubpath);
   // Symlink-escape guard: reject if any path component between targetDir and
   // dest is a symlink that would redirect writes outside the config root.
-  if (hasExistingSymlinkBetween(path.resolve(targetDir), dest)) {
+  // #2393: honor GSD_ALLOW_SYMLINKED_DEST for intentional user-owned symlink layouts.
+  if (hasExistingSymlinkBetween(path.resolve(targetDir), dest, { allowOptInFollow: isSymlinkedDestOptIn() })) {
     throw new Error(
-      `installOpencodeFamilySkills: destDir "${dest}" contains a symlink escaping the install root "${targetDir}" — refusing to write`,
+      `installOpencodeFamilySkills: destDir "${dest}" contains a symlink the install root "${targetDir}" does not trust — refusing to write. If this is an intentional user-owned symlink layout, re-run with GSD_ALLOW_SYMLINKED_DEST=1.`,
     );
   }
   fs.mkdirSync(dest, { recursive: true });
@@ -815,9 +941,11 @@ function installOpencodeFamilySkills(
   _removeGsdEntries(dest, skillsKindEntry);
 
   let count = 0;
+  const firstPartyStems = new Set<string>();
   for (const entry of fs.readdirSync(rawDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
     const stem = entry.name.slice(0, -3);
+    firstPartyStems.add(stem);
     const skillName = `${skillsKindEntry.prefix}${stem}`;
     let content = fs.readFileSync(path.join(rawDir, entry.name), 'utf8');
     content = applyOpencodeFamilyPathPrefix(content, runtime, pathPrefix);
@@ -827,6 +955,50 @@ function installOpencodeFamilySkills(
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(path.join(skillDir, 'SKILL.md'), content);
     count++;
+  }
+
+  // #2362: materialize installed THIRD-PARTY capability skills, bound to their
+  // DECLARING capability via the registry's capabilityClusters view — mirrors
+  // install-profiles.cts stageSkillsForRuntimeAsSkills's third-party fill-in
+  // (the actual #2322 seam), reusing its exported security-reviewed helpers
+  // rather than hand-rolling a second scan (DEFECT.GENERATIVE-FIX guard).
+  // First-party always wins on stem collision. The full/'*' sentinel resolves
+  // through capabilityClusterStems (BLOCKER-2 parity: `resolveProfile`
+  // short-circuits `full` to `'*'` before consulting a registry, so a bare
+  // `resolvedProfile.skills !== '*'` gate would silently skip this pass for
+  // the default full install). No registry in scope -> stage NOTHING
+  // third-party (fail closed — never fall back to scanning).
+  //
+  // Unlike the seam (which stages third-party bodies as-is and relies on a
+  // later applySurface rewrite pass), this install path has no such later
+  // pass — so third-party bodies get the SAME inline path-prefix/attribution
+  // rewrite as first-party ones for on-disk parity. They do NOT go through
+  // `converter`: an installed capability skill is already a complete
+  // SKILL.md, not a Claude-command body awaiting frontmatter conversion.
+  if (capabilityRegistry) {
+    const candidateStems: Iterable<string> =
+      resolvedProfile && resolvedProfile.skills === '*'
+        ? installProfiles.capabilityClusterStems(capabilityRegistry)
+        : (resolvedProfile && resolvedProfile.skills) || [];
+    for (const stem of candidateStems) {
+      if (firstPartyStems.has(stem)) continue; // first-party always wins
+      const found = installProfiles.readInstalledCapabilitySkill(stem, capabilityRegistry);
+      if (found === null) continue; // absent/malformed/unowned -> skip gracefully
+      const skillName = `${skillsKindEntry.prefix}${stem}`;
+      if (!isPathConfined(skillName, dest)) continue; // defense-in-depth
+      let content = found.content;
+      content = applyOpencodeFamilyPathPrefix(content, runtime, pathPrefix);
+      content = processAttribution(content, resolveAttribution(runtime));
+      const skillDir = path.join(dest, skillName);
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(path.join(skillDir, 'SKILL.md'), content);
+      // #2322 HIGH-3 parity: persist the capability-owned marker so a later
+      // prune pass can identify this directory even once the owning
+      // capability is uninstalled/unsurfaced and no longer appears in any
+      // registry view.
+      fs.writeFileSync(path.join(skillDir, installProfiles.CAPABILITY_SKILL_MARKER), found.capId + '\n', 'utf8');
+      count++;
+    }
   }
 
   // Restore user-owned dirs after the prune+copy.
@@ -935,9 +1107,20 @@ function _installNativePluginIfDeclared(
   if (np && np.source) {
     const pluginSrc = path.join(src, np.source);
     if (fs.existsSync(pluginSrc)) {
-      const destDir = runtimeArtifactInstallPlan.assertDestWithinConfigHome(configDir, np.dir);
-      fs.mkdirSync(destDir, { recursive: true });
-      fs.copyFileSync(pluginSrc, path.join(destDir, np.file));
+      // Confine the FULL dest path (dir + file), not just the dir. Previously
+      // only `np.dir` was validated and `np.file` was joined on unchecked, so a
+      // descriptor whose `file` carried `..`, an absolute path, or a NUL byte
+      // would have written outside configHome. Not reachable today — descriptors
+      // are first-party and compiled into the capability registry at build time —
+      // but `np.file` is exactly the field #2470 changes, and the guard costs
+      // nothing. For a well-formed descriptor this resolves identically to the
+      // previous mkdir(dir) + join(dir, file).
+      const destPath = runtimeArtifactInstallPlan.assertDestWithinConfigHome(
+        configDir,
+        path.join(np.dir, np.file),
+      );
+      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+      fs.copyFileSync(pluginSrc, destPath);
     }
   }
 }
@@ -1029,6 +1212,11 @@ function _migrateLegacyOpencodeCommandDir(runtime: string, configDir: string, be
  * @param resolvedProfile - from resolveProfile() / resolveEffectiveProfile()
  * @param resolveAttribution - injection: (runtime) => attribution string | undefined
  * @param behaviors - the runtime's hostBehaviors descriptor (already resolved by the caller)
+ * @param capabilityRegistry - #2362: optional composed capability registry
+ *   (capabilityClusters view), threaded straight through to
+ *   installOpencodeFamilySkills so an installed third-party capability skill
+ *   materializes for this combined-family (OpenCode/Kilo) install path too.
+ *   Absent -> no third-party skills staged (fail closed).
  */
 function installOpencodeFamilyArtifacts(
   runtime: string,
@@ -1037,6 +1225,7 @@ function installOpencodeFamilyArtifacts(
   resolvedProfile: any,
   resolveAttribution: ResolveAttribution = () => undefined,
   behaviors: any = {},
+  capabilityRegistry?: any,
 ): void {
   const isGlobal = scope === 'global';
   // findInstallSourceRoot resolves DIRECTLY to the commands/gsd source dir
@@ -1068,7 +1257,7 @@ function installOpencodeFamilyArtifacts(
     behaviors.flatCommandDir || 'command',
   );
   installOpencodeFamilyCommands(runtime, commandDir, rawCommandsDir, pathPrefix, resolveAttribution);
-  installOpencodeFamilySkills(runtime, configDir, rawCommandsDir, pathPrefix, resolveAttribution);
+  installOpencodeFamilySkills(runtime, configDir, rawCommandsDir, pathPrefix, resolveAttribution, resolvedProfile, capabilityRegistry);
 
   _installNativePluginIfDeclared(runtime, configDir, behaviors, src);
 }
@@ -1143,6 +1332,7 @@ export = {
   _hostBehaviors,
   _copyStaged,
   hasExistingSymlinkBetween,
+  isSymlinkedDestOptIn,
   preserveUserArtifacts,
   restoreUserArtifacts,
   migrateLegacyDevPreferencesToSkill,

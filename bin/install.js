@@ -579,6 +579,7 @@ const {
   _installNativePluginIfDeclared,
   _copyStaged,
   hasExistingSymlinkBetween,
+  isSymlinkedDestOptIn,
   preserveUserArtifacts,
   restoreUserArtifacts,
   migrateLegacyDevPreferencesToSkill,
@@ -626,7 +627,7 @@ if (hasMinimal && _profileArgRaw) {
 
 function selectRuntimesFromArgs(runtimeArgs) {
   if (runtimeArgs.includes('--all')) {
-    return ['claude', 'kimi', 'kilo', 'opencode', 'pi', 'codex', 'copilot', 'antigravity', 'cursor', 'windsurf', 'augment', 'trae', 'qwen', 'hermes', 'codebuddy', 'cline', 'zcode', 'grok'];
+    return ['claude', 'kimi', 'kimi-code', 'kilo', 'opencode', 'pi', 'codex', 'copilot', 'antigravity', 'cursor', 'windsurf', 'augment', 'trae', 'qwen', 'hermes', 'codebuddy', 'cline', 'zcode', 'grok'];
   }
   if (runtimeArgs.includes('--both')) {
     return ['claude', 'opencode'];
@@ -647,6 +648,7 @@ function selectRuntimesFromArgs(runtimeArgs) {
   if (runtimeArgs.includes('--qwen')) selected.push('qwen');
   if (runtimeArgs.includes('--hermes')) selected.push('hermes');
   if (runtimeArgs.includes('--kimi')) selected.push('kimi');
+  if (runtimeArgs.includes('--kimi-code')) selected.push('kimi-code');
   if (runtimeArgs.includes('--codebuddy')) selected.push('codebuddy');
   if (runtimeArgs.includes('--cline')) selected.push('cline');
   if (runtimeArgs.includes('--zcode')) selected.push('zcode');
@@ -656,6 +658,62 @@ function selectRuntimesFromArgs(runtimeArgs) {
 
 // Runtime selection - can be set by flags or interactive prompt
 let selectedRuntimes = selectRuntimesFromArgs(args);
+
+// #2505 Phase 5: Kimi variant disambiguation (#2513). Kimi CLI (Python, ~/.kimi/)
+// and Kimi Code (Node, ~/.kimi-code/) are two distinct Moonshot products that
+// share the "kimi" brand. Probe for each product's config.toml and warn when
+// the selected runtime doesn't match the detected install — catches the common
+// "ran --kimi --global but actually on Kimi Code" mistake that produced inert
+// YAMLs and empty agent-skills before the Phase 1 descriptor split.
+function disambiguateKimiVariant(runtimes) {
+  const home = os.homedir();
+  const hasKimiCli = fs.existsSync(path.join(home, '.kimi', 'config.toml'));
+  const hasKimiCode = fs.existsSync(path.join(home, '.kimi-code', 'config.toml'));
+  const notices = [];
+  if (runtimes.includes('kimi') && hasKimiCode && !hasKimiCli) {
+    notices.push({
+      kind: 'wrong-variant',
+      selected: 'kimi',
+      detected: 'kimi-code',
+      message: `Detected ~/.kimi-code/config.toml (Kimi Code, Node CLI) but not ~/.kimi/config.toml (Kimi CLI, Python). You selected --kimi but appear to be on Kimi Code. Re-run with --kimi-code for a working install. (Kimi CLI = Python kimi-cli with named subagents; Kimi Code = Node CLI with coder/explore/plan built-ins only.)`,
+    });
+  }
+  if (runtimes.includes('kimi-code') && hasKimiCli && !hasKimiCode) {
+    notices.push({
+      kind: 'wrong-variant',
+      selected: 'kimi-code',
+      detected: 'kimi',
+      message: `Detected ~/.kimi/config.toml (Kimi CLI, Python) but not ~/.kimi-code/config.toml (Kimi Code, Node CLI). You selected --kimi-code but appear to be on Kimi CLI. Re-run with --kimi for a working install.`,
+    });
+  }
+  // Distinct-entry descriptions when either Kimi variant is selected.
+  if (runtimes.includes('kimi')) {
+    notices.push({
+      kind: 'description',
+      runtime: 'kimi',
+      message: 'Kimi CLI (Python kimi-cli): named subagents via YAML, config at ~/.kimi/, hooks via ~/.kimi/config.toml [[hooks]].',
+    });
+  }
+  if (runtimes.includes('kimi-code')) {
+    notices.push({
+      kind: 'description',
+      runtime: 'kimi-code',
+      message: 'Kimi Code (Node CLI): three built-in subagents (coder/explore/plan), Agent Skills at ~/.kimi-code/skills/, config at ~/.kimi-code/.',
+    });
+  }
+  return notices;
+}
+
+if (selectedRuntimes.includes('kimi') || selectedRuntimes.includes('kimi-code')) {
+  const kimiNotices = disambiguateKimiVariant(selectedRuntimes);
+  for (const notice of kimiNotices) {
+    if (notice.kind === 'wrong-variant') {
+      console.error(`${yellow}⚠ Kimi variant mismatch (${notice.selected} → ${notice.detected}).${reset} ${notice.message}`);
+    } else if (notice.kind === 'description') {
+      console.log(`${dim}  ${notice.runtime}: ${notice.message}${reset}`);
+    }
+  }
+}
 
 // #1928: Google sunset Gemini CLI on 2026-06-18; Antigravity CLI is its
 // official successor. `--gemini` is no longer a valid runtime selector —
@@ -4368,14 +4426,26 @@ function _resolveMovedSkillsOldDir(runtime, targetDir, scope) {
 
 /**
  * Generate the GSD config block for Codex config.toml.
- * @param {Array<{name: string, description: string}>} agents
+ *
+ * #2406 — standalone per-agent TOMLs (written by installCodexConfig to
+ * `$CODEX_HOME/agents/<name>.toml`) are auto-discovered by Codex and are the
+ * SOLE canonical registration source for each role. This block therefore no
+ * longer emits `[agents.<name>]` role tables that point `config_file` back at
+ * those same standalone TOMLs — that was a second, redundant declaration of
+ * the same role in one config layer, and Codex logged "Ignoring malformed
+ * agent role definition: duplicate agent role name" once per agent as a
+ * result. Only the bare `[agents]` dispatch-tuning scalar table is emitted
+ * here; role name/description/model/reasoning-effort/sandbox settings remain
+ * fully discoverable through the standalone TOML alone.
+ * @param {Array<{name: string, description: string}>} _agents unused — kept
+ *   in the signature for call-site compatibility (installCodexConfig and
+ *   existing tests still pass it positionally); per-agent role tables are no
+ *   longer generated from it.
+ * @param {string} [_targetDir] unused — the standalone-TOML `config_file`
+ *   path it used to resolve is no longer emitted here; kept for the same
+ *   call-site-compatibility reason as `_agents`.
  */
-function generateCodexConfigBlock(agents, targetDir) {
-  // Use absolute paths when targetDir is provided — Codex ≥0.116 requires
-  // AbsolutePathBuf for config_file and cannot resolve relative paths.
-  const agentsPrefix = targetDir
-    ? path.join(targetDir, 'agents').replace(/\\/g, '/')
-    : 'agents';
+function generateCodexConfigBlock(_agents, _targetDir) {
   const lines = [
     GSD_CODEX_MARKER,
     '',
@@ -4384,23 +4454,11 @@ function generateCodexConfigBlock(agents, targetDir) {
   // ADR-1239 upgrade 2 / #2088 — explicit dispatch tuning. Pin `max_depth` on the
   // `[agents]` (AgentsToml) table rather than relying on codex-cli's implicit
   // default, realizing the negotiated `dispatch.maxDepth: 1` axis. This bare
-  // `[agents]` scalar table coexists with the flattened `[agents.<name>]` role
-  // sub-tables below (validated by validateCodexConfigSchema, which permits a
-  // known-scalar-only `[agents]`). Emitted before the role tables so the parent
-  // table is opened first.
+  // `[agents]` scalar table is validated by validateCodexConfigSchema, which
+  // permits a known-scalar-only `[agents]`.
   lines.push('[agents]');
   lines.push(`max_depth = ${GSD_CODEX_AGENTS_MAX_DEPTH}`);
   lines.push('');
-
-  for (const { name, description } of agents) {
-    // #2727 — Codex 0.124.0 requires [agents.<name>] struct format, not [[agents]] sequence.
-    // [[agents]] (introduced in #2645) is rejected by codex-cli 0.124.0 with
-    // "invalid type: sequence, expected struct AgentsToml in `agents`".
-    lines.push(`[agents.${name}]`);
-    lines.push(`description = ${JSON.stringify(description)}`);
-    lines.push(`config_file = "${agentsPrefix}/${name}.toml"`);
-    lines.push('');
-  }
 
   return lines.join('\n');
 }
@@ -6926,12 +6984,14 @@ function installCodexConfig(targetDir, agentsSrc, sandboxTier = 'codex-agent-san
   // Symlink-escape guard (parity with _copyStaged / copyWithPathReplacement): the
   // lexical gate above does not resolve symlinks, so a pre-existing config.toml or
   // agents/ symlink could redirect writes outside targetDir. Reject those.
+  // #2393: honor GSD_ALLOW_SYMLINKED_DEST for intentional user-owned symlink layouts.
+  const symlinkOptIn = isSymlinkedDestOptIn();
   if (
-    hasExistingSymlinkBetween(resolvedTargetRoot, configPath) ||
-    hasExistingSymlinkBetween(resolvedTargetRoot, path.resolve(agentsTomlDir))
+    hasExistingSymlinkBetween(resolvedTargetRoot, configPath, { allowOptInFollow: symlinkOptIn }) ||
+    hasExistingSymlinkBetween(resolvedTargetRoot, path.resolve(agentsTomlDir), { allowOptInFollow: symlinkOptIn })
   ) {
     throw new Error(
-      `installCodexConfig: a Codex config path under "${targetDir}" contains a symlink escaping the install root — refusing to write`,
+      `installCodexConfig: a Codex config path under "${targetDir}" contains a symlink the install root does not trust — refusing to write. If this is an intentional user-owned symlink layout, re-run with GSD_ALLOW_SYMLINKED_DEST=1.`,
     );
   }
   fs.mkdirSync(agentsTomlDir, { recursive: true });
@@ -6982,9 +7042,9 @@ function installCodexConfig(targetDir, agentsSrc, sandboxTier = 'codex-agent-san
     // `name` containing path separators must not escape agents/ (which would let
     // it clobber config.toml or write elsewhere under the configHome).
     const agentTomlPath = assertDestWithinConfigHome(agentsTomlDir, `${name}.toml`);
-    if (hasExistingSymlinkBetween(resolvedTargetRoot, agentTomlPath)) {
+    if (hasExistingSymlinkBetween(resolvedTargetRoot, agentTomlPath, { allowOptInFollow: symlinkOptIn })) {
       throw new Error(
-        `installCodexConfig: agent toml path "${agentTomlPath}" contains a symlink escaping the install root — refusing to write`,
+        `installCodexConfig: agent toml path "${agentTomlPath}" contains a symlink the install root does not trust — refusing to write. If this is an intentional user-owned symlink layout, re-run with GSD_ALLOW_SYMLINKED_DEST=1.`,
       );
     }
     fs.writeFileSync(agentTomlPath, tomlContent);
@@ -7658,9 +7718,10 @@ function copyWithPathReplacement(srcDir, destDir, pathPrefix, runtime, isCommand
   }
   const resolvedConfinementRoot = path.resolve(confinementRoot);
   const resolvedDestDir = assertDestWithinConfigHome(confinementRoot, destDir);
-  if (hasExistingSymlinkBetween(resolvedConfinementRoot, resolvedDestDir)) {
+  // #2393: honor GSD_ALLOW_SYMLINKED_DEST for intentional user-owned symlink layouts.
+  if (hasExistingSymlinkBetween(resolvedConfinementRoot, resolvedDestDir, { allowOptInFollow: isSymlinkedDestOptIn() })) {
     throw new Error(
-      `copyWithPathReplacement: destDir "${destDir}" contains a symlink escaping the install root "${confinementRoot}" — refusing to write`,
+      `copyWithPathReplacement: destDir "${destDir}" contains a symlink the install root "${confinementRoot}" does not trust — refusing to write. If this is an intentional user-owned symlink layout, re-run with GSD_ALLOW_SYMLINKED_DEST=1.`,
     );
   }
   // Use the validated absolute path for all writes below so the gate validates
@@ -9327,7 +9388,7 @@ function resolveInstallRelativePath(baseDir, relPath) {
   if (fullPath !== root && !fullPath.startsWith(root + path.sep)) {
     return null;
   }
-  if (hasExistingSymlinkBetween(root, fullPath)) {
+  if (hasExistingSymlinkBetween(root, fullPath, { allowOptInFollow: isSymlinkedDestOptIn() })) {
     return null;
   }
   return { relPath: normalized, fullPath };
@@ -10542,7 +10603,8 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   } else if (_hostBehaviors(runtime).pluginOnlyInstall) {
     // pi (ADR-1239 / #2102 Stage 1): plugin-only install — pi's /gsd command is
     // registered programmatically by the native extension (pi/gsd.cjs →
-    // extensions/gsd.cjs, staged separately below) and dispatches in-process
+    // extensions/gsd.js, staged separately below; the dest suffix must be
+    // .ts/.js or pi's auto-discovery skips it silently — #2470) and dispatches in-process
     // through the embedded gsd-core command-routing hub. pi has no host-read
     // markdown surface (unlike Claude/OpenCode/etc., which scan commands/ or
     // command/ directories), so writing flat gsd-<cmd>.md files here would be
@@ -12307,6 +12369,19 @@ function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallS
         fs.writeFileSync(defaultsPath, JSON.stringify(defaults, null, 2) + '\n');
         console.log(`  ${green}✓${reset} Set resolve_model_ids: "omit" in ~/.gsd/defaults.json`);
       }
+
+      // #2395: also persist `runtime: <runtime>` for non-Claude runtimes, so
+      // resolveRuntime() (precedence: GSD_RUNTIME env > config.runtime > 'claude')
+      // resolves to the install's actual runtime identity out of the box — without
+      // this, agent_runtime and every runtime-branded slash hint falls through to
+      // the hard-coded 'claude' default. Mirrors the resolve_model_ids write above:
+      // honor an explicit pre-existing value (any string), only default-populating
+      // when absent. Claude is the resolveRuntime() fallback, so it needs no write.
+      if (defaults.runtime === undefined || defaults.runtime === null || defaults.runtime === '') {
+        defaults.runtime = runtime;
+        fs.writeFileSync(defaultsPath, JSON.stringify(defaults, null, 2) + '\n');
+        console.log(`  ${green}✓${reset} Set runtime: "${runtime}" in ~/.gsd/defaults.json`);
+      }
     } catch (e) {
       console.log(`  ${yellow}⚠${reset} Could not write ~/.gsd/defaults.json: ${e.message}`);
     }
@@ -12418,16 +12493,17 @@ const runtimeMap = {
   '9': 'grok',
   '10': 'hermes',
   '11': 'kimi',
-  '12': 'kilo',
-  '13': 'opencode',
-  '14': 'pi',
-  '15': 'qwen',
-  '16': 'trae',
-  '17': 'windsurf',
-  '18': 'zcode'
+  '12': 'kimi-code',
+  '13': 'kilo',
+  '14': 'opencode',
+  '15': 'pi',
+  '16': 'qwen',
+  '17': 'trae',
+  '18': 'windsurf',
+  '19': 'zcode'
 };
-const allRuntimes = ['claude', 'antigravity', 'augment', 'cline', 'codebuddy', 'codex', 'copilot', 'cursor', 'grok', 'hermes', 'kimi', 'kilo', 'opencode', 'pi', 'qwen', 'trae', 'windsurf', 'zcode'];
-const ALL_RUNTIMES_OPTION = '19';
+const allRuntimes = ['claude', 'antigravity', 'augment', 'cline', 'codebuddy', 'codex', 'copilot', 'cursor', 'grok', 'hermes', 'kimi', 'kimi-code', 'kilo', 'opencode', 'pi', 'qwen', 'trae', 'windsurf', 'zcode'];
+const ALL_RUNTIMES_OPTION = '20';
 
 /**
  * Build the runtime-selection prompt text shown by the interactive installer.
@@ -12446,14 +12522,15 @@ function buildRuntimePromptText() {
   ${cyan}9${reset}) Grok Build   ${dim}(~/.grok)${reset}
   ${cyan}10${reset}) Hermes Agent ${dim}(~/.hermes)${reset}
   ${cyan}11${reset}) Kimi         ${dim}(~/.config/agents, then ~/.agents if existing)${reset}
-  ${cyan}12${reset}) Kilo         ${dim}(~/.config/kilo)${reset}
-  ${cyan}13${reset}) OpenCode     ${dim}(~/.config/opencode)${reset}
-  ${cyan}14${reset}) pi           ${dim}(~/.pi/agent)${reset}
-  ${cyan}15${reset}) Qwen Code    ${dim}(~/.qwen)${reset}
-  ${cyan}16${reset}) Trae         ${dim}(~/.trae)${reset}
-  ${cyan}17${reset}) Windsurf     ${dim}(~/.codeium/windsurf)${reset}
-  ${cyan}18${reset}) ZCode        ${dim}(~/.zcode)${reset}
-  ${cyan}19${reset}) All
+  ${cyan}12${reset}) Kimi Code    ${dim}(~/.kimi-code)${reset}
+  ${cyan}13${reset}) Kilo         ${dim}(~/.config/kilo)${reset}
+  ${cyan}14${reset}) OpenCode     ${dim}(~/.config/opencode)${reset}
+  ${cyan}15${reset}) pi           ${dim}(~/.pi/agent)${reset}
+  ${cyan}16${reset}) Qwen Code    ${dim}(~/.qwen)${reset}
+  ${cyan}17${reset}) Trae         ${dim}(~/.trae)${reset}
+  ${cyan}18${reset}) Windsurf     ${dim}(~/.codeium/windsurf)${reset}
+  ${cyan}19${reset}) ZCode        ${dim}(~/.zcode)${reset}
+  ${cyan}20${reset}) All
 
   ${dim}Select multiple: 1,2,6 or 1 2 6${reset}
 `;

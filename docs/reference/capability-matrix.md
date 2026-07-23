@@ -44,7 +44,7 @@ Core package and are stamped with the package version at release (per
 ADR-1244 D6). They are not subject to the consent or integrity-pin flow applied
 to third-party capabilities.
 
-### Feature capabilities (role: feature) — 19
+### Feature capabilities (role: feature) — 20
 
 Feature capabilities extend what the loop does — contributing research,
 planning, execution, verification, or ship artefacts at the loop extension
@@ -55,6 +55,7 @@ points.
 | `ai-integration` | feature | full | `>=1.6.0` | `plan:pre`, `verify:pre` | step, contribution, gate | first-party |
 | `assumption-delta` | feature | full | `>=1.6.0` | `plan:pre` | contribution | first-party |
 | `audit` | feature | full | `>=1.6.0` | — | — | first-party |
+| `broken-windows` | feature | full | `>=1.7.0` | `ship:pre` | gate | first-party |
 | `claude-orchestration` | feature | full | `>=1.7.0` | `plan:post`, `execute:wave:pre` | contribution | first-party |
 | `code-review` | feature | full | `>=1.6.0` | `execute:post` | step | first-party |
 | `drift` | feature | full | `>=1.6.0` | `plan:pre`, `execute:wave:post` | gate | first-party |
@@ -72,7 +73,7 @@ points.
 | `tdd` | feature | full | `>=1.6.0` | `plan:pre`, `execute:post` | contribution, gate | first-party |
 | `ui` | feature | full | `>=1.6.0` | `plan:pre`, `execute:wave:post`, `verify:post` | step, gate | first-party |
 
-### Runtime capabilities (role: runtime) — 18
+### Runtime capabilities (role: runtime) — 19
 
 Runtime capabilities adapt GSD to a specific AI runtime or IDE — emitting
 skills, agents, hooks configuration, and surface files for that host. They
@@ -92,6 +93,7 @@ emission), so their extension-point and hook-kind cells are `—`.
 | `hermes` | runtime | core | `>=1.6.0` | — | — | first-party |
 | `kilo` | runtime | core | `>=1.6.0` | — | — | first-party |
 | `kimi` | runtime | core | `>=1.6.0` | — | — | first-party |
+| `kimi-code` | runtime | core | `>=1.7.0` | — | — | first-party |
 | `opencode` | runtime | core | `>=1.6.0` | — | — | first-party |
 | `pi` | runtime | core | `>=1.7.0` | — | — | first-party |
 | `qwen` | runtime | core | `>=1.6.0` | — | — | first-party |

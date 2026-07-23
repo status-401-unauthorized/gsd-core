@@ -59,6 +59,10 @@
  * Requirements Operations:
  *   requirements mark-complete <ids>   Mark requirement IDs as complete in REQUIREMENTS.md
  *                                      Accepts: REQ-01,REQ-02 or REQ-01 REQ-02 or [REQ-01, REQ-02]
+ *   requirements ready-ids <plan-path> <ids>  Read-only: which of <ids> are safe to mark-complete now
+ *                                      (no sibling *-PLAN.md in the same phase dir still missing its SUMMARY for that ID)
+ *   requirements revert-phase <ids>   Revert requirement IDs out of Complete (checkbox + traceability row);
+ *                                      gaps_found-only, never call on the pass path
  *
  * Milestone Operations:
  *   milestone complete <version>       Archive milestone, create MILESTONES.md
@@ -285,12 +289,13 @@ const { routeInitCommand } = require('./lib/init-command-router.cjs');
 // here, invoked from case 'init' below.
 const { warnIfStaleBake } = require('./lib/stale-bake-guard.cjs');
 const loopResolver = require('./lib/loop-resolver.cjs');
+const brokenWindows = require('./lib/broken-windows.cjs');
 const { routePhaseCommand } = require('./lib/phase-command-router.cjs');
 const { routePhasesCommand } = require('./lib/phases-command-router.cjs');
 const { routeValidateCommand } = require('./lib/validate-command-router.cjs');
 const { routeRoadmapCommand } = require('./lib/roadmap-command-router.cjs');
 const { routeCapabilityCommand } = require('./lib/capability-command-router.cjs');
-const { routeAgentCommand } = require('./lib/agent-command-router.cjs');
+const { routeAgentCommand, AGENT_FAILURE_CLASSES } = require('./lib/agent-command-router.cjs');
 const smartEntryMod = require('./lib/smart-entry.cjs');
 const { routeCheckCommand } = require('./lib/check-command-router.cjs');
 const { routeTaskCommand } = require('./lib/task-command-router.cjs');
@@ -604,7 +609,21 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
     let effortOverride;
     let fastModeOverride;
     let attempt;
+    let failureClass;
+    let host;
     const positionals = [];
+    // #2296: the valid classes come from the classifier's own frozen enum, so
+    // this validator can never drift from what `agent classify-failure` emits.
+    const validFailureClasses = Object.values(AGENT_FAILURE_CLASSES);
+    const setFailureClass = (v) => {
+      if (!validFailureClasses.includes(v)) {
+        error(
+          `--failure-class must be one of: ${validFailureClasses.join(', ')}`,
+          ERROR_REASON.USAGE,
+        );
+      }
+      failureClass = v;
+    };
     for (let i = 0; i < execArgs.length; i++) {
       const a = execArgs[i];
       if (a.startsWith('--effort=')) {
@@ -621,6 +640,10 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
         const n = parseInt(v, 10);
         if (!Number.isInteger(n) || n < 0) error('--attempt requires a non-negative integer', ERROR_REASON.USAGE);
         attempt = n;
+        continue;
+      }
+      if (a.startsWith('--failure-class=')) {
+        setFailureClass(a.slice('--failure-class='.length));
         continue;
       }
       if (a === '--effort') {
@@ -646,6 +669,20 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
         i++;
         continue;
       }
+      if (a === '--failure-class') {
+        const val = execArgs[i + 1];
+        if (val === undefined || val.startsWith('--')) error('Missing value for --failure-class', ERROR_REASON.USAGE);
+        setFailureClass(val);
+        i++;
+        continue;
+      }
+      if (a === '--host') {
+        const val = execArgs[i + 1];
+        if (val === undefined || val.startsWith('--')) error('Missing value for --host', ERROR_REASON.USAGE);
+        host = val;
+        i++;
+        continue;
+      }
       if (a === '--raw') continue;
       if (a.startsWith('-')) error(`Unknown flag for resolve-execution: ${a}`, ERROR_REASON.USAGE);
       positionals.push(a);
@@ -657,6 +694,8 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
       effortOverride,
       fastModeOverride,
       attempt,
+      failureClass,
+      host,
     });
   }
 
@@ -1148,6 +1187,45 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
           }
   }
 
+  function routeResolveDispatchType({ args, cwd, raw, error }) {
+    // #2508 Phase 4 Option A: resolve a requested GSD subagent name to the
+           // type an Agent() call should use on the current runtime. On
+           // named-dispatch runtimes (Claude, OpenCode, …) the name is returned
+           // unchanged; on built-in-only runtimes (kimi-code) it maps to the
+           // closest built-in (coder/explore/plan) by role-suffix heuristic.
+           // The persona rides ${AGENT_SKILLS_*} (Phase 3 / #2510) regardless.
+           //
+           // Output:
+           //   --raw (default) → prints the resolved type (e.g. "gsd-planner" or "plan")
+           //   --json          → prints { runtime, requested, resolved, dispatch }
+           try {
+             const requestedIdx = args.indexOf('--requested');
+             const requested = requestedIdx !== -1 ? args[requestedIdx + 1] : '';
+             const { resolveRuntime } = require('./lib/runtime-slash.cjs');
+             const runtimeId = resolveRuntime(cwd);
+             const registry = require('./lib/capability-registry.cjs');
+             const runtimeEntry = registry.runtimes != null
+               ? registry.runtimes[runtimeId]
+               : null;
+             const dispatch = runtimeEntry?.runtime?.hostIntegration?.dispatch ?? null;
+             const hostIntegration = require('./lib/host-integration.cjs');
+             const resolved = hostIntegration.resolveDispatchType(requested, dispatch);
+             const jsonIdx = args.indexOf('--json');
+             if (jsonIdx !== -1) {
+               output({ runtime: runtimeId, requested, resolved, dispatch }, raw);
+             } else {
+               process.stdout.write(String(resolved));
+             }
+           } catch {
+             // Fail-closed: on any error, echo the requested name unchanged
+             // (named-dispatch is the GSD default; degrading to it preserves
+             // behavior for every runtime already in the field).
+             const requestedIdx = args.indexOf('--requested');
+             const requested = requestedIdx !== -1 ? args[requestedIdx + 1] : '';
+             process.stdout.write(String(requested));
+           }
+  }
+
   function routeAgentSkills({ args, cwd, raw, error }) {
     // --json emits typed IR { agent_type, block, skills_count } for test assertions
           // (#455). Default (no flag) outputs raw XML so workflow shell expansions work.
@@ -1216,8 +1294,19 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
     const subcommand = args[1];
           if (subcommand === 'mark-complete') {
             milestone.cmdRequirementsMarkComplete(cwd, args.slice(2), raw);
+          } else if (subcommand === 'ready-ids') {
+            // #2388: read-only shared-ID gate — computes which of the given
+            // requirement IDs are safe to hand to mark-complete right now
+            // (no sibling *-PLAN.md in the same phase dir still missing its
+            // *-SUMMARY.md for that ID).
+            milestone.cmdRequirementsReadyIds(cwd, args.slice(2), raw);
+          } else if (subcommand === 'revert-phase') {
+            // #2388: gaps_found-only revert — flips this phase's own
+            // requirement IDs back out of Complete (checkbox + traceability
+            // row) before the gap report renders.
+            milestone.cmdRequirementsRevertPhase(cwd, args.slice(2), raw);
           } else {
-            error('Unknown requirements subcommand. Available: mark-complete', ERROR_REASON.SDK_UNKNOWN_COMMAND);
+            error('Unknown requirements subcommand. Available: mark-complete, ready-ids, revert-phase', ERROR_REASON.SDK_UNKNOWN_COMMAND);
           }
   }
 
@@ -1460,6 +1549,39 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
           } else {
             error('Unknown learnings subcommand. Available: list, query, copy, prune, delete', ERROR_REASON.SDK_UNKNOWN_COMMAND);
           }
+  }
+
+  function routeWindows({ args, cwd, raw, error }) {
+    // windows status | append | waive | fixed  (issue #1950)
+    // All subcommands emit JSON; `--raw` is accepted for forward-compat with
+    // capture-stdout hooks but is a no-op (output shape is JSON in both modes).
+    const subcommand = args[1];
+    const rest = args.slice(2);
+    try {
+      if (subcommand === 'status') {
+        brokenWindows.cmdWindowsStatus(cwd, { raw });
+      } else if (subcommand === 'append') {
+        brokenWindows.cmdWindowsAppend(cwd, rest, { raw });
+      } else if (subcommand === 'waive') {
+        brokenWindows.cmdWindowsWaive(cwd, rest, { raw });
+      } else if (subcommand === 'fixed') {
+        brokenWindows.cmdWindowsMarkFixed(cwd, rest, { raw });
+      } else {
+        error(
+          `Unknown windows subcommand: ${subcommand || '(none)'}. Available: status, append, waive, fixed`,
+          ERROR_REASON.SDK_UNKNOWN_COMMAND,
+        );
+      }
+    } catch (e) {
+      // WindowsError carries a REASON code; surface it through the structured
+      // error path so tests can assert on the typed reason. `error()` calls
+      // process.exit(1) internally so we never reach the fall-through.
+      if (e && e.name === 'WindowsError' && typeof e.reason === 'string') {
+        error(e.message || 'broken-windows error', e.reason);
+      }
+      // Non-WindowsError: surface the message verbatim and exit non-zero.
+      error(`broken-windows: ${(e && e.message) ? e.message : String(e)}`, ERROR_REASON.UNKNOWN);
+    }
   }
 
   function routeTeamsStatus({ args, cwd, raw, error }) {
@@ -1997,6 +2119,7 @@ const HOST_COMMAND_ROUTERS = {
     'quick-tasks-append': routeQuickTasksAppend,
     'normalize-test-command': routeNormalizeTestCommand,
     'dispatch-should-flatten': routeDispatchShouldFlatten,
+    'resolve-dispatch-type': routeResolveDispatchType,
     'agent-skills': routeAgentSkills,
     'skill-manifest': routeSkillManifest,
     'history-digest': routeHistoryDigest,
@@ -2029,6 +2152,7 @@ const HOST_COMMAND_ROUTERS = {
     'effort': routeEffort,
     'user-story': routeUserStory,
     'drift-guard': routeDriftGuard,
+    'windows': routeWindows,
 };
 
 // Returns true when consumed (suppress "Unknown command"), false to fall
@@ -2056,10 +2180,162 @@ async function dispatchHostCommand({ command, args, cwd, raw, error, defaultValu
 
 // ─── Arg parsing helpers ──────────────────────────────────────────────────────
 
+// ─── run-with-timeout (#2351) ─────────────────────────────────────────────────
+// Portable, coreutils-independent wall-clock cap for a spawned command. Replaces
+// the GNU-only `timeout <n> …` calls that were hardcoded across gsd
+// workflow/agent files: stock macOS ships neither `timeout` nor `gtimeout`, so
+// those calls exited 127 ("command not found") and a passing build/test was
+// misreported as a FAILURE. The resolution lives here ONCE — every call site
+// invokes `gsd_run run-with-timeout <secs> [--] <cmd> [args…]` instead of
+// hand-rolling a `command -v timeout` probe per file.
+//
+// Exit-code contract (kept identical to GNU `timeout` so the existing per-site
+// dispatch — `-eq 124` for timeout, `-eq 0` for pass, non-zero for fail — is
+// unchanged):
+//   • command exits normally       → exit with the command's own code
+//   • wall-clock budget exceeded    → exit 124
+//   • command killed by a signal    → exit 128+signum
+//   • command not found / not exec  → exit 127 / 126 (spawn ENOENT / EACCES)
+//   • bad wrapper args              → exit 2 (usage — a workflow-authoring bug)
+//   • <secs> == 0                   → run with NO timer (matches `timeout 0`)
+//   • blank / negative / NaN <secs> → exit 2 (usage — fails SAFE, never unbounded)
+//
+// The wrapped command's argv is OPAQUE: this executes BEFORE gsd-tools' own
+// global-flag parsing (see main()), so a wrapped `--raw`/`--cwd`/`--pick` passes
+// through verbatim rather than being consumed by this dispatcher. stdio is
+// inherited so shell pipes (`echo x | gsd_run run-with-timeout …`) and redirects
+// keep working. No shell is spawned (argv array) — no injection surface beyond
+// the old `timeout … bash -c "$CMD"`.
+function runWithTimeout(argv) {
+  const { spawn } = require('node:child_process');
+  const os = require('node:os');
+
+  const USAGE = 'Usage: gsd_run run-with-timeout <seconds> [--] <command> [args...]';
+  const usageError = (msg) => new ExitError(2, `run-with-timeout: ${msg}\n${USAGE}`);
+
+  const rawSecs = argv[0];
+  if (rawSecs === undefined) throw usageError('missing <seconds>');
+  // Accept a bare number or a GNU-style trailing `s` unit (the only unit callers
+  // use). A blank/whitespace value is a USAGE ERROR — never a silent "no timer",
+  // which would drop the wall-clock bound if a config value ever resolved to "".
+  const secsText = String(rawSecs).trim().replace(/s$/, '');
+  const secs = Number(secsText);
+  if (secsText === '' || !Number.isFinite(secs) || secs < 0) {
+    throw usageError(`invalid <seconds>: ${rawSecs}`);
+  }
+
+  let i = 1;
+  if (argv[i] === '--') i += 1; // optional POSIX end-of-options separator
+  const cmd = argv[i];
+  if (cmd === undefined) throw usageError('missing <command>');
+  const cmdArgs = argv.slice(i + 1);
+
+  const isWin = process.platform === 'win32';
+  // Detached (own process group) on POSIX so a timeout can reap the WHOLE tree —
+  // a bare child.kill() misses grandchildren (e.g. a test runner's workers) and
+  // would not actually bound the wall clock. Windows has no POSIX process
+  // groups; a direct kill is the best portable option there.
+  const detached = !isWin && secs > 0;
+  const spawnFailureCode = (err) =>
+    (err && err.code === 'ENOENT' ? 127 : err && err.code === 'EACCES' ? 126 : 125);
+  // Node's setTimeout delay is a 32-bit signed ms int; a larger value silently
+  // clamps to 1ms → a spurious immediate timeout. Cap the budget (~24.8 days).
+  const timerMs = Math.min(Math.round(secs * 1000), 2 ** 31 - 1);
+
+  // Resolve with the numeric exit code — never process.exit() (banned by
+  // n/no-process-exit). main() returns this code and runMain() maps it to
+  // process.exitCode, so stdout/stderr flush and cleanup hooks still fire.
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, cmdArgs, { stdio: 'inherit', detached });
+    } catch (err) {
+      process.stderr.write(`run-with-timeout: ${cmd}: ${err && err.message ? err.message : 'failed to start'}\n`);
+      resolve(spawnFailureCode(err));
+      return;
+    }
+
+    const killTree = (signal) => {
+      try {
+        if (detached && child.pid) {
+          try { process.kill(-child.pid, signal); return; } catch { /* group already gone */ }
+        }
+        child.kill(signal);
+      } catch { /* already exited */ }
+    };
+
+    let timedOut = false;
+    let killTimer = null;
+    // Backstop SIGKILL for a descendant that traps SIGTERM. The child keeps the
+    // event loop alive until this fires, so it stays ref'd (not unref'd).
+    const armEscalation = () => {
+      if (!killTimer) killTimer = setTimeout(() => killTree('SIGKILL'), 3000);
+    };
+
+    const timer = secs > 0
+      ? setTimeout(() => { timedOut = true; killTree('SIGTERM'); armEscalation(); }, timerMs)
+      : null;
+
+    // Forward an interrupt to the child tree rather than dying and orphaning it
+    // (GNU `timeout` forwards received signals). Without this, SIGINT/SIGTERM to
+    // the wrapper — Ctrl-C, CI cancellation — would leave the detached child
+    // running unbounded with no supervisor left to enforce the cap.
+    const onSignal = (sig) => { killTree(sig); armEscalation(); };
+    const onSigint = () => onSignal('SIGINT');
+    const onSigterm = () => onSignal('SIGTERM');
+    process.on('SIGINT', onSigint);
+    process.on('SIGTERM', onSigterm);
+
+    const finish = (exitCode) => {
+      if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigterm);
+      resolve(exitCode);
+    };
+
+    child.on('error', (err) => {
+      process.stderr.write(`run-with-timeout: ${cmd}: ${err && err.message ? err.message : 'failed to start'}\n`);
+      finish(spawnFailureCode(err));
+    });
+
+    child.on('exit', (code, signal) => {
+      if (timedOut) {
+        // The direct child exited on our SIGTERM, but a SIGTERM-trapping descendant
+        // may still hold the inherited stdio — orphaning it would hang a captured
+        // or piped gate. Reap the whole group SYNCHRONOUSLY here; the escalation
+        // timer can't fire once we resolve and the loop drains.
+        killTree('SIGKILL');
+        finish(124); // matches GNU `timeout`
+        return;
+      }
+      if (signal) {
+        const num = os.constants.signals[signal] || 0;
+        finish(num ? 128 + num : 1); // bash's 128+signum convention
+        return;
+      }
+      finish(code == null ? 1 : code);
+    });
+  });
+}
+
 // ─── CLI Router ───────────────────────────────────────────────────────────────
 
 async function main() {
   let args = process.argv.slice(2);
+
+  // #2351: run-with-timeout bounds a spawned command's wall clock portably
+  // (coreutils-independent). It MUST intercept HERE, before the global-flag
+  // parsing below — the wrapped command's argv is opaque and may itself contain
+  // --raw / --cwd / --pick that this dispatcher would otherwise consume.
+  {
+    let rwt = args;
+    if (rwt[0] === 'query') rwt = rwt.slice(1);
+    if (rwt[0] === 'run-with-timeout') {
+      // Return the child's exit code; runMain() maps it to process.exitCode.
+      return runWithTimeout(rwt.slice(1));
+    }
+  }
 
   // --json-errors / GSD_JSON_ERRORS=1: when active, error() emits structured
   // JSON ({ ok: false, reason: <ERROR_REASON code>, message }) to stderr

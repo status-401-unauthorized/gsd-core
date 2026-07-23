@@ -2154,6 +2154,75 @@ describe('stats command', () => {
     assert.strictEqual(stats.phases_completed, 1);
     assert.strictEqual(stats.phases.length, 1);
   });
+
+  // ─── #2408: cmdStats last-write-wins fix — colliding dirs fold by precedence ──
+  //
+  // Two on-disk phase directories that normalize to the same phase key
+  // (e.g. `05-real/` + `05-real-stray/`) used to silently overwrite `status`
+  // at the directory-scan merge site (last-write-wins), so /gsd-stats could
+  // report `Not Started` for a phase that is actually `Complete` depending on
+  // fs.readdirSync order. The fix folds colliding statuses by precedence
+  // (Complete > Needs Review > Executed > In Progress > Planned > Not Started),
+  // so the furthest-along status wins regardless of read order.
+
+  test('#2408: colliding phase directories fold to the furthest-along status (Complete wins over Not Started)', () => {
+    // Two dirs that both normalize to phase key "05": `05-real/` (Complete)
+    // and `05-real-stray/` (empty → Not Started). The merged status MUST be
+    // Complete regardless of which directory the fs yields first.
+    const realDir = path.join(tmpDir, '.planning', 'phases', '05-real');
+    fs.mkdirSync(realDir, { recursive: true });
+    fs.writeFileSync(path.join(realDir, '01-01-PLAN.md'), '# Plan');
+    fs.writeFileSync(path.join(realDir, '01-01-SUMMARY.md'), '# Summary');
+    fs.writeFileSync(path.join(realDir, 'VERIFICATION.md'), '---\nstatus: passed\n---\n# Verified');
+
+    const strayDir = path.join(tmpDir, '.planning', 'phases', '05-real-stray');
+    fs.mkdirSync(strayDir, { recursive: true });
+
+    // ROADMAP declares Phase 5 so the dir-scan finds an explicit phase to populate.
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      [
+        '# Roadmap',
+        '',
+        '## Milestone v1',
+        '',
+        '### Phase 5: Real',
+        '**Goal:** The real phase',
+      ].join('\n')
+    );
+
+    const result = runGsdTools('stats', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const stats = JSON.parse(result.output);
+    assert.strictEqual(stats.phases_total, 1, 'two colliding dirs must merge into one phase');
+    assert.strictEqual(stats.phases_completed, 1, 'Complete status must win over Not Started after the fold');
+    const phase05 = stats.phases.find((p) => p.number === '05');
+    assert.ok(phase05, 'phase 05 must appear in stats output');
+    assert.strictEqual(phase05.status, 'Complete', 'folded status must be Complete, not Not Started');
+  });
+
+  test('#2408: foldPhaseStatus is commutative and order-independent (property)', () => {
+    // Direct unit test of the fold: a Complete colliding with a Not Started
+    // must yield Complete regardless of argument order. This is the property
+    // that makes the merge-site fix correct independent of fs read order.
+    const { foldPhaseStatus, PHASE_STATUS_PRECEDENCE } = require('../gsd-core/bin/lib/commands.cjs');
+    assert.strictEqual(foldPhaseStatus('Complete', 'Not Started'), 'Complete');
+    assert.strictEqual(foldPhaseStatus('Not Started', 'Complete'), 'Complete');
+    assert.strictEqual(foldPhaseStatus('Complete', 'Complete'), 'Complete');
+    // Every recognized status folded with a lower-precedence one wins.
+    for (let i = 0; i < PHASE_STATUS_PRECEDENCE.length - 1; i++) {
+      const higher = PHASE_STATUS_PRECEDENCE[i];
+      const lower = PHASE_STATUS_PRECEDENCE[i + 1];
+      assert.strictEqual(foldPhaseStatus(higher, lower), higher, `${higher} should beat ${lower}`);
+      assert.strictEqual(foldPhaseStatus(lower, higher), higher, `${higher} should beat ${lower} (commutative)`);
+    }
+    // Unrecognized status never beats a recognized one.
+    assert.strictEqual(foldPhaseStatus('Complete', '???'), 'Complete');
+    assert.strictEqual(foldPhaseStatus('???', 'Complete'), 'Complete');
+    // Two unrecognized → returns first arg (deterministic).
+    assert.strictEqual(foldPhaseStatus('foo', 'bar'), 'foo');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3482,3 +3551,67 @@ describe('feat-488: effort sync command', () => {
 });
   });
 }
+
+describe('query commit --files scoping (#2269)', () => {
+  const REPO_ROOT = path.join(__dirname, '..');
+
+  test('secure-phase.md passes --files to its query commit call', () => {
+    const content = fs.readFileSync(
+      path.join(REPO_ROOT, 'gsd-core', 'workflows', 'secure-phase.md'), 'utf-8'
+    );
+    const idx = content.indexOf('add/update security threat verification');
+    assert.notEqual(idx, -1, 'must contain the security commit message');
+    assert.match(content.slice(idx, idx + 200), /--files/);
+    assert.match(content.slice(idx, idx + 200), /SECURITY\.md/);
+  });
+
+  test('validate-phase.md passes --files to its query commit call', () => {
+    const content = fs.readFileSync(
+      path.join(REPO_ROOT, 'gsd-core', 'workflows', 'validate-phase.md'), 'utf-8'
+    );
+    const idx = content.indexOf('add/update validation strategy');
+    assert.notEqual(idx, -1, 'must contain the validation commit message');
+    assert.match(content.slice(idx, idx + 200), /--files/);
+    assert.match(content.slice(idx, idx + 200), /VALIDATION\.md/);
+  });
+
+  test('next.md passes --files to its deferral query commit call', () => {
+    const content = fs.readFileSync(
+      path.join(REPO_ROOT, 'gsd-core', 'workflows', 'next.md'), 'utf-8'
+    );
+    const idx = content.indexOf('defer incomplete Phase');
+    assert.notEqual(idx, -1, 'must contain the deferral commit message');
+    assert.match(content.slice(idx, idx + 200), /--files/);
+    assert.match(content.slice(idx, idx + 200), /ROADMAP\.md/);
+  });
+});
+
+describe('#2279: map-codebase date stamp instructions overwrite existing dates', () => {
+  const REPO_ROOT = path.join(__dirname, '..');
+
+  test('codebase-mapper agent says to SET date stamps, overwriting existing values', () => {
+    const content = fs.readFileSync(
+      path.join(REPO_ROOT, 'agents', 'gsd-codebase-mapper.md'), 'utf-8'
+    );
+    assert.match(content, /overwriting whatever date is already there/i,
+      'must instruct the agent to SET date stamps unconditionally, not just replace [YYYY-MM-DD] placeholders');
+  });
+
+  test('map-codebase workflow spawn prompts say to SET date stamps, not replace placeholders', () => {
+    const content = fs.readFileSync(
+      path.join(REPO_ROOT, 'gsd-core', 'workflows', 'map-codebase.md'), 'utf-8'
+    );
+    const stampLines = content.match(/Set all date stamps[^\r\n]*/g) || [];
+    assert.ok(stampLines.length >= 4,
+      `must have ≥4 "Set all date stamps" instructions (4 spawn prompts + 1 sequential); got ${stampLines.length}`);
+  });
+
+  test('map-codebase sequential path says to SET date stamps overwriting existing dates', () => {
+    const content = fs.readFileSync(
+      path.join(REPO_ROOT, 'gsd-core', 'workflows', 'map-codebase.md'), 'utf-8'
+    );
+    const idx = content.indexOf('overwriting any existing date');
+    assert.notEqual(idx, -1,
+      'workflow must instruct agents to overwrite existing dates, not just replace [YYYY-MM-DD] placeholders');
+  });
+});

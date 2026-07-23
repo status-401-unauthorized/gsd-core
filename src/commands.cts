@@ -30,8 +30,13 @@ import roadmapParserMod = require('./roadmap-parser.cjs');
 const { extractCurrentMilestone, stripShippedMilestones: _stripShippedMilestones, getMilestoneInfo, getMilestonePhaseFilter, getRoadmapPhaseInternal } = roadmapParserMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import modelResolverMod = require('./model-resolver.cjs');
-const { resolveModelInternal, resolveModelForTier, resolveEffortInternal, resolveFastModeInternal, resolveEffortForTier, resolveGranularityInternal, assertValidGranularityOverride } = modelResolverMod;
-import { renderEffortForRuntime, RUNTIMES_WITH_FAST_MODE } from './model-catalog.cjs';
+const { resolveModelInternal, resolveModelForTier, resolveProviderEscalation, resolveEffortInternal, resolveFastModeInternal, resolveEffortForTier, resolveGranularityInternal, assertValidGranularityOverride } = modelResolverMod;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import agentCommandRouterMod = require('./agent-command-router.cjs');
+const { AGENT_FAILURE_CLASSES } = agentCommandRouterMod;
+import { renderEffortForRuntime, renderEffortArgv, RUNTIMES_WITH_FAST_MODE } from './model-catalog.cjs';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import hostIntegrationMod = require('./host-integration.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspace = require('./planning-workspace.cjs');
 const { planningDir, planningPaths } = planningWorkspace;
@@ -90,6 +95,45 @@ interface EffortSyncChange {
 }
 
 // ─── Phase Status ─────────────────────────────────────────────────────────────
+
+/**
+ * Phase-status precedence ladder — furthest-along wins (#2408).
+ *
+ * `cmdStats` builds `phasesByNumber` by scanning on-disk phase directories.
+ * When two directories normalize to the same phase key (e.g. `05-real/` and
+ * `05-real-stray/`), the status field must be folded by precedence rather
+ * than overwritten last-write-wins — otherwise `/gsd-stats` reports whatever
+ * directory `fs.readdirSync` happened to yield last, which is non-deterministic
+ * across platforms and can silently call a `Complete` phase `Not Started`.
+ */
+const PHASE_STATUS_PRECEDENCE: ReadonlyArray<string> = [
+  'Complete',
+  'Needs Review',
+  'Executed',
+  'In Progress',
+  'Planned',
+  'Not Started',
+  'Pending',
+];
+const PHASE_STATUS_RANK = new Map<string, number>(
+  PHASE_STATUS_PRECEDENCE.map((s, i) => [s, i]),
+);
+
+/**
+ * Fold two phase statuses by precedence — returns whichever is further along
+ * the {@link PHASE_STATUS_PRECEDENCE} ladder. Unrecognized statuses fall behind
+ * every recognized one (so a recognized status always wins over an unknown one;
+ * two unrecognized statuses favor `a` for determinism).
+ */
+function foldPhaseStatus(a: string, b: string): string {
+  const ra = PHASE_STATUS_RANK.get(a);
+  const rb = PHASE_STATUS_RANK.get(b);
+  if (ra === undefined && rb === undefined) return a;
+  if (ra === undefined) return b;
+  if (rb === undefined) return a;
+  // Lower rank = higher precedence (Complete=0 wins over Not Started=5).
+  return ra <= rb ? a : b;
+}
 
 /**
  * Determine phase status by checking plan/summary counts AND verification state.
@@ -482,9 +526,10 @@ function cmdResolveGranularity(cwd: string, phaseType: string | undefined, raw: 
  *   { model, profile, effort, effort_rendered, effort_param, effort_propagation,
  *     fast_mode, fast_mode_supported, [unknown_agent] }
  *
- * Flags: --effort <level>, --fast-mode <true|false>, --attempt <n>
+ * Flags: --effort <level>, --fast-mode <true|false>, --attempt <n>,
+ *        --failure-class <class> (#2296), --host <runtime-id> (#2481)
  */
-function cmdResolveExecution(cwd: string, agentType: string | undefined, raw: boolean, opts?: { effortOverride?: string; fastModeOverride?: boolean; attempt?: number }): void {
+function cmdResolveExecution(cwd: string, agentType: string | undefined, raw: boolean, opts?: { effortOverride?: string; fastModeOverride?: boolean; attempt?: number; failureClass?: string; host?: string }): void {
   if (!agentType) {
     error('agent-type required');
   }
@@ -499,9 +544,22 @@ function cmdResolveExecution(cwd: string, agentType: string | undefined, raw: bo
   // including dynamic_routing-enabled users who don't pass --attempt), and only an
   // explicit attempt routes through the tier ladder. resolveModelForTier itself
   // still falls back to resolveModelInternal when dynamic_routing is off.
-  const model = (opts.attempt !== undefined && opts.attempt !== null)
+  let model = (opts.attempt !== undefined && opts.attempt !== null)
     ? resolveModelForTier(cwd, agentType!, opts.attempt)
     : resolveModelInternal(cwd, agentType!);
+
+  // #2296: when the caller reports WHY the previous attempt failed, consult the
+  // provider-escalation ladder. Only a quota/rate-limit class warrants it — a
+  // heavier tier on the same throttled provider is still throttled, so this
+  // ladder swaps providers instead. Gated on an explicit --failure-class so the
+  // JSON contract is byte-identical for every existing caller.
+  let escalation: Record<string, unknown> | undefined;
+  if (opts.failureClass !== undefined) {
+    const applicable = opts.failureClass === AGENT_FAILURE_CLASSES.QUOTA_EXCEEDED;
+    const resolved = resolveProviderEscalation(cwd, agentType!, opts.attempt, applicable);
+    if (resolved.escalated) model = resolved.to;
+    escalation = { class: opts.failureClass, ...resolved };
+  }
 
   const effortOpts: Record<string, unknown> = {};
   if (typeof opts.effortOverride === 'string') effortOpts['override'] = opts.effortOverride;
@@ -531,8 +589,53 @@ function cmdResolveExecution(cwd: string, agentType: string | undefined, raw: bo
     fast_mode: fastMode,
     fast_mode_supported: fastModeSupported,
   };
+  // ADR-1239 amendment (#2481) / ADR-443 path (a): invocation-time effort for a
+  // named host. The host's negotiated `effortSurface` decides WHETHER an argument
+  // is emitted; the catalog knows the syntax. Absent --host the contract is
+  // byte-identical to before, so every existing caller is unaffected.
+  if (typeof opts.host === 'string' && opts.host.length > 0) {
+    const surface = effortSurfaceForHost(cwd, opts.host);
+    const argvRendered = renderEffortArgv(opts.host, effort, surface);
+    result['host'] = opts.host;
+    result['effort_surface'] = surface;
+    result['effort_argv'] = argvRendered.argv;
+    result['effort_argv_string'] = argvRendered.argv.join(' ');
+    result['effort_argv_value'] = argvRendered.value;
+  }
+
   if (!agentModels) result['unknown_agent'] = true;
+  if (escalation) result['escalation'] = escalation;
   output(result, raw, effort);
+}
+
+/**
+ * ADR-1239 amendment (#2481) — resolve a host's negotiated `effortSurface`.
+ *
+ * Reads the host's runtime descriptor from the generated capability registry and
+ * runs it through the Host-Integration negotiation so the trust-boundary invariant
+ * applies here exactly as everywhere else: an unknown host, a missing axis, or the
+ * `undocumented` sentinel all degrade to the safe floor rather than being trusted.
+ * Never throws — a lookup failure yields `'none'`, which renders no argument.
+ */
+function effortSurfaceForHost(cwd: string, host: string): string {
+  void cwd;
+  try {
+    // Mirrors the lazy-require pattern from runtime-slash.cts §runtimeSlash —
+    // capability-registry.cjs is generated and carries no type declarations.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { runtimes } = require('./capability-registry.cjs') as {
+      runtimes: Record<string, { runtime?: { hostIntegration?: unknown } }>;
+    };
+    const declared = runtimes[host]?.runtime?.hostIntegration;
+    if (!declared || typeof declared !== 'object') return 'none';
+    // The descriptor is untrusted JSON; negotiation applies the trust-boundary
+    // invariant (effective ⊆ host-declared ∩ engine-known) and fails closed.
+    const negotiated = hostIntegrationMod.negotiateHostCapabilities(declared);
+    const surface: unknown = negotiated?.effective?.effortSurface;
+    return typeof surface === 'string' ? surface : 'none';
+  } catch {
+    return 'none';
+  }
 }
 
 /**
@@ -1614,7 +1717,12 @@ function cmdStats(cwd: string, format: string | undefined, raw: boolean): void {
         name: existing?.name || phaseName,
         plans: (existing?.plans || 0) + plans,
         summaries: (existing?.summaries || 0) + summaries,
-        status,
+        // #2408: fold colliding statuses by precedence rather than overwriting
+        // last-write-wins. fs.readdirSync order is non-deterministic across
+        // platforms, so a naive overwrite can report a Complete phase as Not
+        // Started (or vice versa) depending on read order. The fold picks the
+        // furthest-along status, matching what an operator expects.
+        status: existing ? foldPhaseStatus(existing.status, status) : status,
       });
     }
   } catch { /* intentionally empty */ }
@@ -1745,6 +1853,8 @@ function cmdCheckCommit(cwd: string, raw: boolean): void {
 export = {
   groupFilesBySubrepo,
   determinePhaseStatus,
+  foldPhaseStatus,
+  PHASE_STATUS_PRECEDENCE,
   cmdGenerateSlug,
   cmdCurrentTimestamp,
   cmdListTodos,

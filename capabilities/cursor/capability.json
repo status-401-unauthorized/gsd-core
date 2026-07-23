@@ -1,7 +1,7 @@
 {
   "id": "cursor",
   "role": "runtime",
-  "version": "1.7.0-rc.6",
+  "version": "1.8.0",
   "title": "Cursor",
   "description": "Cursor IDE — skills + converted commands artifact layout; hooks.json surface; Claude hook event dialect; recursive skill loader (flat nesting); tier-2 support.",
   "tier": "core",
@@ -97,7 +97,8 @@
       "hookBus": "host",
       "stateIO": "filesystem",
       "transport": "mcp",
-      "runtime": "node"
+      "runtime": "node",
+      "effortSurface": "undocumented"
     },
     "hostBehaviors": {
       "reapplyCommand": "gsd-update --reapply (mention the skill name)",

@@ -60,7 +60,7 @@ describe('multi-runtime selection parsing', () => {
 
   test('space-separated choices return multiple runtimes', () => {
     assert.deepStrictEqual(parseRuntimeInput('1 7 9'), ['claude', 'copilot', 'grok']);
-    assert.deepStrictEqual(parseRuntimeInput('8 12'), ['cursor', 'kilo']);
+    assert.deepStrictEqual(parseRuntimeInput('8 13'), ['cursor', 'kilo']);
   });
 
   test('mixed comma and space separators work', () => {
@@ -77,50 +77,55 @@ describe('multi-runtime selection parsing', () => {
   });
 
   test('single choice for kilo', () => {
-    assert.deepStrictEqual(parseRuntimeInput('12'), ['kilo']);
+    assert.deepStrictEqual(parseRuntimeInput('13'), ['kilo']);
   });
 
   test('single choice for opencode', () => {
-    assert.deepStrictEqual(parseRuntimeInput('13'), ['opencode']);
+    assert.deepStrictEqual(parseRuntimeInput('14'), ['opencode']);
   });
 
   test('single choice for pi', () => {
-    assert.deepStrictEqual(parseRuntimeInput('14'), ['pi']);
+    assert.deepStrictEqual(parseRuntimeInput('15'), ['pi']);
   });
 
   test('single choice for qwen', () => {
-    assert.deepStrictEqual(parseRuntimeInput('15'), ['qwen']);
+    assert.deepStrictEqual(parseRuntimeInput('16'), ['qwen']);
   });
 
   test('single choice for trae', () => {
-    assert.deepStrictEqual(parseRuntimeInput('16'), ['trae']);
+    assert.deepStrictEqual(parseRuntimeInput('17'), ['trae']);
   });
 
   test('single choice for windsurf', () => {
-    assert.deepStrictEqual(parseRuntimeInput('17'), ['windsurf']);
+    assert.deepStrictEqual(parseRuntimeInput('18'), ['windsurf']);
   });
 
   test('single choice for zcode', () => {
-    assert.deepStrictEqual(parseRuntimeInput('18'), ['zcode']);
+    assert.deepStrictEqual(parseRuntimeInput('19'), ['zcode']);
   });
 
   test('single choice for kimi', () => {
     assert.deepStrictEqual(parseRuntimeInput('11'), ['kimi']);
   });
 
-  test('choice 19 returns all runtimes', () => {
-    assert.deepStrictEqual(parseRuntimeInput('19'), allRuntimes);
+  test('single choice for kimi-code (#2454)', () => {
+    assert.deepStrictEqual(parseRuntimeInput('12'), ['kimi-code']);
   });
 
-  test('choice 19 returns all runtimes when mixed with separators or other tokens', () => {
+  test('choice 20 returns all runtimes', () => {
+    assert.deepStrictEqual(parseRuntimeInput('20'), allRuntimes);
+  });
+
+
+  test('choice 20 returns all runtimes when mixed with separators or other tokens', () => {
     // CR feedback: tokenized inputs that include 19 (e.g. trailing comma, or
     // alongside other choices) must still expand to all-runtimes — previously
     // only the bare all-runtimes option matched, so "19," or "19 1" silently installed a
     // subset.
-    assert.deepStrictEqual(parseRuntimeInput('19,'), allRuntimes);
-    assert.deepStrictEqual(parseRuntimeInput('19 1'), allRuntimes);
-    assert.deepStrictEqual(parseRuntimeInput('1,19'), allRuntimes);
-    assert.deepStrictEqual(parseRuntimeInput('  19  '), allRuntimes);
+    assert.deepStrictEqual(parseRuntimeInput('20,'), allRuntimes);
+    assert.deepStrictEqual(parseRuntimeInput('20 1'), allRuntimes);
+    assert.deepStrictEqual(parseRuntimeInput('1,20'), allRuntimes);
+    assert.deepStrictEqual(parseRuntimeInput('  20  '), allRuntimes);
   });
 
   test('empty input defaults to claude', () => {
@@ -129,13 +134,13 @@ describe('multi-runtime selection parsing', () => {
   });
 
   test('invalid choices are ignored, falls back to claude if all invalid', () => {
-    assert.deepStrictEqual(parseRuntimeInput('20'), ['claude']);
+    assert.deepStrictEqual(parseRuntimeInput('21'), ['claude']);
     assert.deepStrictEqual(parseRuntimeInput('0'), ['claude']);
     assert.deepStrictEqual(parseRuntimeInput('abc'), ['claude']);
   });
 
   test('invalid choices mixed with valid are filtered out', () => {
-    assert.deepStrictEqual(parseRuntimeInput('1,20,7'), ['claude', 'copilot']);
+    assert.deepStrictEqual(parseRuntimeInput('1,21,7'), ['claude', 'copilot']);
     assert.deepStrictEqual(parseRuntimeInput('abc 3 xyz'), ['augment']);
   });
 
@@ -146,7 +151,7 @@ describe('multi-runtime selection parsing', () => {
 
   test('preserves selection order', () => {
     assert.deepStrictEqual(parseRuntimeInput('9,1,7'), ['grok', 'claude', 'copilot']);
-    assert.deepStrictEqual(parseRuntimeInput('12,2,8'), ['kilo', 'antigravity', 'cursor']);
+    assert.deepStrictEqual(parseRuntimeInput('13,2,8'), ['kilo', 'antigravity', 'cursor']);
   });
 });
 
@@ -163,17 +168,18 @@ describe('install.js exports multi-select runtime metadata', () => {
     '9': 'grok',
     '10': 'hermes',
     '11': 'kimi',
-    '12': 'kilo',
-    '13': 'opencode',
-    '14': 'pi',
-    '15': 'qwen',
-    '16': 'trae',
-    '17': 'windsurf',
-    '18': 'zcode',
+    '12': 'kimi-code',
+    '13': 'kilo',
+    '14': 'opencode',
+    '15': 'pi',
+    '16': 'qwen',
+    '17': 'trae',
+    '18': 'windsurf',
+    '19': 'zcode',
   };
   const expectedRuntimes = [
     'claude', 'antigravity', 'augment', 'cline', 'codebuddy', 'codex',
-    'copilot', 'cursor', 'grok', 'hermes', 'kimi', 'kilo', 'opencode', 'pi',
+    'copilot', 'cursor', 'grok', 'hermes', 'kimi', 'kimi-code', 'kilo', 'opencode', 'pi',
     'qwen', 'trae', 'windsurf', 'zcode',
   ];
 
@@ -191,11 +197,11 @@ describe('install.js exports multi-select runtime metadata', () => {
       'allRuntimes has no duplicates');
   });
 
-  test('"All" shortcut (option 19) selects every runtime', () => {
-    assert.deepStrictEqual(parseRuntimeInput('19'), allRuntimes);
+  test('"All" shortcut (option 20) selects every runtime', () => {
+    assert.deepStrictEqual(parseRuntimeInput('20'), allRuntimes);
   });
 
-  test('--kimi flag selects Kimi without interactive prompt', () => {
+  test('--kimi flag selects Kimi (Python kimi-cli) without interactive prompt', () => {
     assert.deepStrictEqual(selectRuntimesFromArgs(['--kimi']), ['kimi']);
   });
 
@@ -205,6 +211,10 @@ describe('install.js exports multi-select runtime metadata', () => {
 
   test('--grok-build alias selects Grok Build', () => {
     assert.deepStrictEqual(selectRuntimesFromArgs(['--grok-build']), ['grok']);
+  });
+
+  test('--kimi-code flag selects Kimi Code (Node CLI) without interactive prompt (#2454)', () => {
+    assert.deepStrictEqual(selectRuntimesFromArgs(['--kimi-code']), ['kimi-code']);
   });
 
   test('--zcode flag selects ZCode without interactive prompt', () => {
@@ -243,7 +253,7 @@ describe('install.js exports multi-select runtime metadata', () => {
       '--all includes pi exactly once');
   });
 
-  test('prompt lists Grok Build (9), pi (14), ZCode (18), and All (19)', () => {
+  test('prompt lists Grok Build (9), Kimi Code (12), pi (15), ZCode (19), and All (20)', () => {
     const prompt = stripAnsi(buildRuntimePromptText());
     assert.ok(/\b9\)\s*Grok Build\b/.test(prompt),
       'prompt lists Grok Build as option 9');
@@ -253,16 +263,18 @@ describe('install.js exports multi-select runtime metadata', () => {
       'prompt lists Kimi as option 11');
     assert.ok(/Kimi\s+\(~\/\.config\/agents, then ~\/\.agents if existing\)/.test(prompt),
       'prompt shows the Kimi first-existing generic root policy');
-    assert.ok(/\b14\)\s*pi\b/.test(prompt),
+    assert.ok(/\b12\)\s*Kimi Code\b/.test(prompt),
+      'prompt lists Kimi Code as option 12 (#2454)');
+    assert.ok(/\b15\)\s*pi\b/.test(prompt),
       'prompt lists pi as option 14');
-    assert.ok(/\b15\)\s*Qwen Code\b/.test(prompt),
+    assert.ok(/\b16\)\s*Qwen Code\b/.test(prompt),
       'prompt lists Qwen Code as option 15');
-    assert.ok(/\b16\)\s*Trae\b/.test(prompt),
+    assert.ok(/\b17\)\s*Trae\b/.test(prompt),
       'prompt lists Trae as option 16');
-    assert.ok(/\b18\)\s*ZCode\b/.test(prompt),
+    assert.ok(/\b19\)\s*ZCode\b/.test(prompt),
       'prompt lists ZCode as option 18');
-    assert.ok(/\b19\)\s*All\b/.test(prompt),
-      'prompt lists All as option 19');
+    assert.ok(/\b20\)\s*All\b/.test(prompt),
+      'prompt lists All as option 20');
   });
 
   test('prompt does not list Gemini (removed #1928)', () => {

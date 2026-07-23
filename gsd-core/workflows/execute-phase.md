@@ -13,6 +13,10 @@ Execute all plans in a phase using wave-based parallel execution. Orchestrator s
 Orchestrator coordinates, not executes. Each subagent loads the full execute-plan context. Orchestrator: discover plans → analyze deps → group waves → spawn agents → handle checkpoints → collect results.
 </core_principle>
 
+<!-- #2508 runtime-aware-dispatch -->
+
+> **Runtime-aware dispatch (#2508 Phase 4).** GSD workflows dispatch specialized subagents by role. Before dispatching on a built-in-only runtime (kimi-code — three built-ins only), resolve the role to a built-in via `gsd_run query resolve-dispatch-type --requested <role> --raw`. On named-dispatch runtimes (Claude/OpenCode/…) the role is returned unchanged; on kimi-code it maps to `coder`/`explore`/`plan` by role-suffix. The persona rides `${AGENT_SKILLS_<ROLE>}` (Phase 3) regardless. See @gsd-core/references/runtime-aware-dispatch.md.
+
 <runtime_compatibility>
 **Subagent spawning is runtime-specific:**
 - **Claude Code:** Uses `Agent(subagent_type="gsd-executor", ...)` — blocks until complete, returns result
@@ -82,11 +86,11 @@ if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
 AGENT_SKILLS=$(gsd_run query agent-skills gsd-executor)
 ```
 
-Parse JSON for: `executor_model`, `verifier_model`, `commit_docs`, `parallelization`, `branching_strategy`, `branch_name`, `phase_found`, `phase_dir`, `phase_number`, `phase_name`, `phase_slug`, `plans`, `incomplete_plans`, `plan_count`, `incomplete_count`, `state_exists`, `roadmap_exists`, `phase_req_ids`, `response_language`.
+Parse JSON for: `executor_model`, `verifier_model`, `commit_docs`, `parallelization`, `branching_strategy`, `branch_name`, `phase_found`, `phase_dir`, `phase_number`, `phase_name`, `phase_slug`, `plans`, `incomplete_plans`, `plan_count`, `incomplete_count`, `state_exists`, `roadmap_exists`, `phase_req_ids`, `response_language`, `requirements_path`.
 
 **Model resolution:** If `executor_model` is `"inherit"`, omit the `model=` parameter from all `Agent()` calls — do NOT pass `model="inherit"` to Agent. Omitting the `model=` parameter causes Claude Code to inherit the current orchestrator model automatically. Only set `model=` when `executor_model` is an explicit model name (e.g., `"claude-sonnet-5"`, `"claude-opus-4-8"`).
 
-**If `response_language` is set:** Include `response_language: {value}` in all spawned subagent prompts so any user-facing output stays in the configured language.
+@~/.claude/gsd-core/references/execute-phase-response-language.md
 
 Read runtime/worktree config and fail closed before any executor dispatch:
 
@@ -127,7 +131,7 @@ else
 fi
 ```
 
-`SUBMODULE_PATHS` is exported to the `execute_waves` step, where the per-plan decision actually happens (see "Per-plan worktree decision" sub-step inside `execute_waves`). The decision is per-plan because different plans in the same wave can touch different files — only plans whose paths intersect a submodule must drop worktree isolation; plans nowhere near a submodule keep parallel isolation.
+`SUBMODULE_PATHS` is exported to the `execute_waves` step, where the per-plan decision happens (see "Per-plan worktree decision" sub-step inside `execute_waves`). The decision is per-plan because different plans in the same wave can touch different files — only plans whose paths intersect a submodule must drop worktree isolation; plans nowhere near a submodule keep parallel isolation.
 
 When `USE_WORKTREES` (project-level) is `false`, all executor agents run without `isolation="worktree"` — they execute sequentially on the main working tree instead of in parallel worktrees. The per-plan decision below has no effect when worktrees are project-disabled.
 
@@ -403,7 +407,7 @@ CROSS_AI_TIMEOUT=$(gsd_run query config-get workflow.cross_ai_timeout 2>/dev/nul
 3. **Run the external command** from the project root, writing the prompt to stdin.
    Never shell-interpolate the prompt — always pipe via stdin to prevent injection:
    ```bash
-   echo "$TASK_PROMPT" | timeout "${CROSS_AI_TIMEOUT}s" ${CROSS_AI_CMD} > "$CANDIDATE_SUMMARY" 2>"$ERROR_LOG"
+   echo "$TASK_PROMPT" | gsd_run run-with-timeout "${CROSS_AI_TIMEOUT}" -- ${CROSS_AI_CMD} > "$CANDIDATE_SUMMARY" 2>"$ERROR_LOG"
    EXIT_CODE=$?
    ```
 
@@ -441,7 +445,7 @@ cwd inside an agent worktree (or a subdirectory of one). Every subsequent
 orchestrator-side git call would then target the wrong tree — this is how a wrong-base
 merge nearly shipped ~1000 files. Resolve the *worktree root* (so a subdirectory cwd
 cannot skew the check) and refuse if it is an agent worktree. The discriminator is the
-per-agent branch namespace `worktree-agent-*`, NOT the `.claude/worktrees/` path: the
+per-agent branch namespace `agent-*` / `worktree-agent-*`, NOT the `.claude/worktrees/` path: the
 orchestrator may itself be legitimately invoked from a feature worktree under
 `.claude/worktrees/`, so a path-substring refusal would break legitimate runs. Do NOT
 pin to `git worktree list`'s first entry — that is the main worktree, the wrong target
@@ -451,7 +455,7 @@ when the orchestrator legitimately runs from a feature worktree.
 ORCHESTRATOR_WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
   echo "FATAL: execute_waves entry is not inside a git worktree (#48)." >&2; exit 1; }
 ORCH_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-if printf '%s' "$ORCH_BRANCH" | grep -Eq '^worktree-agent-'; then
+if printf '%s' "$ORCH_BRANCH" | grep -Eq '^(worktree-)?agent-'; then
   echo "FATAL: orchestrator cwd is inside an agent worktree (branch '$ORCH_BRANCH', root '$ORCHESTRATOR_WT') — refusing to execute waves (#48). A prior isolation=\"worktree\" dispatch drifted the cwd; re-run from the orchestrator's own worktree." >&2
   exit 1
 fi
@@ -553,7 +557,7 @@ increases monotonically across waves. `{status}` is `complete` (success),
 
    Read and execute `gsd-core/workflows/execute-phase/steps/per-plan-worktree-gate.md` for each plan. It extracts `PLAN_FILES` from the plan's JSON, intersects against `SUBMODULE_PATHS` (with normalization, bidirectional matching, and glob-prefix handling), and sets `USE_WORKTREES_FOR_PLAN` to `false` when the plan touches a submodule path. Append `plan_id` to a `WAVE_WORKTREE_PLANS` accumulator when `USE_WORKTREES_FOR_PLAN != false`.
 
-   The dispatch branches in step 3 below MUST gate on `USE_WORKTREES_FOR_PLAN` for the current plan, not on the project-level `USE_WORKTREES`.
+   The dispatch branches in step 3 gate on both `USE_WORKTREES` and `USE_WORKTREES_FOR_PLAN` (#2474).
 
 2.75. **Execute:wave:pre capability dispatch:**
 
@@ -574,14 +578,14 @@ increases monotonically across waves. `{status}` is `complete` (success),
    For 200k models, this keeps orchestrator context lean (~10-15%).
    For 1M+ models (Opus 4.6, Sonnet 4.6), richer context can be passed directly.
 
-   **Worktree mode** (`USE_WORKTREES_FOR_PLAN` is not `false` — evaluated per-plan in step 2.5):
+   **Worktree mode** (`USE_WORKTREES` and `USE_WORKTREES_FOR_PLAN` not `false`):
 
    Before spawning, capture the current HEAD:
    ```bash
    EXPECTED_BASE=$(git rev-parse HEAD)
    DISPATCH_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
    EXPECTED_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-   if [ "${USE_WORKTREES_FOR_PLAN:-true}" != "false" ] && [ -z "${WAVE_WORKTREE_MANIFEST:-}" ]; then
+    if [ "${USE_WORKTREES:-true}" != "false" ] && [ "${USE_WORKTREES_FOR_PLAN:-true}" != "false" ] && [ -z "${WAVE_WORKTREE_MANIFEST:-}" ]; then
      M=$(mktemp "${TMPDIR:-/tmp}/gsd-worktree-wave-XXXXXX") && mv "$M" "$M.json" && WAVE_WORKTREE_MANIFEST="$M.json" || exit 1  # XXXXXX must be path-final on BSD/macOS (#1520)
      # Persist the dispatch-time orchestrator worktree root so wave-cleanup can pin back to the
      # orchestrator's OWN worktree — NOT `git worktree list`'s first entry (always the main
@@ -976,7 +980,7 @@ increases monotonically across waves. `{status}` is `complete` (success),
    Note: If `WAVE_FAILURE_COUNT > 1`, strongly recommend "Fix now" — compounding
    failures across multiple waves become exponentially harder to diagnose.
 
-   If "Fix now": diagnose failures (typically import conflicts, missing types,
+   If "Fix now": diagnose failures (import conflicts, missing types,
    or changed function signatures from parallel plans modifying the same module).
    Fix, commit as `fix: resolve post-merge conflicts from wave {N}`, re-run tests.
 
@@ -993,8 +997,6 @@ increases monotonically across waves. `{status}` is `complete` (success),
    ```
    [checkpoint] phase {PHASE_NUMBER} wave {N}/{M} complete, {P}/{Q} plans done ({wave_success}/{wave_plan_count} ok)
    ```
-
-
 
    For each SUMMARY.md:
    - Verify first 2 files from `key-files.created` exist on disk
@@ -1026,23 +1028,13 @@ increases monotonically across waves. `{status}` is `complete` (success),
    if [ -n "$RETRY_AFTER" ]; then RETRY_HINT="  Provider hinted retry-after: ${RETRY_AFTER}s"; else RETRY_HINT=""; fi
    ```
    One classifier branch handles sentinels across Claude/Copilot/Codex/Gemini. Reference: `docs/research/provider-rate-limit-signals.md`.
-   **Step 7.1 — `class == "quota-exceeded"`:**
-   Do not offer "retry now". Run step-5 spot-check first; if SUMMARY.md is missing but commits exist, route to safe-resume (`state.verify-against-disk`) instead of immediate redispatch.
-   ```text
-   ⚠ Plan {plan_id} terminated by provider quota / rate limit
-     Runtime sentinel: {SENTINEL}
-     {RETRY_HINT}
-     Partial commits on worktree branch: {N}
-     SUMMARY.md present: {yes|no}
-     1. Wait for quota reset, then resume (recommended)
-   2. Switch to a different runtime / model and resume
-   3. Abort phase and report partial state
-   ```
-   Re-run `/gsd:execute-phase` after quota reset for Option 1.
+   **Step 7.1 — `class == "quota-exceeded"`:** follow the quota-recovery fragment below.
    **Step 7.2 — `class == "classify-handoff-bug"`:**
    If error contains `classifyHandoffIfNeeded is not defined`, treat as Claude runtime bug. Run the same step-5 spot-checks; PASS => treat as success, FAIL => fall through.
    **Step 7.3 — `class == "unknown-failure"`:**
    Report failed plan and ask Continue/Stop; continuing may cascade into dependent plan failures.
+
+@~/.claude/gsd-core/references/execute-phase-quota-recovery.md
 
 @~/.claude/gsd-core/references/execute-phase-between-wave-reset.md
 
@@ -1344,7 +1336,7 @@ Create VERIFICATION.md.
 Read these files before verification:
 - {phase_dir}/*-PLAN.md (All plans — understand intent, check must_haves)
 - {phase_dir}/*-SUMMARY.md (All summaries — cross-reference claimed vs actual)
-- .planning/REQUIREMENTS.md (Requirement traceability)
+- {requirements_path} (Requirement traceability)
 ${CONTEXT_WINDOW >= 500000 ? `- {phase_dir}/*-CONTEXT.md (User decisions — verify they were honored)
 - {phase_dir}/*-RESEARCH.md (Known pitfalls — check for traps)
 - Prior VERIFICATION.md files from earlier phases (regression check)
@@ -1417,7 +1409,7 @@ Commit the file:
 gsd_run query commit "test({phase_num}): persist human verification items as UAT" --files "{phase_dir}/{phase_num}-UAT.md"
 ```
 
-**Step B: Present to user:**
+**Step B: Present to user**:
 
 ```
 ## ◷ Phase {X}: {Name} — Human Verification Needed
@@ -1439,9 +1431,10 @@ Verify-work will walk you through each item and mark the phase complete when all
 
 **If user acknowledges without reporting issues (including "ok", "noted", "ack", "got it", "approved", "done", "yes", "pass", or similar):** Stop. The phase remains pending. No further orchestrator action — wait for the user to run `/gsd:verify-work`.
 
-**If user reports issues now (before running verify-work):** Proceed to gap closure as currently implemented.
+**If user reports issues now:** Proceed to gap closure.
 
 **If gaps_found:**
+@~/.claude/gsd-core/references/execute-phase-requirement-revert.md
 ```
 ## ⚠ Phase {X}: {Name} — Gaps Found
 
@@ -1482,7 +1475,7 @@ The CLI handles:
 
 Extract from result: `next_phase`, `next_phase_name`, `is_last_phase`, `warnings`, `has_warnings`.
 
-**If has_warnings is true:**
+**If has_warnings is true**:
 ```
 ## Phase {X} marked complete with {N} warnings:
 
@@ -1542,7 +1535,7 @@ for TODO_FILE in "$PENDING_DIR"/*.md; do
 done
 
 if [ ${#CLOSED[@]} -gt 0 ]; then
-  gsd_run query commit "docs(phase-${PHASE_NUMBER}): auto-close ${#CLOSED[@]} todo(s) resolved by this phase" --files .planning/todos/completed/ .planning/STATE.md|| true
+  gsd_run query commit "docs(phase-${PHASE_NUMBER}): close ${#CLOSED[@]} resolved todo(s)" --files .planning/todos/completed/ .planning/todos/pending/ .planning/STATE.md|| true
   echo "◆ Closed ${#CLOSED[@]} todo(s) resolved by Phase ${PHASE_NUMBER}:"
   for f in "${CLOSED[@]}"; do echo "  ✓ $f"; done
 fi
@@ -1665,7 +1658,7 @@ Orchestrator: ~10-15% context for 200k windows, can use more for 1M+ windows.
 Subagents: fresh context each (200k-1M depending on model). No polling (Agent blocks). No context bleed.
 
 For 1M+ context models, consider:
-- Passing richer context (code snippets, dependency outputs) directly to executors instead of just file paths
+- Passing richer context (code snippets, dependency outputs) directly to executors instead of file paths
 - Running small phases (≤3 plans, no dependencies) inline without subagent spawning overhead
 - Relaxing /clear recommendations — context rot onset is much further out with 5x window
 </context_efficiency>

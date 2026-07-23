@@ -35,6 +35,10 @@ const RUNTIME_INSTALL_CONTRACTS = {
   gemini: { surface: 'commands-gsd', settings: true, packageJson: true },
   hermes: { surface: 'hermes-skills', settings: true, packageJson: true },
   kimi: { surface: 'kimi-skills-agents', settings: false, packageJson: false },
+  // #2454: Kimi Code (Node CLI) has NO custom named subagents (per official
+  // docs), so its install surface is skills-only (flat-skills), NOT
+  // kimi-skills-agents. The kimi-agents YAML layout is Python kimi-cli only.
+  'kimi-code': { surface: 'flat-skills', settings: false, packageJson: false },
   // #2305: Kilo's native plugin spawns the staged guard hooks, so it receives
   // the shared hooks bundle + the CommonJS package.json marker, like OpenCode.
   // (#1821 excluded Kilo on the false premise that it had no plugin surface.)
@@ -292,9 +296,19 @@ function assertFreshInstallContract(runtime, targetDir) {
     // adversarial-review fix — hooksSurface:'none' no longer implies
     // skipSharedHooksInstall for pi, mirroring OpenCode), so hooks/ + the
     // git-cmd.js tokenizer helper ARE part of the artifact surface now.
+    // #2470: the dest filename comes from pi's descriptor, and must satisfy
+    // pi's isExtensionFile() auto-discovery filter (.ts/.js only) — otherwise
+    // the file installs but pi never loads it and /gsd never registers.
+    const piNativePlugin = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '..', 'capabilities', 'pi', 'capability.json'), 'utf8')
+    ).runtime.hostBehaviors.nativePlugin;
     assert.ok(
-      fs.existsSync(path.join(targetDir, 'extensions', 'gsd.cjs')),
-      `${runtime} should install the native extension file at extensions/gsd.cjs`
+      piNativePlugin.file.endsWith('.ts') || piNativePlugin.file.endsWith('.js'),
+      `${runtime}'s extension "${piNativePlugin.file}" must end in .ts or .js for pi to discover it (#2470)`
+    );
+    assert.ok(
+      fs.existsSync(path.join(targetDir, piNativePlugin.dir, piNativePlugin.file)),
+      `${runtime} should install the native extension file at ${piNativePlugin.dir}/${piNativePlugin.file}`
     );
     assert.ok(
       fs.existsSync(path.join(targetDir, 'hooks', 'gsd-ensure-canonical-path.js')),

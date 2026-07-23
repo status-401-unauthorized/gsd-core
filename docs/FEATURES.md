@@ -309,6 +309,7 @@
 - REQ-PLAN-07: System MUST prompt user to run `/gsd-ui-phase` if frontend phase detected and no UI-SPEC.md exists (UI safety gate)
 - REQ-PLAN-08: System MUST include Nyquist validation mapping when `workflow.nyquist_validation` is enabled
 - REQ-PLAN-09: System MUST verify all phase requirements are covered by at least one plan before planning completes (requirements coverage gate)
+- REQ-PLAN-10: System MUST support an optional `<reversibility rating="reversible|costly|one-way">` element recording how costly a decision would be to undo, and MUST insert a `checkpoint:decision` before the task implementing a `one-way` decision unless `--no-reversibility-gates` is set (`costly` is flagged without blocking; `reversible` and unrated flow normally)
 
 **Produces:**
 | Artifact | Description |
@@ -3351,5 +3352,17 @@ The load-bearing wire is the `plan-phase` lift into `must_haves.prohibitions`, s
 ### 157. State Rebuild & Configurable Graph Path
 
 **Behavior:** A new `gsd-tools state rebuild` subcommand re-derives `STATE.md` from source (#1830). The new `graphify.graph_path` setting makes the knowledge-graph location configurable, so a single umbrella graph can serve several projects (#1825).
+
+---
+
+### 158. Broken-Windows Ledger
+
+**Behavior:** A cross-phase defect register at `.planning/WINDOWS.md` accumulates stubs, TODOs, skipped tests, unrun verifies, and unmet truths (#1950). `/gsd:ship` blocks while any entry is `open`; an entry can be `waived` only with a recorded reason (auditable) or marked `fixed` (removed from the blocking set). `/gsd:progress` surfaces the open + waived counts.
+
+**Commands:** `gsd-tools windows status | append | waive | fixed`.
+
+**Config:** `workflow.windows_enforce` (gate active, default `false` — opt-in enforcement). Enable with `gsd config-set workflow.windows_enforce true`. Tracking (the ledger itself, populated by the executor) is always on; only the ship gate is opt-in.
+
+**Backward compatibility:** A project with no `.planning/WINDOWS.md` reports `open_count: 0` and ships cleanly; the gate only activates once windows are recorded.
 
 **Configuration:** `graphify.graph_path`

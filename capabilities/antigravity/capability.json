@@ -1,7 +1,7 @@
 {
   "id": "antigravity",
   "role": "runtime",
-  "version": "1.7.0-rc.6",
+  "version": "1.8.0",
   "title": "Antigravity",
   "description": "Google Antigravity IDE — nested under ~/.gemini/antigravity; probed across 1.x and 2.x layouts; Gemini hook event dialect; flat skill layout; tier-1 support.",
   "tier": "core",
@@ -88,7 +88,8 @@
       "hookBus": "host",
       "stateIO": "filesystem",
       "transport": "mcp",
-      "runtime": "go"
+      "runtime": "go",
+      "effortSurface": "undocumented"
     },
     "hostBehaviors": {
       "reviewerCli": true,

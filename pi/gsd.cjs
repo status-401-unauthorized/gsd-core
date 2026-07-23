@@ -9,8 +9,14 @@
  * This extension binds GSD's command surface to pi via the imperative adapter
  * path — the programmatic-CLI peer of the OpenCode worked binding.
  *
- * Installation: copy this file to ~/.pi/agent/extensions/gsd.cjs (pi loads
- * extensions via jiti from that dir). The engine is resolved from the installed
+ * Installation: copy this file to ~/.pi/agent/extensions/gsd.js — note the
+ * `.js` DEST suffix, not `.cjs`. pi auto-discovers extensions/ entries through
+ * `isExtensionFile()`, which accepts only `.ts`/`.js` and skips anything else
+ * SILENTLY (no error, no log line), so a `.cjs` dest installs fine and is then
+ * never loaded (#2470). This source file keeps its `.cjs` suffix on purpose —
+ * tests `require()` it directly and `.cjs` is unambiguous CommonJS — and pi
+ * loads the copied file via jiti, which handles CommonJS and ESM alike, so the
+ * suffix gates discovery, not parsing. The engine is resolved from the installed
  * GSD tree (walk-up like the OpenCode plugin). pi's shared hooks/ bundle
  * (hooks/*.js + hooks/lib/git-cmd.js) is installed alongside the extension —
  * capabilities/pi/capability.json does NOT set
@@ -191,10 +197,35 @@ function buildBeforeProviderRequestHandler({ tier = 'sonnet' } = {}) {
   return async function onBeforeProviderRequest(event, ctx) {
     try {
       const effectiveCwd = (ctx && ctx.cwd) || process.cwd();
-      const { resolveTierEntry } = require(path.join(GSD_CORE, 'bin', 'lib', 'model-resolver.cjs'));
       const { loadConfig } = require(path.join(GSD_CORE, 'bin', 'lib', 'config-loader.cjs'));
       const config = loadConfig(effectiveCwd);
       const overrides = (config && config.model_profile_overrides) || undefined;
+
+      // #2460: FAIL-OPEN when the user has not explicitly configured
+      // model_profile_overrides[runtime][tier]. pi is provider-agnostic
+      // (kimi-coding, zai, openrouter, openai-codex, minimax, anthropic, …);
+      // the built-in RUNTIME_PROFILE_MAP.pi.sonnet default is `claude-sonnet-5`,
+      // an Anthropic-ecosystem assumption that is wrong for every non-Anthropic
+      // provider. Returning the built-in default unconditionally rewrote every
+      // outgoing request to a model the active provider did not know.
+      //
+      // resolveTierEntry falls back to the built-in catalog when no override is
+      // present, so we cannot call it to detect "did the user opt in?" — we
+      // inspect the override map directly. Only when the user has explicitly
+      // set model_profile_overrides[runtime][tier] do we steer; otherwise we
+      // return undefined and pi's chosen model flows through untouched.
+      const userRaw = overrides && overrides.pi ? overrides.pi[tier] : undefined;
+      // `''` is treated the same as null/undefined: an explicit empty-string
+      // override is the user clearing a previously-set value, NOT opting in to
+      // steering. Without this guard, `resolveTierEntry`'s falsy `if (userRaw)`
+      // check would silently fall back to the built-in catalog and rewrite
+      // payload.model to claude-sonnet-5 — re-introducing the exact bug this
+      // handler exists to prevent.
+      if (userRaw === undefined || userRaw === null || userRaw === '') {
+        return undefined; // fail-open — leave pi's model untouched
+      }
+
+      const { resolveTierEntry } = require(path.join(GSD_CORE, 'bin', 'lib', 'model-resolver.cjs'));
       const entry = resolveTierEntry({ runtime: 'pi', tier, overrides });
       const modelId = entry && typeof entry.model === 'string' && entry.model.length > 0 ? entry.model : null;
       if (!modelId) return undefined; // fail-open — leave pi's model untouched
