@@ -1512,7 +1512,8 @@ const capabilities = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "harness-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -5116,7 +5117,8 @@ const runtimes = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "harness-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
