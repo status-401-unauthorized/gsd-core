@@ -176,7 +176,8 @@ const capabilities = {
           "maxDepth": "undocumented",
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -374,7 +375,8 @@ const capabilities = {
           "maxDepth": "undocumented",
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -505,7 +507,8 @@ const capabilities = {
           "maxDepth": 5,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "harness-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -514,6 +517,7 @@ const capabilities = {
         "runtime": "node",
         "effortSurface": "argv"
       },
+      "harnessIsolationFlag": "isolation=\"worktree\"",
       "hostBehaviors": {
         "attributionSource": "settings-json-commit",
         "authorsCanonicalWorkflow": true,
@@ -676,7 +680,8 @@ const capabilities = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "read-only",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -854,7 +859,8 @@ const capabilities = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -935,7 +941,8 @@ const capabilities = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "orchestrator-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -943,6 +950,14 @@ const capabilities = {
         "transport": "mcp",
         "runtime": "node",
         "effortSurface": "argv"
+      },
+      "orchestratorExec": {
+        "command": "codex",
+        "args": [
+          "exec"
+        ],
+        "cwdFlag": "--cd",
+        "promptFlag": null
       },
       "hostBehaviors": {
         "reapplyCommand": "$gsd-update --reapply",
@@ -1031,7 +1046,8 @@ const capabilities = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -1141,7 +1157,8 @@ const capabilities = {
           "maxDepth": 2,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "harness-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -1150,6 +1167,7 @@ const capabilities = {
         "runtime": "node",
         "effortSurface": "undocumented"
       },
+      "harnessIsolationFlag": "--worktree",
       "hostBehaviors": {
         "reapplyCommand": "gsd-update --reapply (mention the skill name)",
         "frontmatterDialect": "cursor",
@@ -1583,7 +1601,8 @@ const capabilities = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "read-only",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -1730,7 +1749,8 @@ const capabilities = {
           "maxDepth": -1,
           "background": true,
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -1824,7 +1844,8 @@ const capabilities = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "orchestrator-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -1832,6 +1853,14 @@ const capabilities = {
         "transport": "mcp",
         "runtime": "python",
         "effortSurface": "undocumented"
+      },
+      "orchestratorExec": {
+        "command": "kimi",
+        "args": [
+          "--print"
+        ],
+        "cwdFlag": "--work-dir",
+        "promptFlag": "--prompt"
       },
       "hostBehaviors": {
         "reapplyCommand": "/skill:gsd-update --reapply",
@@ -1909,13 +1938,20 @@ const capabilities = {
             "coder",
             "explore",
             "plan"
-          ]
+          ],
+          "isolation": "orchestrator-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
         "stateIO": "filesystem",
         "transport": "mcp",
         "runtime": "node"
+      },
+      "orchestratorExec": {
+        "command": "kimi",
+        "args": [],
+        "cwdFlag": null,
+        "promptFlag": "--prompt"
       },
       "hostBehaviors": {
         "reapplyCommand": "/skill:gsd-update --reapply",
@@ -2231,7 +2267,8 @@ const capabilities = {
           "maxDepth": "undocumented",
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "orchestrator-worktree"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -2239,6 +2276,14 @@ const capabilities = {
         "transport": "mcp",
         "runtime": "bun",
         "effortSurface": "argv"
+      },
+      "orchestratorExec": {
+        "command": "opencode",
+        "args": [
+          "run"
+        ],
+        "cwdFlag": "--dir",
+        "promptFlag": null
       },
       "hostBehaviors": {
         "reapplyCommand": "/gsd-update --reapply",
@@ -2355,7 +2400,8 @@ const capabilities = {
           "maxDepth": 0,
           "background": false,
           "backgroundDispatch": false,
-          "subagentToolkit": "undocumented"
+          "subagentToolkit": "undocumented",
+          "isolation": "none"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -2533,7 +2579,8 @@ const capabilities = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -2883,7 +2930,8 @@ const capabilities = {
           "maxDepth": "undocumented",
           "background": true,
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "engine",
@@ -3034,7 +3082,8 @@ const capabilities = {
           "maxDepth": 5,
           "background": true,
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "undocumented"
         },
         "modelMode": "active",
         "hookBus": "engine",
@@ -3114,7 +3163,8 @@ const capabilities = {
           "maxDepth": "undocumented",
           "background": "undocumented",
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "none"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -3223,7 +3273,8 @@ const capabilities = {
           "maxDepth": "undocumented",
           "background": false,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "none"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -4250,7 +4301,8 @@ const runtimes = {
           "maxDepth": "undocumented",
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -4365,7 +4417,8 @@ const runtimes = {
           "maxDepth": "undocumented",
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -4450,7 +4503,8 @@ const runtimes = {
           "maxDepth": 5,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "harness-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -4459,6 +4513,7 @@ const runtimes = {
         "runtime": "node",
         "effortSurface": "argv"
       },
+      "harnessIsolationFlag": "isolation=\"worktree\"",
       "hostBehaviors": {
         "attributionSource": "settings-json-commit",
         "authorsCanonicalWorkflow": true,
@@ -4533,7 +4588,8 @@ const runtimes = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "read-only",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -4650,7 +4706,8 @@ const runtimes = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -4731,7 +4788,8 @@ const runtimes = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "orchestrator-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -4739,6 +4797,14 @@ const runtimes = {
         "transport": "mcp",
         "runtime": "node",
         "effortSurface": "argv"
+      },
+      "orchestratorExec": {
+        "command": "codex",
+        "args": [
+          "exec"
+        ],
+        "cwdFlag": "--cd",
+        "promptFlag": null
       },
       "hostBehaviors": {
         "reapplyCommand": "$gsd-update --reapply",
@@ -4827,7 +4893,8 @@ const runtimes = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -4937,7 +5004,8 @@ const runtimes = {
           "maxDepth": 2,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "harness-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -4946,6 +5014,7 @@ const runtimes = {
         "runtime": "node",
         "effortSurface": "undocumented"
       },
+      "harnessIsolationFlag": "--worktree",
       "hostBehaviors": {
         "reapplyCommand": "gsd-update --reapply (mention the skill name)",
         "frontmatterDialect": "cursor",
@@ -5136,7 +5205,8 @@ const runtimes = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "read-only",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -5231,7 +5301,8 @@ const runtimes = {
           "maxDepth": -1,
           "background": true,
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -5325,7 +5396,8 @@ const runtimes = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "orchestrator-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -5333,6 +5405,14 @@ const runtimes = {
         "transport": "mcp",
         "runtime": "python",
         "effortSurface": "undocumented"
+      },
+      "orchestratorExec": {
+        "command": "kimi",
+        "args": [
+          "--print"
+        ],
+        "cwdFlag": "--work-dir",
+        "promptFlag": "--prompt"
       },
       "hostBehaviors": {
         "reapplyCommand": "/skill:gsd-update --reapply",
@@ -5410,13 +5490,20 @@ const runtimes = {
             "coder",
             "explore",
             "plan"
-          ]
+          ],
+          "isolation": "orchestrator-worktree"
         },
         "modelMode": "passive",
         "hookBus": "host",
         "stateIO": "filesystem",
         "transport": "mcp",
         "runtime": "node"
+      },
+      "orchestratorExec": {
+        "command": "kimi",
+        "args": [],
+        "cwdFlag": null,
+        "promptFlag": "--prompt"
       },
       "hostBehaviors": {
         "reapplyCommand": "/skill:gsd-update --reapply",
@@ -5508,7 +5595,8 @@ const runtimes = {
           "maxDepth": "undocumented",
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": true
+          "backgroundDispatch": true,
+          "isolation": "orchestrator-worktree"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -5516,6 +5604,14 @@ const runtimes = {
         "transport": "mcp",
         "runtime": "bun",
         "effortSurface": "argv"
+      },
+      "orchestratorExec": {
+        "command": "opencode",
+        "args": [
+          "run"
+        ],
+        "cwdFlag": "--dir",
+        "promptFlag": null
       },
       "hostBehaviors": {
         "reapplyCommand": "/gsd-update --reapply",
@@ -5578,7 +5674,8 @@ const runtimes = {
           "maxDepth": 0,
           "background": false,
           "backgroundDispatch": false,
-          "subagentToolkit": "undocumented"
+          "subagentToolkit": "undocumented",
+          "isolation": "none"
         },
         "modelMode": "active",
         "hookBus": "host",
@@ -5679,7 +5776,8 @@ const runtimes = {
           "maxDepth": 1,
           "background": true,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -5779,7 +5877,8 @@ const runtimes = {
           "maxDepth": "undocumented",
           "background": true,
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "engine",
@@ -5835,7 +5934,8 @@ const runtimes = {
           "maxDepth": 5,
           "background": true,
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "undocumented"
         },
         "modelMode": "active",
         "hookBus": "engine",
@@ -5915,7 +6015,8 @@ const runtimes = {
           "maxDepth": "undocumented",
           "background": "undocumented",
           "subagentToolkit": "undocumented",
-          "backgroundDispatch": "undocumented"
+          "backgroundDispatch": "undocumented",
+          "isolation": "none"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -6024,7 +6125,8 @@ const runtimes = {
           "maxDepth": "undocumented",
           "background": false,
           "subagentToolkit": "full",
-          "backgroundDispatch": false
+          "backgroundDispatch": false,
+          "isolation": "none"
         },
         "modelMode": "passive",
         "hookBus": "host",
