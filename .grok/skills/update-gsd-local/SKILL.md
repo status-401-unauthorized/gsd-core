@@ -34,8 +34,10 @@ Run from the **gsd-core** repo root (the tree that contains `bin/install.js`,
 3. Preferred branch: local `grok-build` tracking `fork/grok-build`. If on another
    branch, tell the user and ask whether to switch to `grok-build` or update the
    current branch instead.
-4. Node.js ≥ 22 and npm ≥ 10 (see `package.json` engines). `npm install` must be
-   viable if `node_modules` is missing or stale.
+4. Node.js ≥ 22 and npm ≥ 10 (see `package.json` engines). Prefer **nvm** +
+   repo-root **`.nvmrc`** (major pin, e.g. `22`). `npm install` must be viable if
+   `node_modules` is missing or stale. System Node with npm &lt; 10 may still run
+   some steps but fails engines when npm is below 10 — activate nvm before Step 6.
 
 Record before any mutation:
 
@@ -292,9 +294,26 @@ node --test tests/grok-upgrades.test.cjs
 
 ### 6. Build the TypeScript / generated libs
 
+**Always activate the Node version from `.nvmrc` before any `npm` / build
+command.** Agent non-interactive shells often lack nvm as a function — load it
+first, then `nvm use` from the repo root:
+
+```bash
+# Load nvm if needed (nvm is a shell function, not a binary on PATH)
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
+# Fail early if nvm or the pin is unavailable
+command -v nvm >/dev/null || { echo "nvm not available; install nvm or fix NVM_DIR"; exit 1; }
+nvm use          # reads repo-root .nvmrc (e.g. 22 → latest matching Node)
+# If the version is missing: nvm install   # then nvm use again
+node -v && npm -v   # expect Node ≥22 and npm ≥10 per package.json engines
+```
+
 Default post-merge build (covers tsc, Grok descriptor registry, hooks):
 
 ```bash
+# After nvm use (required):
 # If deps missing or package-lock changed substantially:
 npm install
 
@@ -307,6 +326,7 @@ When unsure what drifted (capability registry, loop-host contract, plugin skills
 hooks), prefer the full pipeline:
 
 ```bash
+# After nvm use (required):
 npm run build
 ```
 
@@ -530,8 +550,8 @@ Summarize for the user:
 3. **Fork analysis:** each Grok delta → keep / adapt / drop + one-line rationale;
    call out hostIntegration / isolation decision explicitly.
 4. **Code adjustments:** what was implemented after analysis (or “none”).
-5. **Build:** success/fail, commands run (`build:lib` / `gen:capability-registry` /
-   `build:hooks` / full `build`).
+5. **Build:** success/fail, note `nvm use` / Node+npm versions, then commands
+   (`build:lib` / `gen:capability-registry` / `build:hooks` / full `build`).
 6. **Install:** success/fail, command `node bin/install.js --grok --global`, target
    home, VERSION match.
 7. **Verify:** VERSION, runtime marker, skill/agent counts, hooks presence,
@@ -562,6 +582,9 @@ Summarize for the user:
   - `capabilities/**` → `npm run gen:capability-registry`
   - never long-lived hand merges of generated files
 - Do not treat `build:lib` as sufficient for descriptor/registry changes.
+- Do not run `npm install` / `build:lib` / `gen:capability-registry` / tests /
+  install without **`nvm use`** (after loading `$NVM_DIR/nvm.sh` if needed) so
+  Node/npm match `.nvmrc` and `package.json` engines.
 
 ## Quick reference
 
@@ -570,6 +593,7 @@ Summarize for the user:
 git fetch origin next
 git checkout grok-build
 git merge origin/next   # resolve + analyze Grok deltas + hostIntegration parity
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}" && . "$NVM_DIR/nvm.sh" && nvm use
 npm install             # if lockfile / deps changed
 npm run build:lib
 npm run gen:capability-registry   # required; not covered by build:lib
