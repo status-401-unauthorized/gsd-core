@@ -1519,7 +1519,8 @@ const capabilities = {
         "hookBus": "host",
         "stateIO": "filesystem",
         "transport": "mcp",
-        "runtime": "node"
+        "runtime": "node",
+        "effortSurface": "undocumented"
       }
     }
   },
@@ -5124,7 +5125,8 @@ const runtimes = {
         "hookBus": "host",
         "stateIO": "filesystem",
         "transport": "mcp",
-        "runtime": "node"
+        "runtime": "node",
+        "effortSurface": "undocumented"
       }
     }
   },
