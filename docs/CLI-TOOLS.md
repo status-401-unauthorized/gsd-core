@@ -127,6 +127,8 @@ node gsd-tools.cjs phase insert <after> <description>
 node gsd-tools.cjs phase remove <phase> [--force]
 
 # Mark phase complete, update state + roadmap
+# Also emits advisory `warnings[]` when a phase SUMMARY references a file that
+# is not on disk — see "Phase SUMMARY artifact check" below.
 node gsd-tools.cjs phase complete <phase>
 
 # Evaluate HUMAN-UAT results for a phase (markdown-aware; ignores false-positive contexts)
@@ -139,6 +141,31 @@ node gsd-tools.cjs phase-plan-index <phase>
 # List phases with filtering
 node gsd-tools.cjs phases list [--type planned|executed|all] [--phase N] [--include-archived]
 ```
+
+### Phase SUMMARY artifact check
+
+A phase `SUMMARY.md` asserts which files the phase created or modified. On
+`phase complete`, each SUMMARY in the phase is scanned for referenced file paths
+and any path that is not on disk is reported in the command's existing
+`warnings[]` array — the case where a summary reports work that never landed.
+
+**Advisory only.** Findings never block completion; the completion gate is the
+phase's `VERIFICATION.md` status, which this does not touch. `/gsd-execute-phase`
+surfaces the warnings before advancing.
+
+Scope and limits, so the output is not read as more than it is:
+
+- Paths are recovered heuristically from the SUMMARY body — backticked paths and
+  `Created:`/`Modified:`-style lines. Globs, URLs, bare hostnames, and paths
+  resolving outside the project are skipped rather than reported.
+- The `key-files:` frontmatter block is **not** read. Its YAML flow-sequence form
+  (`created: [a.ts, b.ts]`) is not matched by the prose scan, so a summary whose
+  only file claims live there produces no findings.
+- Commit hashes in the SUMMARY are **not** resolved here. The pattern matches any
+  hex-shaped token in prose, which is too loose to surface.
+
+Every path the scan does recover is checked — there is no cap. The standalone
+`verify-summary` verb keeps its historical default of checking the first two.
 
 ---
 
@@ -292,6 +319,47 @@ node gsd-tools.cjs query eval.score --covered 3 --total 5 --infra ok,partial,mis
 ```
 
 This command is strictly read-only — no config writes, no disk mutation.
+
+---
+
+### `query context-predicates`
+
+```bash
+node gsd-tools.cjs query context-predicates --class <CLASS> | --prefix <dotted.prefix> | --contains <text>
+```
+
+Selector surface for the `CONTEXT.md` predicate fact-store (ADR-1671, #2928). Parses the repo-root `CONTEXT.md` **live** on every call via the compiled `context-predicates.cjs` — it never reads the committed `docs/CONTEXT-INDEX.json` (that artifact is a CI drift-guard byproduct, not a query source, so it can never go stale relative to the live predicates it answers about).
+
+**Selectors** (at least one required; when more than one is given they are ANDed together):
+
+| Flag | Type | Description |
+|---|---|---|
+| `--class <CLASS>` | string | Exact match on the predicate's class (the segment before the first `.`) |
+| `--prefix <dotted.prefix>` | string | Match predicate ids starting with this dotted prefix |
+| `--contains <text>` | string | Case-insensitive substring match against `id + ' ' + value` |
+
+Each flag also accepts the inline-assignment form (`--contains=<text>`), which is the escape
+hatch for a flag-shaped value the space-separated form cannot express — e.g.
+`--contains=--dry-run` to search for the literal substring `--dry-run`. The space-separated form
+(`--contains --dry-run`) always reads a following `--...` token as a missing value, by design.
+
+**Output JSON:**
+
+```json
+{
+  "matched": 2,
+  "predicates": [
+    { "id": "RULESET.EXAMPLE", "klass": "RULESET", "value": "…", "line": 42, "section": "Glossary" }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `matched` | number | Count of predicates satisfying all given selectors |
+| `predicates` | array | Each entry is a live `Predicate` — `id`, `klass`, `value`, `line` (1-based source line), `section` (nearest enclosing heading) |
+
+This command is strictly read-only — no config writes, no disk mutation. See [ADR-1671](adr/1671-dynamic-context-management-platform.md) and [Architecture — CLI Tools](ARCHITECTURE.md#cli-tools-gsd-corebin).
 
 ---
 
@@ -712,6 +780,7 @@ User-facing entry point: `/gsd-graphify` (see [Command Reference](COMMANDS.md#gs
 | Audit | `lib/audit.cjs` | Phase/milestone audit queue handlers; `audit-open` helper |
 | GSD2 Import | `lib/gsd2-import.cjs` | Reverse-migration importer from GSD-2 projects (backs `/gsd-import --from-gsd2`) |
 | Intel | `lib/intel.cjs` | Queryable codebase intelligence index (backs `/gsd-map-codebase --query`) |
+| Context Predicates | `lib/context-predicates.cjs` | `CONTEXT.md` predicate fact-store parser/selector (ADR-1671, #2928) — backs `query context-predicates` and `scripts/gen-context-index.cjs`'s `docs/CONTEXT-INDEX.json` drift guard |
 | Capability State | `lib/capability-state.cjs` | Capability-state resolver — composes install profile, surface, and config into per-capability `enabled`/`active` view |
 | Capability Writer | `lib/capability-writer.cjs` | Capability-state writer (ADR-1213) — write-side inverse; projects `--on`/`--off`/`--gate` onto surface + config substrates then re-resolves |
 | Worktree Base Ref | `lib/worktree-base-ref.cjs` | Worktree fork-base detection and `worktree base-check` / `set-baseref` commands (#683) |

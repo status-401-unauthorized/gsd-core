@@ -26,7 +26,7 @@ import configLoaderMod = require('./config-loader.cjs');
 const { loadConfig } = configLoaderMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- core-utils.cjs is an export= CommonJS module
 import coreUtilsMod = require('./core-utils.cjs');
-const { toPosixPath, generateSlugInternal, readSubdirectories } = coreUtilsMod;
+const { toPosixPath, generateSlugInternal, readSubdirectories, findUnsummarizedPlans } = coreUtilsMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- phase-id.cjs is an export= CommonJS module
 import phaseIdMod = require('./phase-id.cjs');
 const {
@@ -62,6 +62,11 @@ import uatPredicate = require('./uat-predicate.cjs');
 const { evaluateUatPassed } = uatPredicate;
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- verification.cjs is an export= CommonJS module
 import verificationMod = require('./verification.cjs');
+// #2572: the artifact↔disk core behind the `verify-summary` verb. `verify.cts`
+// has no transitive import path back to `phase.cts`, so this edge introduces no
+// cycle (the reverse edge, `state.cts → verify.cjs`, would).
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- verify.cjs is an export= CommonJS module
+import verifyMod = require('./verify.cjs');
 const { readVerificationStatus } = verificationMod;
 
 const { planningDir, withPlanningLock, listAvailableWorkstreams, getActiveWorkstream } =
@@ -1593,24 +1598,56 @@ function cmdPhaseRemove(
   );
 
   const statePath = path.join(planningDir(cwd), 'STATE.md');
+  let stateUpdated = false;
   if (fs.existsSync(statePath)) {
-    readModifyWriteStateMd(
+    // #2640: report whether STATE.md content actually changed, not just file
+    // existence (fs.existsSync was trivially true). Also ensure the body
+    // transform produces a diff so readModifyWriteStateMd's no-op guard
+    // (#948) doesn't skip the frontmatter resync — without that, the
+    // progress.* frontmatter block stays stale when the body has no
+    // 'Total Phases:' or 'of N' phrase.
+    stateUpdated = readModifyWriteStateMd(
       statePath,
       (stateContent: string) => {
-        const totalRaw = stateExtractField(stateContent, 'Total Phases');
+        let modified = stateContent;
+        const totalRaw = stateExtractField(modified, 'Total Phases');
         if (totalRaw) {
-          stateContent =
-            stateReplaceField(stateContent, 'Total Phases', String(parseInt(totalRaw, 10) - 1)) ||
-            stateContent;
+          modified =
+            stateReplaceField(modified, 'Total Phases', String(parseInt(totalRaw, 10) - 1)) ||
+            modified;
         }
-        const ofMatch = stateContent.match(/(\bof\s+)(\d+)(\s*(?:\(|phases?))/i);
+        const ofMatch = modified.match(/(\bof\s+)(\d+)(\s*(?:\(|phases?))/i);
         if (ofMatch) {
-          stateContent = stateContent.replace(
+          modified = modified.replace(
             /(\bof\s+)(\d+)(\s*(?:\(|phases?))/i,
             `$1${parseInt(ofMatch[2], 10) - 1}$3`,
           );
         }
-        return stateContent;
+        // #2640: if neither body field was found, the transform is a no-op.
+        // readModifyWriteStateMd's no-op guard (#948) would then skip the
+        // frontmatter resync, leaving progress.* stale. Force a body diff
+        // ONLY when a phase directory was actually removed (targetDir !== null)
+        // so the guard passes and syncStateFrontmatter rebuilds the frontmatter
+        // from the post-deletion disk/ROADMAP state. Without the targetDir gate,
+        // a no-op removal (ROADMAP-only phase, no directory) would inject a
+        // spurious 'Total Phases:' line into a body that intentionally lacked one.
+        if (targetDir && modified === stateContent) {
+          // subdirs was read before the deletion; excluding the removed target
+          // gives the remaining count. Renumbering changes names but not count.
+          const remainingPhases = subdirs.filter(
+            (d) => phaseTokenMatches(d, normalized) === false,
+          ).length;
+          if (totalRaw) {
+            modified =
+              stateReplaceField(modified, 'Total Phases', String(remainingPhases)) || modified;
+          } else {
+            // No 'Total Phases:' field in the body — append one so the no-op
+            // guard sees a diff. syncStateFrontmatter will then rebuild the
+            // frontmatter progress.* block from the real disk/ROADMAP count.
+            modified = `Total Phases: ${remainingPhases}\n` + modified;
+          }
+        }
+        return modified;
       },
       cwd,
     );
@@ -1623,7 +1660,7 @@ function cmdPhaseRemove(
       renamed_directories: renamedDirs,
       renamed_files: renamedFiles,
       roadmap_updated: true,
-      state_updated: fs.existsSync(statePath),
+      state_updated: stateUpdated,
     },
     raw,
   );
@@ -1722,6 +1759,82 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
   const warnings: string[] = [];
   const phaseFullDir = path.join(cwd, phaseInfo['directory'] as string);
 
+  // #2648: fail-closed plan-coverage gate. phase.complete used to gate ONLY on a
+  // single *-VERIFICATION.md status, so a phase could close "complete" while an
+  // arbitrary number of its plans — including plans a lock/recovery decision
+  // silently dropped — had no completion record (a confirmed production incident
+  // closed a phase with 6/30 plans unexecuted, including its entire final UI
+  // scope, with every tool-reported signal green). Now refuse completion when any
+  // plan lacks a matching *-SUMMARY.md, UNLESS that plan is explicitly retired
+  // via machine-readable `status: superseded` frontmatter (the #2349 marker).
+  //
+  // scanPhasePlans is the superseded-AWARE counter (it drops status: superseded
+  // plans from planFiles before returning), so a deliberately-retired plan never
+  // appears in the unsummarized set and never blocks completion — closing the
+  // Goodhart hole (delete a SUMMARY to raise the %) without regressing the
+  // legitimate lock/recovery pattern (retire a plan instead of executing it).
+  // This is evaluated BEFORE the verification-gate transaction below so a
+  // plan-coverage refusal fails fast without mutating ROADMAP/STATE. The count
+  // path (cmdPhaseComplete's own planCount/summaryCount above) is NOT superseded-
+  // aware (it comes from findPhaseInternal/phase-locator.cts); that is fine for
+  // DISPLAY (the X/Y cell) but must not be the gate — the gate needs the
+  // superseded-adjusted set so retired plans don't re-block the very phases the
+  // marker exists to unblock. Matches roadmap.cts's already-correct-but-unenforced
+  // `summaryCount >= planCount` predicate, now enforced at the completion seam.
+  const coverageScan = scanPhasePlans(phaseFullDir);
+  // #2648 security: fail CLOSED when the phase directory cannot be read.
+  // scanPhasePlans deliberately swallows readdirSync errors and returns an empty
+  // plan set ({planFiles: []}), which is indistinguishable from a readable empty
+  // phase. For a COVERAGE gate that is the wrong posture: "I could not read the
+  // plans" must mean "I cannot prove coverage," not "all plans are summarized" —
+  // otherwise any I/O failure (permissions, ENOTDIR, EBUSY on Windows, a dir
+  // present in ROADMAP.md but missing/unreadable on disk) silently re-opens the
+  // exact hole this gate exists to close. Distinguish the two: a readable
+  // directory with zero plans is a legitimately complete empty phase; an
+  // UNREADABLE directory is a fail-closed refusal. Mirrors cmdPhaseInsert's own
+  // readdirSync-fail-closed posture (a swallow there used to risk writing a
+  // colliding phase number).
+  try {
+    fs.readdirSync(phaseFullDir);
+  } catch (readErr) {
+    error(
+      `Phase ${phaseNum} cannot be completed: its plan directory is unreadable (${phaseInfo['directory'] as string}: ${(readErr as NodeJS.ErrnoException).code || (readErr as Error).message}), so plan coverage cannot be verified. Restore read access and retry — a coverage gate that passes when it cannot read the plans is no gate at all (#2648).`,
+      ERROR_REASON.PHASE_PLAN_COVERAGE_INCOMPLETE,
+    );
+  }
+  const unsummarizedPlans = findUnsummarizedPlans(
+    coverageScan.planFiles,
+    coverageScan.summaryFiles,
+  );
+  if (unsummarizedPlans.length > 0) {
+    // Sanitize plan filenames before interpolation: they come raw from
+    // readdirSync and could carry C0 control chars / DEL (a committable filename
+    // could spoof the terminal in plain-error mode). Strip them so the message is
+    // safe to print regardless of --json-errors. Path traversal sequences are not
+    // a code-execution vector here (printed only, never reopened from the message).
+    const sanitize = (name: string): string => name.replace(/[\u0000-\u001f\u007f]/g, '?');
+    const listed = unsummarizedPlans.slice(0, 20).map(sanitize).join(', ');
+    const more = unsummarizedPlans.length > 20 ? ` (and ${unsummarizedPlans.length - 20} more)` : '';
+    // Audit surface (#2648 review M1): name how many plans were excluded as
+    // superseded so a reviewer can see WHICH work was declared retired, not just
+    // that some plans are missing summaries. The status: superseded marker is a
+    // committable, review-time-trusted bypass; surfacing its count keeps that
+    // bypass visible rather than silent.
+    const phaseInfoPlanCount = Array.isArray(phaseInfo['plans']) ? (phaseInfo['plans'] as string[]).length : 0;
+    const supersededCount =
+      coverageScan.planFiles.length === 0 ? 0 : Math.max(0, phaseInfoPlanCount - coverageScan.planFiles.length);
+    const supersededNote = supersededCount > 0
+      ? ` ${supersededCount} plan(s) excluded as status: superseded (retired).`
+      : '';
+    error(
+      `Phase ${phaseNum} cannot be completed: ${unsummarizedPlans.length} plan(s) have no completion record (*-SUMMARY.md): ${listed}${more}.` +
+        supersededNote +
+        ` Execute the plans and write their summaries, or retire a plan with machine-readable \`status: superseded\` frontmatter (#2349) if it was deliberately dropped — a retired plan is excluded from this gate. ` +
+        `Completing a phase with unexecuted plans is what lost an entire promised deliverable silently (#2648).`,
+      ERROR_REASON.PHASE_PLAN_COVERAGE_INCOMPLETE,
+    );
+  }
+
   try {
     const phaseFiles = fs.readdirSync(phaseFullDir);
 
@@ -1755,6 +1868,50 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
      * actual completion GATE is readVerificationStatus below (a separate
      * mechanism). A readdirSync/readFileSync failure here just means fewer
      * warnings are surfaced this run, not a blocked or corrupted completion. */
+  }
+
+  // #2572: artifact↔disk advisory for the SUMMARYs of the phase being completed.
+  //
+  // A SUMMARY asserts "I created these files". Nothing checked that claim for
+  // phase summaries — the `verify-summary` verb has existed since the beginning
+  // but was only ever pointed at `.planning/research/SUMMARY.md`. An interrupted
+  // or over-reported phase therefore counted toward 100% silently.
+  //
+  // Joins the same ADVISORY channel as the pre-scan above: findings land in
+  // `warnings[]` (rendered by execute-phase.md's "If has_warnings is true"
+  // step), never in the completion GATE (readVerificationStatus below).
+  // Completion is never blocked.
+  //
+  // `checkCommits: false` — only the file-existence half is surfaced here, so
+  // the `git cat-file` probes would be spawned and their result discarded. The
+  // hash pattern is a loose `\b[0-9a-f]{7,40}\b` that matches any hex-shaped
+  // token in prose, too noisy to put in front of a user even as a warning.
+  //
+  // `Infinity` — report every referenced file, not the CLI verb's default first
+  // two, so a phase that lists twelve files and landed three says so. The verb
+  // keeps its 2-file default; only this caller opts out of the cap.
+  try {
+    const phaseDirRel = phaseInfo['directory'] as string;
+    // `summaries` arrives pre-sorted from the phase locator, so warning order is
+    // deterministic across platforms rather than readdir-dependent.
+    const summaryNames = (phaseInfo['summaries'] as string[] | undefined) || [];
+    for (const summaryName of summaryNames) {
+      const v = verifyMod.verifySummaryCore(
+        cwd,
+        `${phaseDirRel}/${summaryName}`,
+        Infinity,
+        { checkCommits: false },
+      );
+      const missing = v.checks.files_created.missing;
+      if (missing.length > 0) {
+        warnings.push(
+          `${summaryName}: references ${missing.length} file(s) not on disk: ${missing.join(', ')}`,
+        );
+      }
+    }
+  } catch {
+    /* best-effort, same posture as the #2245 pre-scan above: an unreadable
+     * SUMMARY means one fewer advisory this run, never a blocked completion. */
   }
 
   let nextPhaseNum: string | null = null;
@@ -2029,7 +2186,9 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
               // Complete" gate is folded into the newValue callback so one
               // updateTableCell call both probes and writes.
               const reqUpdate = updateTraceabilityCell(reqContent, reqRowMatch, 'Status', (current) =>
-                /^(?:pending|in progress)$/i.test(current.trim()) ? ' Complete ' : current);
+                // #2788: accept `Gaps Found` too so a phase stranded by revert-phase (the
+                // gaps_found response) can complete without hand-editing the table.
+                /^(?:pending|in progress|gaps found)$/i.test(current.trim()) ? ' Complete ' : current);
               if (reqUpdate.ok) {
                 reqContent = reqUpdate.value;
               } else if (!isPlaceholderReqId(reqId)) {
@@ -2407,7 +2566,15 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
           planCount,
           summaryCount,
         );
-        stateContent = syncStateFrontmatter(stateContent, cwd);
+        // #2736: the transition holds the next phase's exact display name in
+        // the intent; pass it as authoritative so the sync's prose
+        // re-derivation cannot rewrite current_phase_name to the name's own
+        // parenthetical (`Closer-ruling measurement (D1a)` → `D1a`).
+        stateContent = syncStateFrontmatter(
+          stateContent,
+          cwd,
+          nextPhaseDisplayName ? { current_phase_name: nextPhaseDisplayName } : undefined,
+        );
 
         writes.push({ filePath: statePath, before: originalStateContent, after: stateContent });
       }

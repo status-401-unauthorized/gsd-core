@@ -125,7 +125,7 @@ fi
 
 When `USE_WORKTREES` is `false`, `ISOLATION` is forced to `none`: executors run sequentially on the main working tree. The per-plan decision below has no effect when worktrees are project-disabled.
 
-`USE_WORKTREES` and `ISOLATION` are also reset for the run when `worktree base-check` detects the orchestrator HEAD has diverged from the worktree fork base (#683 — e.g. an unmerged milestone branch). This runs for **any** isolated run, not only Claude: fork-base divergence is a property of the repository, so it degrades a GSD-created worktree exactly as a harness-created one. The auto-degrade prints a one-line warning to stderr and falls through to the sequential path so executors do not hit the exit-42 worktree-branch-check halt. To restore parallel worktree execution, set `worktree.baseRef:"head"` in `.claude/settings.local.json` (or run `gsd-tools worktree set-baseref`) — this makes the fork base track the live HEAD instead of a fixed remote ref. The `worktree-branch-check` exit-42 guard inside each executor remains in place as a backstop.
+`USE_WORKTREES` and `ISOLATION` are also reset for the run when `worktree base-check` detects the orchestrator HEAD has diverged from the worktree fork base (#683 — e.g. an unmerged milestone branch). This runs for **any** isolated run, not only Claude: fork-base divergence is a property of the repository, so it degrades a GSD-created worktree exactly as a harness-created one. The auto-degrade prints a one-line warning to stderr and falls through to the sequential path so executors do not hit the exit-42 worktree-branch-check halt. To restore parallel worktree execution, set `worktree.baseRef:"head"` in `.claude/settings.local.json` (or run `gsd_run worktree set-baseref`) — this makes the fork base track the live HEAD instead of a fixed remote ref. The `worktree-branch-check` exit-42 guard inside each executor remains in place as a backstop.
 
 Read context window size for adaptive prompt enrichment:
 
@@ -440,11 +440,56 @@ pin to `git worktree list`'s first entry — that is the main worktree, the wron
 when the orchestrator legitimately runs from a feature worktree.
 
 ```bash
+# gsd:guard=orchestrator-cwd-drift
 ORCHESTRATOR_WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
   echo "FATAL: execute_waves entry is not inside a git worktree (#48)." >&2; exit 1; }
 ORCH_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 if printf '%s' "$ORCH_BRANCH" | grep -Eq '^(worktree-)?agent-'; then
   echo "FATAL: orchestrator cwd is inside an agent worktree (branch '$ORCH_BRANCH', root '$ORCHESTRATOR_WT') — refusing to execute waves (#48). A prior isolation=\"worktree\" dispatch drifted the cwd; re-run from the orchestrator's own worktree." >&2
+  # #1856 handoff: the refusal above is correct, but on its own it is a dead end —
+  # this worktree may hold committed fixes AND uncommitted work, and "re-run from
+  # the orchestrator's worktree" silently means abandoning them. Report exactly
+  # what is stranded and how to integrate it. Every command here is DIAGNOSTIC:
+  # each is `|| true`-guarded so a failure degrades to the plain refusal above
+  # rather than crashing before the message prints.
+  _WT_BASE=""
+  for _ref in "$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)" \
+              origin/next origin/main next main; do
+    [ -n "$_ref" ] || continue
+    if git rev-parse --verify --quiet "$_ref" >/dev/null 2>&1; then _WT_BASE="$_ref"; break; fi
+  done
+  _WT_AHEAD=""
+  [ -n "$_WT_BASE" ] && _WT_AHEAD=$(git rev-list --count "$_WT_BASE..HEAD" 2>/dev/null || true)
+  # Count BEFORE truncating, so a long list reports its true size rather than
+  # under-reporting what is stranded — which is the whole point of this report.
+  _WT_DIRTY_ALL=$(git status --porcelain 2>/dev/null || true)
+  _WT_DIRTY_N=0
+  [ -n "$_WT_DIRTY_ALL" ] && _WT_DIRTY_N=$(printf '%s\n' "$_WT_DIRTY_ALL" | wc -l | tr -d ' ')
+  _WT_HAS_COMMITS=0
+  [ -n "$_WT_AHEAD" ] && [ "$_WT_AHEAD" -gt 0 ] 2>/dev/null && _WT_HAS_COMMITS=1
+
+  echo "" >&2
+  echo "── Handoff: what is in this worktree (#1856) ──" >&2
+  if [ "$_WT_HAS_COMMITS" -eq 1 ]; then
+    echo "  $_WT_AHEAD commit(s) on '$ORCH_BRANCH' not on '$_WT_BASE':" >&2
+    git log --oneline --no-decorate "$_WT_BASE..HEAD" 2>/dev/null | head -20 | sed 's/^/    /' >&2 || true
+    [ "$_WT_AHEAD" -gt 20 ] 2>/dev/null && echo "    … and $((_WT_AHEAD - 20)) more" >&2
+    echo "  These live ONLY on this branch. Switching away without integrating loses them." >&2
+  fi
+  if [ -n "$_WT_DIRTY_ALL" ]; then
+    echo "  $_WT_DIRTY_N uncommitted change(s) still in this worktree:" >&2
+    printf '%s\n' "$_WT_DIRTY_ALL" | head -20 | sed 's/^/    /' >&2
+    [ "$_WT_DIRTY_N" -gt 20 ] 2>/dev/null && echo "    … and $((_WT_DIRTY_N - 20)) more" >&2
+  fi
+  if [ "$_WT_HAS_COMMITS" -eq 1 ] || [ -n "$_WT_DIRTY_ALL" ]; then
+    echo "" >&2
+    echo "  To integrate before continuing:" >&2
+    [ -n "$_WT_DIRTY_ALL" ] && echo "    1. git add -A && git commit -m 'wip: recover worktree state'   # from THIS worktree" >&2
+    echo "    2. cd <orchestrator worktree>   # a checkout whose branch is NOT agent-*/worktree-agent-*" >&2
+    echo "    3. git merge --no-ff $ORCH_BRANCH        # or: git cherry-pick <sha>...  for selected commits" >&2
+    echo "    4. re-run the phase from there" >&2
+    echo "  Verify with: git log --oneline ${_WT_BASE:-HEAD}..$ORCH_BRANCH" >&2
+  fi
   exit 1
 fi
 # Pin to the worktree root; each later orchestrator-side block re-pins the same way
@@ -1126,6 +1171,7 @@ If an active secure-phase step hook exists AND SECURITY.md exists: check frontma
 ```
 </step>
 
+<!-- gsd:section id="partial-wave" when="flag:--wave" -->
 <step name="handle_partial_wave_execution">
 If `WAVE_FILTER` was used, re-run plan discovery after execution:
 
@@ -1156,6 +1202,7 @@ Selected wave finished successfully. This phase still has incomplete plans, so p
 - continue with the normal phase-level verification and completion flow below
 - this means the selected wave happened to be the last remaining work in the phase
 </step>
+<!-- /gsd:section -->
 
 <step name="code_review_gate" required="true">
 **This step is REQUIRED to evaluate the capability hook.** When the code-review capability is active, auto-invoke code review on the phase's source changes. Advisory only — never blocks execution flow. Also dispatches advisory execute:post gate hooks (e.g. tdd.review-checkpoint).
@@ -1210,6 +1257,7 @@ Resolve and re-run /gsd execute-phase, or override with /gsd execute-phase {phas
 **Proceed rule:** If `MVP_MODE && TDD_MODE && GATE_RESULT.block == true` for `tdd.review-checkpoint`: STOP — do NOT proceed to `close_parent_artifacts`, `regression_gate`, `verify_phase_goal`, or `phase.complete`. Otherwise proceed normally.
 </step>
 
+<!-- gsd:section id="gap-closure-artifacts" when="state:gap-closure-phase" -->
 <step name="close_parent_artifacts">
 **For decimal/polish phases only (X.Y pattern):** Close the feedback loop by resolving parent UAT and debug artifacts.
 
@@ -1259,7 +1307,9 @@ mv .planning/debug/{slug}.md .planning/debug/resolved/
 gsd_run query commit "docs(phase-${PARENT_PHASE}): resolve UAT gaps and debug sessions after ${PHASE_NUMBER} gap closure" --files .planning/phases/*${PARENT_PHASE}*/*-UAT.md .planning/debug/resolved/*.md
 ```
 </step>
+<!-- /gsd:section -->
 
+<!-- gsd:section id="regression-gate" when="state:has-prior-phases" -->
 <step name="regression_gate">
 Run prior phases' test suites to catch cross-phase regressions BEFORE verification.
 
@@ -1308,6 +1358,7 @@ Options:
 
 If `TEXT_MODE` is true, present as a plain-text numbered list and ask the user to type their choice number. Otherwise, use AskUserQuestion to present the options.
 </step>
+<!-- /gsd:section -->
 
 <step name="verify_phase_goal">
 Verify phase achieved its GOAL, not just completed tasks.
