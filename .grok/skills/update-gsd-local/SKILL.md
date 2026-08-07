@@ -95,7 +95,10 @@ feat: add Grok Build as a first-class installable runtime
 feat(grok): native hooks, Grok 4.5 model tiers, and expanded adapters
 fix(grok): rewrite Claude tool names to Grok natives on install
 fix(grok): declare dispatch.isolation harness-worktree after origin/next
+fix(grok): declare effortSurface undocumented after origin/next
 chore: regenerate bin/lib after origin/next merge
+chore(grok): track /update-gsd-local skill in-repo
+chore(grok): require nvm use before build in update-gsd-local
 ```
 
 Plus periodic `Merge origin/next into grok-build` commits.
@@ -333,6 +336,22 @@ npm run build
 Use a generous timeout on cold `npm install` / full `build` (several minutes is
 normal).
 
+**Incremental `tsc` after large merges:** `build:lib` uses
+`tsconfig.build.tsbuildinfo`. Many ADR-457 artifacts under `gsd-core/bin/lib/*.cjs`
+are **gitignored** and only emitted from `src/*.cts`. After a big `origin/next`
+merge, the incremental cache can report success while **never emitting** modules
+that were not present in the local `outDir` yet. Symptom: install or tests fail
+with `Cannot find module './some-module.cjs'` (e.g. `runtime-artifact-install-plan.cjs`)
+even though `src/some-module.cts` exists. Fix:
+
+```bash
+rm -f tsconfig.build.tsbuildinfo
+npm run build:lib
+```
+
+Prefer that clean rebuild when Step 6 or 7 hits `MODULE_NOT_FOUND` for a
+gitignored lib with a matching `src/*.cts` source.
+
 **Always** run `gen:capability-registry` when:
 
 - `capabilities/grok/**` (or any capability descriptor) was edited in Step 5, or
@@ -381,7 +400,10 @@ Expect surfaces:
 | Runtime marker | `~/.grok/gsd-core/.gsd-runtime` → `grok` |
 
 If install fails, fix errors (often missing build artifacts — re-run Step 6) and
-retry. Do not claim success without a clean installer exit.
+retry. For `MODULE_NOT_FOUND` on a gitignored `gsd-core/bin/lib/*.cjs` that has a
+matching `src/*.cts`, wipe the incremental cache first
+(`rm -f tsconfig.build.tsbuildinfo && npm run build:lib`) then reinstall. Do not
+claim success without a clean installer exit.
 
 ### 8. Verify install
 
@@ -595,6 +617,8 @@ git checkout grok-build
 git merge origin/next   # resolve + analyze Grok deltas + hostIntegration parity
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}" && . "$NVM_DIR/nvm.sh" && nvm use
 npm install             # if lockfile / deps changed
+# If MODULE_NOT_FOUND on gitignored bin/lib after merge:
+#   rm -f tsconfig.build.tsbuildinfo && npm run build:lib
 npm run build:lib
 npm run gen:capability-registry   # required; not covered by build:lib
 npm run build:hooks
