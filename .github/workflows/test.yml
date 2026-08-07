@@ -116,16 +116,25 @@ jobs:
     needs: changes
     if: needs.changes.outputs.product_changed == 'true'
     runs-on: ${{ matrix.os }}
-    # #2952: this lane is sharded three ways (see the matrix below), so the
-    # budget covers ONE shard, not the whole unit suite. Measured on run
-    # 30677442953: shard 1/3 7m12s, 2/3 4m32s, 3/3 3m59s. Shard 1 is the long
-    # pole because the unsharded aux suites (integration/security/install/slow)
-    # ride along on it — that is deliberate; they total ~1m35s and sharding them
-    # would cost more than it saves.
+    # #2952: the `scope: full` lane is sharded three ways (see the matrix
+    # below), so the budget covers ONE shard, not the whole unit suite.
+    # Measured on run 30677442953: shard 1/3 7m12s, 2/3 4m32s, 3/3 3m59s. Shard
+    # 1 is the long pole because the unsharded aux suites
+    # (integration/security/install/slow) ride along on it — that is
+    # deliberate; they total ~1m35s and sharding them would cost more than it
+    # saves.
     #
     # 15 is ~1.9x the slowest measured shard. Before sharding this same lane ran
     # 15m20s against a 15-minute cap and was killed mid-run, which is the whole
     # of #2952 — the number is unchanged, the work behind it is a third the size.
+    #
+    # The `scope: windows` lane is sharded three ways for the same reason
+    # (see #3057): on PR #3094 it reached 15m05s against this same cap and was
+    # CANCELLED, four shas in a row — a change to tests/helpers.cjs scoped in
+    # the install-heavy suites and pushed the single Windows lane over the top.
+    # Per #869, a timeout bump only moves that cliff; sharding removes it. The
+    # cap stays at 15 unchanged: each shard now does roughly a third of the
+    # work, so headroom improves rather than needing a raise.
     # tests/ci-test-job-timeout-budget.test.cjs holds every lane here to a
     # headroom factor over its own measured cost.
     timeout-minutes: 15
@@ -158,6 +167,13 @@ jobs:
           # gave the `test-full` lane, which measures 0.0% spread across 3 bins on
           # the current table. The aux suites (integration/security/install/slow)
           # total ~1m35s and are not worth sharding; they run on shard 1 only.
+          #
+          # #3057: the `scope: windows` lane is now sharded three ways too, the
+          # same fix applied to the same cliff (#869's stated durable follow-up).
+          # It hit exactly 15m05s and was CANCELLED on PR #3094, four shas
+          # straight, after a change to tests/helpers.cjs scoped in the
+          # install-heavy suites. Its shards use the same `--shard i/n`
+          # flag on scripts/run-tests.cjs, applied AFTER scope selection.
           - os: ubuntu-latest
             node-version: 22
             scope: targeted
@@ -176,6 +192,15 @@ jobs:
           - os: windows-latest
             node-version: 24
             scope: windows
+            shard: 1/3
+          - os: windows-latest
+            node-version: 24
+            scope: windows
+            shard: 2/3
+          - os: windows-latest
+            node-version: 24
+            scope: windows
+            shard: 3/3
 
     steps:
       # Windows lane on checkout v5.0.1 (drops includeIf; no auth flake, uses Node 24 natively).
@@ -255,7 +280,7 @@ jobs:
 
       - name: Run scoped tests
         if: matrix.scope != 'full'
-        run: node scripts/run-tests.cjs --files-from .ci-selected-tests.txt
+        run: node scripts/run-tests.cjs --files-from .ci-selected-tests.txt${{ matrix.shard && format(' --shard {0}', matrix.shard) || '' }}
 
       # #2952: each shard runs its slice of the unit suite under c8 but renders
       # NO report and enforces NO gate — it only leaves raw V8 dumps in
@@ -572,6 +597,65 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+  # #2966: turns a loop QA-walk "smell" into a decision — see
+  # scripts/qa-smell-ratchet.cjs's own header for the full design invariant.
+  # Gated the same way as `test`/`coverage-gate` (product_changed only): the
+  # scenarios drive the real gsd-tools binary end-to-end, so there is nothing
+  # to walk on a docs-only change.
+  qa-loop-walk:
+    name: QA loop walk (smell ratchet)
+    needs: changes
+    if: needs.changes.outputs.product_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GSD_PLUGIN_ROOT: .ci-gsd-plugin-root-disabled
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ github.token }}
+
+      - name: Guard — require GitHub-hosted runner
+        run: node scripts/ci-guard-runner.cjs
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6.3.0
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Environment check
+        run: npm run check:env
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dependency integrity gate
+        run: node scripts/check-npm-integrity.cjs
+
+      - name: Build runtime lib (required by the QA walk's gsd-tools invocations)
+        run: npm run build:lib
+
+      - name: Run QA loop-walk scenarios
+        run: npm run test:qa
+
+      # `-- --json qa-report.json` asks the ratchet to also write the full report
+      # (its default `npm run lint:qa-smells` invocation does not) — the report is
+      # gitignored and exists for the artifact upload below, not for the gate itself.
+      - name: QA smell ratchet
+        run: npm run lint:qa-smells -- --json qa-report.json
+
+      - name: Upload QA report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: qa-report
+          path: qa-report.json
+          if-no-files-found: ignore
+          retention-days: 3
+
   required-tests:
     name: Required tests
     needs:
@@ -581,6 +665,7 @@ jobs:
       - test-inert
       - test-full
       - coverage-gate
+      - qa-loop-walk
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -595,6 +680,7 @@ jobs:
           INERT_RESULT: ${{ needs.test-inert.result }}
           FULL_TEST_RESULT: ${{ needs.test-full.result }}
           COVERAGE_GATE_RESULT: ${{ needs.coverage-gate.result }}
+          QA_LOOP_WALK_RESULT: ${{ needs.qa-loop-walk.result }}
         run: |
           set -euo pipefail
           echo "code_changed=$CODE_CHANGED"
@@ -605,6 +691,7 @@ jobs:
           echo "test-inert=$INERT_RESULT"
           echo "test-full=$FULL_TEST_RESULT"
           echo "coverage-gate=$COVERAGE_GATE_RESULT"
+          echo "qa-loop-walk=$QA_LOOP_WALK_RESULT"
 
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::test scope detection did not pass"
@@ -641,6 +728,12 @@ jobs:
             # docs-only PR.
             if [ "$COVERAGE_GATE_RESULT" != "success" ] && [ "$COVERAGE_GATE_RESULT" != "skipped" ]; then
               echo "::error::coverage-gate did not pass"
+              exit 1
+            fi
+
+            # #2966: same product_changed-only gating as coverage-gate above.
+            if [ "$QA_LOOP_WALK_RESULT" != "success" ] && [ "$QA_LOOP_WALK_RESULT" != "skipped" ]; then
+              echo "::error::qa-loop-walk did not pass"
               exit 1
             fi
           else

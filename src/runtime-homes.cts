@@ -35,12 +35,34 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 /**
- * Expand a leading ~ to os.homedir().
+ * Expand a leading ~ to the given home directory (defaults to os.homedir()).
+ * Every call site inside resolveConfigHomeFromDescriptor threads its
+ * resolved `home` local through here so an injected opts.home (used by
+ * hermetic tests) is honored instead of silently falling back to the real
+ * home directory.
  */
-function expandTilde(p: string): string {
+function expandTilde(p: string, home: string = os.homedir()): string {
   if (!p) return p;
-  if (p.startsWith('~/') || p === '~') return path.join(os.homedir(), p.slice(1));
+  if (p.startsWith('~/') || p === '~') return path.join(home, p.slice(1));
   return p;
+}
+
+/**
+ * True when `val` is a usable env-var override: a real string that contains
+ * at least one non-whitespace character. Every env-override consumption site
+ * in resolveConfigHomeFromDescriptor gates on this instead of a bare truthy
+ * check, so `FOO_DIR=''` (empty), `FOO_DIR` unset (`undefined`), and
+ * `FOO_DIR='   '` (whitespace-only — e.g. from a shell templating bug that
+ * leaves a variable substitution blank but quoted) all fall back to the
+ * descriptor default identically. Deliberately does NOT trim: a value that
+ * merely has leading/trailing whitespace around otherwise-real content (or
+ * interior whitespace, e.g. `~/My Agent Dir`) is passed through byte-for-byte
+ * unchanged, exactly as this module already treats every other env-var
+ * override (no site here or elsewhere in this file trims a path value) — so
+ * default behavior for every non-whitespace value is unaffected by this guard.
+ */
+function hasNonBlankOverride(val: string | undefined): val is string {
+  return typeof val === 'string' && val.trim() !== '';
 }
 
 export interface ResolveAntigravityOpts {
@@ -53,6 +75,16 @@ export interface ResolveKimiOpts {
   env?: Record<string, string | undefined>;
   home?: string;
   existsSync?: (p: string) => boolean;
+}
+
+/**
+ * Options for `resolveKimiHooksTomlDir`. Separate from `ResolveKimiOpts` so the
+ * `runtime` selector is not implied to affect `resolveKimiGlobalDir`, which
+ * resolves the generic Agent-Skills root and is runtime-independent.
+ */
+export interface ResolveKimiHooksTomlOpts extends ResolveKimiOpts {
+  /** Runtime id — `kimi` (default) or `kimi-code`. See #2755. */
+  runtime?: string;
 }
 
 export interface ResolveConfigHomeOpts {
@@ -167,7 +199,7 @@ export function resolveConfigHomeFromDescriptor(
       // First env var that is set wins
       for (const varName of configHome.env) {
         const val = env[varName];
-        if (val) return expandTilde(val);
+        if (hasNonBlankOverride(val)) return expandTilde(val, home);
       }
       return path.join(home, configHome.name);
     }
@@ -175,8 +207,8 @@ export function resolveConfigHomeFromDescriptor(
     case 'dot-home-nested': {
       // env override
       const nestedEnv0Val = env[configHome.env[0]];
-      if (configHome.env[0] && nestedEnv0Val) {
-        return expandTilde(nestedEnv0Val);
+      if (configHome.env[0] && hasNonBlankOverride(nestedEnv0Val)) {
+        return expandTilde(nestedEnv0Val, home);
       }
       const base = path.join(home, configHome.parent);
       if (configHome.probe && configHome.probe.length > 0) {
@@ -208,18 +240,18 @@ export function resolveConfigHomeFromDescriptor(
     case 'xdg': {
       // env[0]: direct override dir
       const xdgEnv0Val = env[configHome.env[0]];
-      if (configHome.env[0] && xdgEnv0Val) {
-        return expandTilde(xdgEnv0Val);
+      if (configHome.env[0] && hasNonBlankOverride(xdgEnv0Val)) {
+        return expandTilde(xdgEnv0Val, home);
       }
       // env[1]: FILE path → dirname
       const xdgEnv1Val = env[configHome.env[1]];
-      if (configHome.env[1] && xdgEnv1Val) {
-        return path.dirname(expandTilde(xdgEnv1Val));
+      if (configHome.env[1] && hasNonBlankOverride(xdgEnv1Val)) {
+        return path.dirname(expandTilde(xdgEnv1Val, home));
       }
       // env[2]: XDG_CONFIG_HOME → subdir
       const xdgEnv2Val = env[configHome.env[2]];
-      if (configHome.env[2] && xdgEnv2Val) {
-        return path.join(expandTilde(xdgEnv2Val), configHome.name);
+      if (configHome.env[2] && hasNonBlankOverride(xdgEnv2Val)) {
+        return path.join(expandTilde(xdgEnv2Val, home), configHome.name);
       }
       return path.join(home, '.config', configHome.name);
     }
@@ -227,29 +259,20 @@ export function resolveConfigHomeFromDescriptor(
     case 'generic-agents-root': {
       // env override
       const garEnv0Val = env[configHome.env[0]];
-      if (configHome.env[0] && garEnv0Val) {
-        return expandTilde(garEnv0Val);
+      if (configHome.env[0] && hasNonBlankOverride(garEnv0Val)) {
+        return expandTilde(garEnv0Val, home);
       }
       // probe each candidate; return first where probeExists subpath exists
       for (const candidate of configHome.probe) {
-        const resolved = expandTildeWithHome(candidate, home);
+        const resolved = expandTilde(candidate, home);
         if (existsSyncFn(path.join(resolved, configHome.probeExists))) {
           return resolved;
         }
       }
       // fallback: first probe candidate
-      return expandTildeWithHome(configHome.probe[0], home);
+      return expandTilde(configHome.probe[0], home);
     }
   }
-}
-
-/**
- * Expand ~ using an explicit home directory (for hermetic testing).
- */
-function expandTildeWithHome(p: string, home: string): string {
-  if (!p) return p;
-  if (p.startsWith('~/') || p === '~') return path.join(home, p.slice(1));
-  return p;
 }
 
 /**
@@ -370,28 +393,45 @@ export function resolveKimiGlobalDir(opts: ResolveKimiOpts = {}): string {
 }
 
 /**
- * Resolve the directory holding Kimi CLI's OWN native config.toml (the file
- * Kimi itself reads for providers/models/hooks/etc — see
- * moonshotai.github.io/kimi-cli/en/configuration/data-locations.html and
- * .../reference/kimi-command.html). Default `~/.kimi`, overridden by
- * `KIMI_SHARE_DIR` per Kimi's own upstream env-var (NOT `KIMI_CONFIG_DIR`,
- * which is a GSD-installer write-location override for the unrelated generic
- * Agent-Skills root resolved by resolveKimiGlobalDir above).
+ * Resolve the directory holding the Kimi product's OWN native config.toml —
+ * the file that product itself reads for providers/models/hooks/etc, and the
+ * one GSD writes its `[[hooks]]` block, hooks bundle and CommonJS marker into.
  *
- * This is deliberately a SEPARATE directory from GSD's kimi configHome
- * (~/.config/agents): Kimi's own docs confirm the Agent-Skills search path is
- * independent of KIMI_SHARE_DIR ("This variable does not affect Agent Skills
- * search paths, which are handled separately"). #2095 Upgrade 1 writes GSD's
- * native [[hooks]] entries into `<this dir>/config.toml`, never into the
- * skills configDir.
+ * The two Kimi runtimes share `hooksSurface: "kimi-hooks-toml"` but are
+ * different products with different roots, and this must be selected by
+ * `runtime` (#2755). Before that fix this function was unparameterized and a
+ * `--kimi-code` install wrote its hooks into Kimi CLI's `~/.kimi`, leaving Kimi
+ * Code with none:
+ *
+ *   kimi       → `~/.kimi`,      overridden by `KIMI_SHARE_DIR`
+ *                (moonshotai.github.io/kimi-cli/en/configuration/data-locations.html)
+ *   kimi-code  → `~/.kimi-code`, overridden by `KIMI_CODE_HOME`
+ *                (moonshotai/kimi-code docs/en/configuration/data-locations.md;
+ *                 its hooks doc places `[[hooks]]` in `~/.kimi-code/config.toml`)
+ *
+ * Each product's env var is scoped to that product: `KIMI_SHARE_DIR` is Kimi
+ * CLI's own upstream variable and must NOT redirect kimi-code, nor vice versa.
+ *
+ * An unrecognised `runtime` (and an omitted one) falls back to `~/.kimi`, which
+ * preserves the pre-#2755 behaviour for every existing caller that passes no
+ * runtime — this function is exported, so that default is a contract.
+ *
+ * For BOTH runtimes this is deliberately a SEPARATE directory from the generic
+ * Agent-Skills root resolved by `resolveKimiGlobalDir` (`~/.config/agents`):
+ * both vendors' docs confirm the Agent-Skills search path is independent of the
+ * data-root env var. GSD's native `[[hooks]]` entries go in
+ * `<this dir>/config.toml`, never into the skills configDir.
  */
-export function resolveKimiHooksTomlDir(opts: ResolveKimiOpts = {}): string {
+export function resolveKimiHooksTomlDir(opts: ResolveKimiHooksTomlOpts = {}): string {
   const env: Record<string, string | undefined> = opts.env ?? process.env;
   const home = opts.home ?? os.homedir();
-  return resolveConfigHomeFromDescriptor(
-    { kind: 'dot-home', name: '.kimi', env: ['KIMI_SHARE_DIR'] },
-    { env, home },
-  );
+  // Explicit comparison rather than an object lookup keyed on `runtime`: the
+  // value originates from argv, and an index would resolve inherited keys
+  // (`constructor`, `__proto__`) to something that is not a descriptor.
+  const descriptor: DotHomeDescriptor = opts.runtime === 'kimi-code'
+    ? { kind: 'dot-home', name: '.kimi-code', env: ['KIMI_CODE_HOME'] }
+    : { kind: 'dot-home', name: '.kimi', env: ['KIMI_SHARE_DIR'] };
+  return resolveConfigHomeFromDescriptor(descriptor, { env, home });
 }
 
 /**

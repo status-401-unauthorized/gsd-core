@@ -5,6 +5,7 @@ import pluginN from 'eslint-plugin-n';
 import noOnlyTests from 'eslint-plugin-no-only-tests';
 import { dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -24,6 +25,10 @@ import noBareNpmExec from './eslint-rules/no-bare-npm-exec.cjs';
 import requireUserprofileWithHome from './eslint-rules/require-userprofile-with-home.cjs';
 import normalizePathInContent from './eslint-rules/normalize-path-in-content.cjs';
 import requireFsOpFallback from './eslint-rules/require-fs-op-fallback.cjs';
+import noUnboundedSpawn from './eslint-rules/no-unbounded-spawn.cjs';
+
+const require = createRequire(import.meta.url);
+const unboundedSpawnAllowlist = require('./eslint-rules/no-unbounded-spawn.allowlist.json');
 
 const localPlugin = {
   rules: {
@@ -42,6 +47,7 @@ const localPlugin = {
     'require-userprofile-with-home': requireUserprofileWithHome,
     'normalize-path-in-content': normalizePathInContent,
     'require-fs-op-fallback': requireFsOpFallback,
+    'no-unbounded-spawn': noUnboundedSpawn,
   },
 };
 
@@ -64,6 +70,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/host-integration-sdk.cjs',
       'gsd-core/bin/lib/install-effort-resolver.cjs',
       'gsd-core/bin/lib/install-engine.cjs',
+      'gsd-core/bin/lib/commonjs-marker.cjs',
       'gsd-core/bin/lib/capability-loader.cjs',
       'gsd-core/bin/lib/capability-source.cjs',
       'gsd-core/bin/lib/capability-ledger.cjs',
@@ -117,6 +124,8 @@ export default tseslint.config(
       'gsd-core/bin/lib/installer-migration-authoring.cjs',
       'gsd-core/bin/lib/update-context.cjs',
       'gsd-core/bin/lib/installer-migrations/000-first-time-baseline.cjs',
+      'gsd-core/bin/lib/installer-migrations/008-cursor-retire-commands-surface.cjs',
+      'gsd-core/bin/lib/retired-artifact-cleanup.cjs',
       'gsd-core/bin/lib/runtime-homes.cjs',
       'gsd-core/bin/lib/model-catalog.cjs',
       'gsd-core/bin/lib/configuration.cjs',
@@ -135,6 +144,13 @@ export default tseslint.config(
       'gsd-core/bin/lib/installer-migrations/003-rename-get-shit-done-to-gsd-core.cjs',
       'gsd-core/bin/lib/installer-migrations/004-prune-stale-pristine-snapshots.cjs',
       'gsd-core/bin/lib/installer-migrations/005-opencode-baseline-commands-dir.cjs',
+      // 007 is tsc output like its siblings, but unlike 006 it imports node
+      // builtins — so tsc emits its `__importDefault` helper, which uses `var`
+      // and trips no-var. ADR-457: the linted source is the .cts.
+      'gsd-core/bin/lib/installer-migrations/007-retire-config-root-commonjs-marker.cjs',
+      // 009 also imports node builtins (fs, path) like 007, so tsc emits the
+      // same `__importDefault` helper. ADR-457: the linted source is the .cts.
+      'gsd-core/bin/lib/installer-migrations/009-pi-retire-reserved-hooks-dir.cjs',
       'gsd-core/bin/lib/observability/logger.cjs',
       'gsd-core/bin/lib/active-workstream-store.cjs',
       'gsd-core/bin/lib/adr-parser.cjs',
@@ -163,6 +179,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/normalize-test-command.cjs',
       'gsd-core/bin/lib/config-loader.cjs',
       'gsd-core/bin/lib/phase-locator.cjs',
+      'gsd-core/bin/lib/plan-dependency-graph.cjs',
       'gsd-core/bin/lib/roadmap-parser.cjs',
       'gsd-core/bin/lib/drift.cjs',
       'gsd-core/bin/lib/cjs-command-router-adapter.cjs',
@@ -234,12 +251,16 @@ export default tseslint.config(
       'gsd-core/bin/lib/state-io.cjs',
       'gsd-core/bin/lib/external-descriptor-trust.cjs',
       'gsd-core/bin/lib/mcp-server.cjs',
+      // #3072: tsc-generated runtime artifact — lint the src/mcp-catalog.cts source.
+      'gsd-core/bin/lib/mcp-catalog.cjs',
       // ADR-1671 (#2928): tsc-generated runtime artifact — lint the src/context-predicates.cts source.
       'gsd-core/bin/lib/context-predicates.cjs',
       // #2929: tsc-generated runtime artifact — lint the src/context-composer.cts source.
       'gsd-core/bin/lib/context-composer.cjs',
       // ADR-1671 (#2930): tsc-generated runtime artifact — lint the src/workflow-fragments.cts source.
       'gsd-core/bin/lib/workflow-fragments.cjs',
+      // ADR-1671 Phase 5 (#2932): tsc-generated runtime artifact — lint the src/section-manifest.cts source.
+      'gsd-core/bin/lib/section-manifest.cjs',
     ],
   },
 
@@ -341,7 +362,7 @@ export default tseslint.config(
 
   // ── tests/**/*.test.cjs ─────────────────────────────────────────────────────
   {
-    files: ['tests/**/*.test.cjs'],
+    files: ['tests/**/*.cjs'],
     plugins: {
       'no-only-tests': noOnlyTests,
       local: localPlugin,
@@ -378,6 +399,8 @@ export default tseslint.config(
       'local/no-bare-npm-exec': 'error',
       // Require USERPROFILE alongside HOME assignments (ADR-1703 Phase 4)
       'local/require-userprofile-with-home': 'error',
+      // Ban unbounded sync child_process spawns in tests (DEFECT.UNBOUNDED-SUBPROCESS)
+      'local/no-unbounded-spawn': ['error', { allowlist: unboundedSpawnAllowlist }],
       // Ban raw setTimeout sync + elapsed/duration-style assertions via no-restricted-syntax
       'no-restricted-syntax': [
         'error',

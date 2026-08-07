@@ -315,7 +315,11 @@ function cmdRoadmapAnalyze(cwd: string, raw: boolean): void {
   // Extract all phase headings: ## Phase N: Name or ### Phase N: Name
   // #1729: `(?:\s*\([^)\n]{0,200}\))?` tolerates a pre-colon ( ) tag (literal mirror of OPTIONAL_PHASE_TAG_SOURCE).
   // phase-id-owner: uses the [.-] (dot-or-dash) separator variant, not the canonical dot-only token; a swap to PHASE_NUMBER_TOKEN_SOURCE would drop hyphenated phase-id matches.
-  const phasePattern = /#{2,4}\s*(?:\[[^\]]{1,200}\]\s*)?Phase\s+(\d+[A-Z]?(?:[.-]\d+)*)(?:\s*\([^)\n]{0,200}\))?\s*:\s*([^\n]+)/gi;
+  // #3036: widen the id capture to accept non-numeric-leading ids (e.g. B7, P0.3-2)
+  // that get-phase/execute-phase already resolve. An optional leading letter prefix
+  // ([A-Za-z]?) covers letter-prefixed ids without breaking numeric-leading ones.
+  // phase-id-owner: uses the [.-] (dot-or-dash) separator variant, not the canonical dot-only token; a swap to PHASE_NUMBER_TOKEN_SOURCE would drop hyphenated phase-id matches.
+  const phasePattern = /#{2,4}\s*(?:\[[^\]]{1,200}\]\s*)?Phase\s+([A-Za-z]?\d+[A-Z]?(?:[.-]\d+)*)(?:\s*\([^)\n]{0,200}\))?\s*:\s*([^\n]+)/gi;
   const phases: Array<{
     number: string;
     name: string;
@@ -359,8 +363,9 @@ function cmdRoadmapAnalyze(cwd: string, raw: boolean): void {
     const sectionStart = match.index;
     const restOfContent = content.slice(sectionStart);
     // #3691: `\d` → `\d[\d.]*` so decimal phase headings (e.g. `### Phase 02.3:`) are
-    // recognised as section boundaries.
-    const nextHeader = restOfContent.match(/\n#{2,4}\s+(?:\[[^\]]{1,200}\]\s*)?Phase\s+\d[\d.-]*/i);
+    // recognised as section boundaries. #3036: `[A-Za-z]?\d` so non-numeric-leading ids
+    // (e.g. B7) are also recognised.
+    const nextHeader = restOfContent.match(/\n#{2,4}\s+(?:\[[^\]]{1,200}\]\s*)?Phase\s+[A-Za-z]?\d[\d.-]*/i);
     const sectionEnd = nextHeader ? sectionStart + nextHeader.index! : content.length;
     const section = content.slice(sectionStart, sectionEnd);
 
@@ -459,7 +464,9 @@ function cmdRoadmapAnalyze(cwd: string, raw: boolean): void {
   // IDs (e.g. `1-01`) match the detail-heading scanner above; otherwise they truncate
   // at the dash (`1-01` -> `1`) and every such phase reports a phantom missing detail.
   // phase-id-owner: uses the [.-] (dot-or-dash) separator variant, not the canonical dot-only token; a swap to PHASE_NUMBER_TOKEN_SOURCE would drop hyphenated phase-id matches.
-  const checklistPattern = /-\s*\[[ x]\]\s*\*\*Phase\s+(\d+[A-Z]?(?:[.-]\d+)*)/gi;
+  // #3036: widen to accept non-numeric-leading ids (same widening as the detail-heading pattern above).
+  // phase-id-owner: uses the [.-] (dot-or-dash) separator variant, not the canonical dot-only token; a swap to PHASE_NUMBER_TOKEN_SOURCE would drop hyphenated phase-id matches.
+  const checklistPattern = /-\s*\[[ x]\]\s*\*\*Phase\s+([A-Za-z]?\d+[A-Z]?(?:[.-]\d+)*)/gi;
   const checklistPhases = new Set<string>();
   let checklistMatch: RegExpExecArray | null;
   while ((checklistMatch = checklistPattern.exec(content)) !== null) {
@@ -551,8 +558,13 @@ function cmdRoadmapUpdatePlanProgress(cwd: string, phaseNum: string | null | und
   // cmdPhaseComplete's gate (phase.cts:1436). Previously the checkbox fired the
   // moment the last plan summary landed — before gsd-verifier had verified.
   const phaseDir = path.join(cwd, phaseInfo!.directory);
-  const verificationPassed = readVerificationStatus(phaseDir).status === 'passed';
+  const verificationResult = readVerificationStatus(phaseDir);
+  const verificationPassed = verificationResult.status === 'passed';
   const isComplete = summaryCount >= planCount && verificationPassed;
+  // #3057 B3: routing above is unchanged (an indeterminate staleness check
+  // still routes as if nothing were stale) — this only makes the fact visible
+  // to whatever reads this command's JSON output.
+  const verificationStaleCheckIndeterminate = verificationResult.staleCheckIndeterminate === true;
   const status = isComplete ? 'Complete' : summaryCount > 0 ? 'In Progress' : 'Planned';
   const today = realClock.localToday();
 
@@ -757,6 +769,7 @@ function cmdRoadmapUpdatePlanProgress(cwd: string, phaseNum: string | null | und
     summary_count: summaryCount,
     status,
     complete: isComplete,
+    verification_stale_check_indeterminate: verificationStaleCheckIndeterminate,
   }, raw, `${summaryCount}/${planCount} ${status}`);
 }
 

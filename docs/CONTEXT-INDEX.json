@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "count": 415,
+  "count": 416,
   "classes": {
     "ARCH": 1,
     "CI": 2,
     "CONFIG": 1,
-    "DEFECT": 167,
+    "DEFECT": 168,
     "EXEC": 8,
     "GSD-RESEARCH": 6,
     "LEARNING": 1,
@@ -335,6 +335,11 @@
       "value": "security_reminder_hook can block Write on substring match (e.g. a literal child-process call-expression token); workaround is heredoc to /tmp then mv into place, or use Edit instead — Edit hooks are more lenient than Write hooks"
     },
     {
+      "id": "DEFECT.HOST-RESERVED-DIR-NAME",
+      "klass": "DEFECT",
+      "value": "a host runtime reserves a directory NAME that GSD also writes verbatim, so the mere presence of GSD's directory trips the host's own reserved-name detection regardless of contents; example: pi (#3023) treats GSD's shared-hooks bundle dir hooks/ as its own deprecated extension location and printed a startup warning purely because checkDeprecatedExtensionDirs() in packages/coding-agent/src/migrations.ts gates on a bare existsSync(hooksDir) with no readdir/emptiness check (unlike its tools/ sibling); fix-forward=make the shared-hooks directory name descriptor-driven (hostBehaviors.sharedHooksDirName, default hooks) and override it per-runtime when a name collision is detected (pi sets gsd-hooks), with adapters probing the new name then falling back to the legacy name for dev/half-upgraded trees"
+    },
+    {
       "id": "DEFECT.INVENTORY-DRIFT.detect",
       "klass": "DEFECT",
       "value": "tests/inventory-manifest-sync.test.cjs fails with \"New surfaces not in manifest\"; tests/inventory-headings-countfree.test.cjs fails if a (N shipped) count is re-added to a heading"
@@ -347,7 +352,7 @@
     {
       "id": "DEFECT.INVENTORY-DRIFT.fix-forward",
       "klass": "DEFECT",
-      "value": "update INVENTORY.md row entry; run node scripts/gen-inventory-manifest.cjs --write to regen INVENTORY-MANIFEST.json (all six families.* arrays are canonical — see RULESET.MANIFEST-CANONICAL-KEY)"
+      "value": "update INVENTORY.md row entry; run node scripts/gen-inventory-manifest.cjs --write to regen INVENTORY-MANIFEST.json (all eight families.* arrays are canonical — see RULESET.MANIFEST-CANONICAL-KEY); a workflow SUB-file (gsd-core/workflows/<wf>/steps/*.md or modes/*.md) lands in workflow_steps/workflow_modes, not in workflows, which is keyed by bare basename and cannot hold a nested path"
     },
     {
       "id": "DEFECT.INVENTORY-DRIFT.symptom",
@@ -1792,7 +1797,7 @@
     {
       "id": "RULESET.MANIFEST-CANONICAL-KEY",
       "klass": "RULESET",
-      "value": "docs/INVENTORY-MANIFEST.json has a single top-level key: families; ALL SIX families.* arrays (agents/commands/workflows/references/cli_modules/hooks) are canonical, consumed by test suites — tests/inventory-manifest-sync.test.cjs reads all six, edit-phase/enh-2380/enh-2430 tests read commands+workflows; the old generated date field and the stale top-level workflows key are both gone; regen via node scripts/gen-inventory-manifest.cjs --write"
+      "value": "docs/INVENTORY-MANIFEST.json has a single top-level key: families; ALL EIGHT families.* arrays (agents/commands/workflows/references/cli_modules/hooks flat, plus workflow_modes/workflow_steps nested — #2996, epic #1671 Phase 6.5) are canonical, consumed by test suites — tests/inventory-manifest-sync.test.cjs reads all eight, edit-phase/enh-2380/enh-2430 tests read commands+workflows; the six flat families are keyed by BARE BASENAME while the two nested families are keyed by <workflow>/<subdir>/<file> path, deliberately, because two workflows may each own a same-named step file and a basename key would silently drop one under a JSON-equality comparison; recursion is bounded at exactly one named subdirectory, never a general walk; the family tables live ONCE in scripts/gen-inventory-manifest.cjs and are IMPORTED by the test (the test formerly redeclared them, a DEFECT.GENERATIVE-FIX divergence that let a new family be verified by nobody while still reporting green); the old generated date field and the stale top-level workflows key are both gone; regen via node scripts/gen-inventory-manifest.cjs --write, AFTER build:lib"
     },
     {
       "id": "RULESET.PR-FLOW.docker-before-push",
