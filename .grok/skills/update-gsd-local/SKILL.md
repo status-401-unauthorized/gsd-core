@@ -34,10 +34,11 @@ Run from the **gsd-core** repo root (the tree that contains `bin/install.js`,
 3. Preferred branch: local `grok-build` tracking `fork/grok-build`. If on another
    branch, tell the user and ask whether to switch to `grok-build` or update the
    current branch instead.
-4. Node.js ≥ 22 and npm ≥ 10 (see `package.json` engines). Prefer **nvm** +
-   repo-root **`.nvmrc`** (major pin, e.g. `22`). `npm install` must be viable if
-   `node_modules` is missing or stale. System Node with npm &lt; 10 may still run
-   some steps but fails engines when npm is below 10 — activate nvm before Step 6.
+4. Node/npm must satisfy `package.json` engines. Prefer **nvm** + repo-root
+   **`.nvmrc`** (read the file — currently major **24**; do not assume 22).
+   `npm install` must be viable if `node_modules` is missing or stale. System
+   Node below engines will fail — activate nvm before Step 6. If `nvm use`
+   says the pin is missing, `nvm install` then `nvm use` again.
 
 Record before any mutation:
 
@@ -76,7 +77,7 @@ this list when analysis shows upstream absorbed them or when new fork commits la
 | Theme | Primary paths | Intent |
 |-------|---------------|--------|
 | Grok as installable runtime | `capabilities/grok/capability.json`, `bin/install.js` (`--grok` / `--grok-build`), runtime lists | First-class Grok Build install target → `~/.grok` |
-| Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME` |
+| Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME`. Grok **is** a registry runtime — do **not** re-list it in `LEGACY_NON_REGISTRY_RUNTIME_IDS`. Adapt origin/next tests that still treat grok as a `#3024` `~/.agents` legacy id. |
 | Host-integration parity | `capabilities/grok/capability.json` → `runtime.hostIntegration` | Track upstream descriptor schema (`dispatch.*`, `effortSurface`, …) so negotiation does not fail closed; see Step 4 |
 | Claude → Grok converters | `src/runtime-artifact-conversion.cts` → `gsd-core/bin/lib/runtime-artifact-conversion.cjs` | `convertClaudeCommandToGrokSkill`, `convertClaudeAgentToGrokAgent`, tool-name rewrites (`Task`→`spawn_subagent`, etc.) |
 | Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts |
@@ -87,6 +88,19 @@ this list when analysis shows upstream absorbed them or when new fork commits la
 fields on runtime `capability.json` / `hostIntegration` (e.g. `dispatch.isolation`
 from ADR-1239 / #2584), port the equivalent into `capabilities/grok/capability.json`
 and regenerate the registry — do not leave Grok omitted while peers declare the axis.
+
+**#3024 / #3547 adapt triggers (homes + install harness):**
+
+- Upstream still documents grok as a non-registry `~/.agents` id
+  (`LEGACY_NON_REGISTRY_RUNTIME_IDS`, skills-root tests, `sync-skills.md`
+  prose, `scripts/live-config-guard.cjs`). This fork’s grok is first-class
+  `~/.grok` / `GROK_HOME`. After merge, re-point those tests/docs; keep the
+  hardcoded `getGlobalConfigDir('grok')` fallback only for a missing registry.
+- `#3547` (`runMinimalInstall`) refuses to guess a global home without
+  `RUNTIME_META[runtime].globalSuffix` in `tests/helpers/install-shared.cjs`.
+  Declare `grok: { localDir: '.grok', globalSuffix: '.grok' }` or
+  `tests/grok-upgrades.test.cjs` install cases fail. Keep grok **out** of
+  `MANIFEST_FAMILIES` (no `tests/fixtures/install-tree/grok.json` golden).
 
 Non-merge feature commits on the fork (historically):
 
@@ -99,6 +113,8 @@ fix(grok): declare effortSurface undocumented after origin/next
 chore: regenerate bin/lib after origin/next merge
 chore(grok): track /update-gsd-local skill in-repo
 chore(grok): require nvm use before build in update-gsd-local
+chore(grok): document tsc incremental cache wipe in update-gsd-local
+fix(grok): declare RUNTIME_META.globalSuffix after #3547
 ```
 
 Plus periodic `Merge origin/next into grok-build` commits.
@@ -110,8 +126,9 @@ Plus periodic `Merge origin/next into grok-build` commits.
 | Most `gsd-core/bin/lib/*.cjs` from `src/*.cts` | `npm run build:lib` (`tsc -p tsconfig.build.json`) | hand-edit forever |
 | **`capability-registry.cjs`** | **`npm run gen:capability-registry`** (`scripts/gen-capability-registry.cjs --write` from `capabilities/*/capability.json`) | **`build:lib` / tsc** |
 | Loop host contract, plugin skills, package identity | `gen:loop-host-contract`, `gen:plugin-skills`, `generate:identity` | `build:lib` alone |
+| Section manifest, CONTEXT-INDEX | `gen:section-manifest`, `gen:context-index` | `build:lib` alone |
 | Hook scripts under pack | `npm run build:hooks` | `build:lib` alone |
-| Full release-shaped pipeline | `npm run build` (= identity + lib + plugin-skills + loop-host-contract + **capability-registry** + hooks) | partial steps only |
+| Full release-shaped pipeline | `npm run build` (= identity + lib + **section-manifest** + **context-index** + plugin-skills + loop-host-contract + **capability-registry** + hooks) | partial steps only |
 
 Editing `capabilities/grok/**` **without** `gen:capability-registry` leaves a
 stale registry (install and negotiation read the generated file). Prefer
@@ -185,7 +202,8 @@ For each conflicted file:
    - `src/runtime-*.cts` and generated `gsd-core/bin/lib/*.cjs`
    - `capabilities/grok/**` (ours; may be untracked on upstream)
    - capability registry generators / `capability-registry.cjs`
-   - tests that list runtimes
+   - tests that list runtimes or assume grok is a `~/.agents` legacy id
+   - `tests/helpers/install-shared.cjs` (`RUNTIME_META` / `MANIFEST_FAMILIES`)
 3. For generated CJS under `gsd-core/bin/lib/`:
    - Prefer resolving **source** correctly, then regenerate — **not** hand-editing
      both forever.
@@ -293,7 +311,8 @@ node --test tests/grok-upgrades.test.cjs
 5. Stage and include in the merge commit if still in progress, or make a
    follow-up commit on `grok-build` with a clear message (e.g.
    `fix(grok): re-adapt converters after origin/next merge` or
-   `fix(grok): declare dispatch.isolation harness-worktree after origin/next`).
+   `fix(grok): declare dispatch.isolation harness-worktree after origin/next`
+   or `fix(grok): declare RUNTIME_META.globalSuffix after #3547`).
 
 ### 6. Build the TypeScript / generated libs
 
@@ -308,9 +327,9 @@ export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 
 # Fail early if nvm or the pin is unavailable
 command -v nvm >/dev/null || { echo "nvm not available; install nvm or fix NVM_DIR"; exit 1; }
-nvm use          # reads repo-root .nvmrc (e.g. 22 → latest matching Node)
+nvm use          # reads repo-root .nvmrc (currently 24 → latest matching Node)
 # If the version is missing: nvm install   # then nvm use again
-node -v && npm -v   # expect Node ≥22 and npm ≥10 per package.json engines
+node -v && npm -v   # expect versions that satisfy package.json engines (Node ≥24, npm ≥10 as of 1.10.0)
 ```
 
 Default post-merge build (covers tsc, Grok descriptor registry, hooks):
@@ -326,7 +345,7 @@ npm run build:hooks
 ```
 
 When unsure what drifted (capability registry, loop-host contract, plugin skills,
-hooks), prefer the full pipeline:
+section-manifest, CONTEXT-INDEX, hooks), prefer the full pipeline:
 
 ```bash
 # After nvm use (required):
