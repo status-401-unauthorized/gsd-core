@@ -55,14 +55,14 @@ Verify the work is ready to ship:
    # The gate decides on ONE read. --pick takes a single field, so the two
    # human-facing fields are read only on the blocking path below — never on the
    # passing path — rather than issuing three queries up front (#2589).
-   STATUS=$(gsd_run query verification.status "${PHASE_DIR}" --pick status 2>/dev/null || echo "")
+   STATUS=$(gsd_run query verification.status "${PHASE_DIR}" --pick status 2>/dev/null)
    ```
    Only `passed` may ship. If `$STATUS` is `passed`, verification is complete — continue to the next preflight check; do not read any further verification field.
 
    Any other value (including `gaps_found`, `human_needed`, `missing`, and `unknown`) blocks with `PHASE_VERIFICATION_INCOMPLETE`. Only then, read the two message fields:
    ```bash
-   NEXT_ACTION=$(gsd_run query verification.status "${PHASE_DIR}" --pick next_action 2>/dev/null || echo "")
-   NEXT_COMMAND=$(gsd_run query verification.status "${PHASE_DIR}" --pick next_command 2>/dev/null || echo "")
+   NEXT_ACTION=$(gsd_run query verification.status "${PHASE_DIR}" --pick next_action 2>/dev/null)
+   NEXT_COMMAND=$(gsd_run query verification.status "${PHASE_DIR}" --pick next_command 2>/dev/null)
    ```
    Present `$NEXT_ACTION` to the user and, when `$NEXT_COMMAND` is non-empty, show it as the command to run next. These two are message text only — the block/allow decision has already been made from `$STATUS`, so a concurrent write between the reads cannot change the gate's verdict. The query already handles missing files and unexpected values, so no per-status arm is needed.
 
@@ -455,7 +455,41 @@ would otherwise trigger (GitHub honors `[ci skip]` / `[skip ci]`):
 
 ```bash
 gsd_run query commit "docs(${padded_phase}): ship phase ${PHASE_NUMBER} — PR #${PR_NUMBER} [ci skip]" --files .planning/STATE.md
+SHIP_NOTE_SHA=$(git rev-parse HEAD)
 git push origin ${CURRENT_BRANCH} 2>&1 || echo "⚠ track_shipping: ship-note push failed — it is local-only; rerun: git push origin ${CURRENT_BRANCH}"
+
+# Preserve the skip-token optimization for repositories without a required-check
+# wedge; only synthesize a second CI-triggering commit when GitHub reports one (#2783).
+# Poll mergeStateStatus with backoff to avoid racing GitHub's async state computation.
+# Note: Skip tokens recognized by GitHub Actions are [skip ci], [ci skip], [no ci], [skip actions], [actions skip], and skip-checks:true.
+# The recovery commit message MUST NOT contain any of these tokens.
+
+STATUS="UNKNOWN"
+CHECKS=0
+REVIEW_DECISION=""
+for i in {1..5}; do
+  PR_STATE=$(gh pr view ${PR_NUMBER} --json headRefOid,mergeStateStatus,statusCheckRollup,reviewDecision -q '{head: .headRefOid, status: .mergeStateStatus, checks: ((.statusCheckRollup // []) | length), review: (.reviewDecision // "")}' 2>/dev/null || echo '{"head":"","status":"UNKNOWN","checks":0,"review":""}')
+  HEAD_OID=$(echo "$PR_STATE" | jq -r .head)
+  if [ "$HEAD_OID" = "$SHIP_NOTE_SHA" ]; then
+    STATUS=$(echo "$PR_STATE" | jq -r .status)
+    CHECKS=$(echo "$PR_STATE" | jq -r .checks)
+    REVIEW_DECISION=$(echo "$PR_STATE" | jq -r .review)
+  fi
+  if [ "$HEAD_OID" = "$SHIP_NOTE_SHA" ] && [ "$STATUS" != "UNKNOWN" ]; then
+    break
+  fi
+  sleep 3
+done
+
+if [ "$STATUS" = "BLOCKED" ] && [ "$CHECKS" = "0" ] && [ "$REVIEW_DECISION" != "REVIEW_REQUIRED" ] && [ "$REVIEW_DECISION" != "CHANGES_REQUESTED" ] && git log -1 --format=%B "$SHIP_NOTE_SHA" | grep -q '\[ci skip\]'; then
+  echo "⚠ PR is BLOCKED with zero checks. The [ci skip] trailer wedged the PR due to required checks."
+  echo "Pushing an empty commit to trigger the required pipelines..."
+  # gsd_run query commit requires a file list; use git directly for this intentionally empty commit.
+  git commit --allow-empty -m "chore: trigger CI (recover from ship-note skip-token)"
+  git push origin ${CURRENT_BRANCH} 2>&1 || echo "⚠ track_shipping: recovery push failed — rerun: git push origin ${CURRENT_BRANCH}"
+elif [ "$STATUS" = "UNKNOWN" ]; then
+  echo "⚠ track_shipping: PR mergeStateStatus is UNKNOWN after polling; PR may require manual check re-trigger."
+fi
 ```
 </step>
 

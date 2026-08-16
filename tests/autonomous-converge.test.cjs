@@ -8,7 +8,9 @@ const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const cp = require('node:child_process');
+const { runNode } = require('./helpers/process-seam.cjs');
+const { throwIfFailed } = require('./helpers/git-fixture.cjs');
+const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const COMMAND_PATH = path.join(REPO_ROOT, 'commands', 'gsd', 'autonomous.md');
@@ -156,10 +158,9 @@ describe('autonomous --converge flag (#711)', () => {
 
     // Behavioral coverage: prove the roster the workflow derives from actually
     // yields the flags this test used to hardcode, so the derivation is not vacuous.
-    const laneFlags = cp
-      .execFileSync(process.execPath, [TOOLS, 'review-lane', 'flags'], { encoding: 'utf8' })
-      .split('\n')
-      .filter(Boolean);
+    const laneFlagsResult = runNode([TOOLS, 'review-lane', 'flags'], { timeoutMs: PROBE_TIMEOUT_MS });
+    throwIfFailed(laneFlagsResult, `node ${TOOLS} review-lane flags`);
+    const laneFlags = laneFlagsResult.stdout.split('\n').filter(Boolean);
     for (const flag of formerlyHardcodedLaneFlags) {
       assert.ok(laneFlags.includes(flag), `review-lane flags should include ${flag}`);
     }
@@ -283,5 +284,44 @@ describe('autonomous verification deferral contract', () => {
     assert.match(iterateStep, /verification_status !== "passed"/);
     assert.match(iterateStep, /STATE_CONTENT=\$\(cat \.planning\/STATE\.md 2>\/dev\/null \|\| true\)/);
     assert.match(iterateStep, /drop deferred phases from the autonomous queue/);
+  });
+});
+
+// ─── Issue #3210: bounded blocker retries, needs_human escalation ────────────
+//
+// handle_blocker's "Fix and retry" path had no attempt ceiling across
+// invocations and no automatic escalation to a terminal needs_human state, so
+// a non-converging blocker (e.g. an operator gate the executor cannot satisfy)
+// looped indefinitely. Regression coverage lives here because this file owns
+// the autonomous.md host-workflow contract.
+
+describe('issue #3210: autonomous handle_blocker has a retry ceiling with needs_human escalation', () => {
+  function stepOf(content, name) {
+    const open = `<step name="${name}">`;
+    const from = content.indexOf(open);
+    assert.ok(from !== -1, `step "${name}" not found`);
+    const to = content.indexOf('</step>', from);
+    assert.ok(to !== -1, `step "${name}" has no closing tag`);
+    return content.slice(from, to);
+  }
+
+  test('handle_blocker bounds "Fix and retry" attempts per phase step', () => {
+    const step = stepOf(read(WORKFLOW_PATH), 'handle_blocker');
+    assert.match(
+      step,
+      /\b3\b.*retr|\bretr.*\b3\b|RETRY_COUNT|retry (ceiling|limit|count)/i,
+      'handle_blocker must track a bounded retry count for the same phase step instead of ' +
+      're-presenting "Fix and retry" indefinitely (#3210)'
+    );
+  });
+
+  test('handle_blocker auto-escalates to a terminal needs_human halt once the ceiling is exceeded', () => {
+    const step = stepOf(read(WORKFLOW_PATH), 'handle_blocker');
+    assert.match(
+      step,
+      /needs_human/,
+      'once the retry ceiling is exceeded, handle_blocker must halt autonomously in a terminal ' +
+      'needs_human state (surfacing the unmet items) instead of looping or asking again (#3210)'
+    );
   });
 });

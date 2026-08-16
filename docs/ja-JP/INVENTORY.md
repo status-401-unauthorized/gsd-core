@@ -189,7 +189,6 @@
 | `code-review.md` | gsd-code-reviewer でフェーズのソース変更をレビュー。REVIEW.md を作成。 | `/gsd-code-review` |
 | `complete-milestone.md` | 出荷されたバージョンを完了としてマーク — MILESTONES.md エントリー、PROJECT.md の進化、タグ。 | `/gsd-complete-milestone` |
 | `diagnose-issues.md` | 並列デバッグエージェントをオーケストレーションして UAT のギャップを調査し、根本原因を特定。 | `/gsd-verify-work` (auto-diagnosis) |
-| `discovery-phase.md` | 適切な深さレベルでディスカバリーを実行。 | `/gsd-new-project` (discovery path) |
 | `discuss-phase-assumptions.md` | 仮定モードの discuss — コードベースファーストの分析で実装決定を抽出。 | `/gsd-discuss-phase` (when `discuss_mode=assumptions`) |
 | `discuss-phase-power.md` | パワーユーザー discuss — すべての質問を JSON 状態ファイル + HTML UI に事前生成。 | `/gsd-discuss-phase --power` |
 | `discuss-phase.md` | 反復的なグレーゾーンの議論を通じて実装決定を抽出。 | `/gsd-discuss-phase` |
@@ -259,10 +258,9 @@
 | `thread.md` | クロスセッション作業のための永続的なコンテキストスレッドを作成、一覧表示、クローズ、または再開。 | `/gsd-thread` |
 | `update.md` | 変更履歴の表示付きで GSD を最新バージョンに更新。 | `/gsd-update` |
 | `validate-phase.md` | 完了したフェーズの Nyquist バリデーションのギャップを遡及監査して埋める。 | `/gsd-validate-phase` |
-| `verify-phase.md` | ゴール後退型分析によってフェーズ目標の達成を検証。 | `execute-phase.md` (post-execution) |
 | `verify-work.md` | 自動診断付きの会話型 UAT — UAT.md と修正プランを作成。 | `/gsd-verify-work` |
 
-> **注記:** 一部のワークフローには直接ユーザー向けのコマンドがありません（例: `execute-plan.md`、`verify-phase.md`、`transition.md`、`node-repair.md`、`diagnose-issues.md`）— これらはオーケストレーターワークフローによって内部的に呼び出されます。`discovery-phase.md` は `/gsd-new-project` の代替エントリーポイントです。
+> **注記:** 一部のワークフローには直接ユーザー向けのコマンドがありません（例: `execute-plan.md`、`transition.md`、`node-repair.md`、`diagnose-issues.md`）— これらはオーケストレーターワークフローによって内部的に呼び出されます。
 
 ---
 
@@ -280,6 +278,7 @@
 | `model-profile-resolution.md` | モデル解決アルゴリズムのドキュメント。 |
 | `verification-patterns.md` | 異なるアーティファクトタイプの検証方法。 |
 | `verification-overrides.md` | アーティファクトごとの検証オーバーライドルール。 |
+| `verifier-phase-gates.md` | gsd-verifier が eager import する検証時ゲート（廃止された verify-phase ワークフローから移行、#1892）：デシジョンカバレッジ検証（#2492）、テスト品質監査、インフラストラクチャフェーズの human-verification スコープ（#2504）。 |
 | `planning-config.md` | 完全な設定スキーマと動作。 |
 | `git-integration.md` | git コミット、ブランチ、履歴パターン。 |
 | `git-planning-commit.md` | 計画ディレクトリのコミット規約。 |

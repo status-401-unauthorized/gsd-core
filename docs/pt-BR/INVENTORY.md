@@ -189,7 +189,6 @@ Registro completo em `gsd-core/workflows/*.md`. Workflows são orquestradores en
 | `code-review.md` | Revisa alterações de código-fonte da fase via gsd-code-reviewer; produz REVIEW.md. | `/gsd-code-review` |
 | `complete-milestone.md` | Marca uma versão entregue como concluída — entrada no MILESTONES.md, evolução do PROJECT.md, tag. | `/gsd-complete-milestone` |
 | `diagnose-issues.md` | Orquestra agentes de debug paralelos para investigar lacunas de UAT e encontrar causas raiz. | `/gsd-verify-work` (autodiagnóstico) |
-| `discovery-phase.md` | Executa a descoberta no nível de profundidade apropriado. | `/gsd-new-project` (caminho de descoberta) |
 | `discuss-phase-assumptions.md` | Discuss no modo de premissas — extrai decisões de implementação via análise com base no código primeiro. | `/gsd-discuss-phase` (quando `discuss_mode=assumptions`) |
 | `discuss-phase-power.md` | Discuss para usuário avançado — pré-gera todas as perguntas em um arquivo de estado JSON + UI HTML. | `/gsd-discuss-phase --power` |
 | `discuss-phase.md` | Extrai decisões de implementação por meio de discussão iterativa de zonas cinzentas. | `/gsd-discuss-phase` |
@@ -259,10 +258,9 @@ Registro completo em `gsd-core/workflows/*.md`. Workflows são orquestradores en
 | `thread.md` | Cria, lista, fecha ou retoma threads de contexto persistentes para trabalho entre sessões. | `/gsd-thread` |
 | `update.md` | Atualiza o GSD para a versão mais recente com exibição do changelog. | `/gsd-update` |
 | `validate-phase.md` | Audita retroativamente e preenche lacunas de validação Nyquist para uma fase concluída. | `/gsd-validate-phase` |
-| `verify-phase.md` | Verifica o alcance dos objetivos da fase por meio de análise retroativa a partir dos objetivos. | `execute-phase.md` (pós-execução) |
 | `verify-work.md` | UAT conversacional com autodiagnóstico — produz UAT.md e planos de correção. | `/gsd-verify-work` |
 
-> **Nota:** Alguns workflows não têm comando direto voltado ao usuário (p. ex. `execute-plan.md`, `verify-phase.md`, `transition.md`, `node-repair.md`, `diagnose-issues.md`) — eles são invocados internamente por workflows orquestradores. `discovery-phase.md` é uma entrada alternativa para `/gsd-new-project`.
+> **Nota:** Alguns workflows não têm comando direto voltado ao usuário (p. ex. `execute-plan.md`, `transition.md`, `node-repair.md`, `diagnose-issues.md`) — eles são invocados internamente por workflows orquestradores.
 
 ---
 
@@ -280,6 +278,7 @@ Registro completo em `gsd-core/references/*.md`. Referências são documentos de
 | `model-profile-resolution.md` | Documentação do algoritmo de resolução de modelo. |
 | `verification-patterns.md` | Como verificar diferentes tipos de artefato. |
 | `verification-overrides.md` | Regras de substituição de verificação por artefato. |
+| `verifier-phase-gates.md` | Gates de verificação carregados eager pelo gsd-verifier (migrados do workflow verify-phase aposentado, #1892): validação de cobertura de decisões (#2492), auditoria de qualidade de testes, escopo de human-verification para fases de infraestrutura (#2504). | |
 | `planning-config.md` | Esquema completo de configuração e comportamento. |
 | `git-integration.md` | Padrões de commit git, ramificação e histórico. |
 | `git-planning-commit.md` | Convenções de commit do diretório de planejamento. |

@@ -14,7 +14,7 @@ import planningWorkspace = require('./planning-workspace.cjs');
 import frontmatterMod = require('./frontmatter.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- state.cjs is an export= CommonJS module
 import stateMod = require('./state.cjs');
-import { platformWriteSync, platformEnsureDir, execGit, retryRenameSync } from './shell-command-projection.cjs';
+import { platformWriteSync, platformReadSync, platformEnsureDir, execGit, retryRenameSync } from './shell-command-projection.cjs';
 import { formatGsdSlash, resolveRuntime } from './runtime-slash.cjs';
 import { realClock } from './clock.cjs';
 import { transitionCore } from './state-transition.cjs';
@@ -26,16 +26,37 @@ import ioMod = require('./io.cjs');
 const { output, error } = ioMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import phaseIdMod = require('./phase-id.cjs');
-const { escapeRegex, normalizePhaseName, phaseTokenMatches, PHASE_NUMBER_TOKEN_SOURCE } = phaseIdMod;
+const { normalizePhaseName, matchPhaseDirs, PHASE_NUMBER_TOKEN_SOURCE, isSentinelPhaseId } = phaseIdMod;
+import { escapeRegex } from './pattern.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import roadmapParserMod = require('./roadmap-parser.cjs');
-const { getMilestonePhaseFilter, extractCurrentMilestone, getMilestoneInfo } = roadmapParserMod;
+const {
+  getMilestonePhaseFilter,
+  extractCurrentMilestone,
+  getMilestoneInfo,
+  sliceMilestoneWindow,
+} = roadmapParserMod;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import planningScopeMod = require('./planning-scope.cjs');
+const { SCOPE } = planningScopeMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import coreUtilsMod = require('./core-utils.cjs');
-const { extractOneLinerFromBody } = coreUtilsMod;
+const { extractOneLinerFromBody, countMatchedSummaries } = coreUtilsMod;
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- plan-scan.cjs is an export= CommonJS module
+import planScanMod = require('./plan-scan.cjs');
+const { scanPhasePlans } = planScanMod;
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- phase-locator.cjs is an export= CommonJS module
+import phaseLocatorMod = require('./phase-locator.cjs');
+const { listMilestonePhaseDirs } = phaseLocatorMod;
 const { planningPaths } = planningWorkspace;
 const { extractFrontmatter } = frontmatterMod;
-const { writeStateMd } = stateMod;
+// ADR-3408 §8.3 / #3469: `writeStateMd` gets sync and NO preservation — the
+// same #3374-shaped exposure the milestone-complete write used to carry (a
+// stale body value silently clobbering fresher frontmatter, with no
+// divergence signal). Routed through the single write-seam composition
+// (`syncAndPreserveStateMd`) instead, under `withStateLock` — see
+// `cmdMilestoneComplete`'s own STATE.md-update block for the full rationale.
+const { syncAndPreserveStateMd, withStateLock } = stateMod;
 
 // #2288 security: a milestone version label becomes a filesystem directory
 // component (`milestones/<label>-phases/`) into which phase directories are
@@ -333,17 +354,21 @@ function cmdRequirementsReadyIds(cwd: string, args: string[], raw: boolean): voi
   }
 
   const planAbsPath = path.resolve(cwd, planPathArg);
-  const phaseDir = path.dirname(planAbsPath);
-  const currentBasename = path.basename(planAbsPath);
+  // #3183: `planPathArg` may point at a root plan (`<phaseDir>/<n>-PLAN.md`)
+  // or a nested plan (`<phaseDir>/plans/PLAN-<n>.md`, #3139 layout) —
+  // scanPhasePlans always operates on the PHASE dir, so a nested plan needs
+  // one extra `dirname` to reach it, and its planFiles-relative identity
+  // carries the `plans/` prefix scanPhasePlans itself applies.
+  const isNestedPlanPath = path.basename(path.dirname(planAbsPath)) === 'plans';
+  const phaseDir = isNestedPlanPath ? path.dirname(path.dirname(planAbsPath)) : path.dirname(planAbsPath);
+  const currentRelative = isNestedPlanPath ? `plans/${path.basename(planAbsPath)}` : path.basename(planAbsPath);
 
-  let siblingPlanFiles: string[] = [];
-  try {
-    siblingPlanFiles = fs
-      .readdirSync(phaseDir)
-      .filter((f) => f.endsWith('-PLAN.md') && f !== currentBasename);
-  } catch {
-    siblingPlanFiles = [];
-  }
+  // #3183: canonical plan/summary sets (root+nested, superseded-excluded)
+  // from the single owner, rather than a root-only hand-rolled readdirSync
+  // filter — a superseded sibling that still declares reqId with no SUMMARY
+  // used to block the ID forever (false-block); it is now excluded upstream.
+  const phaseScan = scanPhasePlans(phaseDir);
+  const siblingPlanFiles = phaseScan.planFiles.filter((f) => f !== currentRelative);
 
   const parseFrontmatterReqIds = (content: string, sourcePath?: string): string[] => {
     const fm = extractFrontmatter(content, sourcePath);
@@ -379,9 +404,11 @@ function cmdRequirementsReadyIds(cwd: string, args: string[], raw: boolean): voi
       if (!siblingDeclaresId) continue;
 
       // Sibling declares the SAME ID — it must have finished (produced a
-      // SUMMARY) before this ID is ready to mark Complete.
-      const siblingSummaryPath = siblingPath.replace(/-PLAN\.md$/, '-SUMMARY.md');
-      if (!fs.existsSync(siblingSummaryPath)) {
+      // SUMMARY) before this ID is ready to mark Complete. Canonical pairing
+      // via countMatchedSummaries (root+nested, all three naming forms)
+      // instead of a bespoke -PLAN.md→-SUMMARY.md regex swap.
+      const siblingHasSummary = countMatchedSummaries([siblingFile], phaseScan.summaryFiles) > 0;
+      if (!siblingHasSummary) {
         blockedBySibling = true;
         break;
       }
@@ -510,18 +537,58 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
   const phasesDir = planningPaths(cwd).phases;
   const today = realClock.localToday();
   const milestoneName = options.name || version;
-
-  // Ensure archive directory exists (skipped in dry-run — no mutations)
-  if (!options.dryRun) {
-    platformEnsureDir(archiveDir);
-  }
+  // ADR-3408 §8.5 / #3469: "liberal but visible" — when the write-seam
+  // composition's preservation stage restores a curated frontmatter value
+  // over a disagreeing freshly-derived one, that divergence is surfaced
+  // here rather than silently absorbed (the direct answer to #3374's
+  // `warnings: []`). Structured (field + reason), not prose, so a caller can
+  // assert on the value rather than regex a rendered message.
+  //
+  // Named `preservation_warnings`, NOT `warnings`: `cmdPhaseComplete` already
+  // exposes a sibling field called `warnings` typed as prose `string[]`. Reusing
+  // that name here for a structured `{field, reason}[]` shape would be the
+  // "Generative Fix Divergence" anti-pattern — two sibling state commands
+  // sharing one field name with different element types. `warnings` stays
+  // one meaning (prose) repo-wide; this is a distinct, machine-assertable
+  // signal for ADR-3408 §8.5's "preservation is visible" rule. Check
+  // `preservation_warnings.length` rather than a companion `has_warnings`
+  // flag — that flag existed only to mirror `cmdPhaseComplete`'s channel,
+  // which this field intentionally does not claim to be.
+  const preservationWarnings: Array<{ field: string; reason: string }> = [];
 
   // Scope stats and accomplishments to only the phases belonging to the
   // current milestone's ROADMAP.  Uses the shared filter from roadmap-parser.cjs
   // (same logic used by cmdPhasesList and other callers).
+  // #3184 review finding: this scope computation + refusal MUST run BEFORE
+  // `platformEnsureDir(archiveDir)` below — a refused run (scope not COMPLETE,
+  // no --force) must be a true no-op on disk, and creating the archive
+  // directory first left an empty directory behind even on refusal.
   const isDirInMilestone = getMilestonePhaseFilter(cwd, version);
   if (isDirInMilestone.missingExplicitVersion) {
     error(`no phases found for milestone ${version} in ROADMAP.md`);
+  }
+  // #3184/#3166: `milestone complete` is the ONE-WAY-DOOR consumer of the
+  // milestone window (ROADMAP/REQUIREMENTS archived, phase directories
+  // MOVED). #3166 is specifically the TRUNCATED case: the milestone's
+  // heading IS found but its section closes before the phase region, and the
+  // phase filter degrades to pass-all (see getMilestonePhaseFilter above) —
+  // silently archiving every phase directory on disk. UNREADABLE (no
+  // ROADMAP.md at all) and UNSCOPED (no section for this version) are
+  // pre-existing, legitimately-handled states — `missingExplicitVersion`
+  // above already errors where that matters, and a missing ROADMAP.md has
+  // its own documented graceful path — so only TRUNCATED is refused here.
+  // The read-path consumers keep the pass-all degrade for every scope
+  // (ADR-3180 Decision 3's Rejected section: deny-all there would trade one
+  // silent wrong answer for another); this write path refuses on TRUNCATED
+  // alone, positioned before `platformEnsureDir` so a refusal stays a no-op
+  // on disk.
+  if (isDirInMilestone.scope === SCOPE.TRUNCATED && !options.force) {
+    error(
+      `Cannot mark milestone complete: the ROADMAP window for "${version}" is truncated ` +
+        `(the milestone heading was found but its section ends before reaching any phase ` +
+        `entries, even though the ROADMAP has phase entries elsewhere), so phase scoping ` +
+        `cannot be trusted for this destructive operation. Re-run with --force to override.`,
+    );
   }
 
   // Guard: prevent marking complete when ROADMAP still lists phases that have
@@ -578,7 +645,21 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
       }
 
       const roadmapContent = fs.readFileSync(roadmapPath, 'utf-8');
-      const scopedContent = extractCurrentMilestone(roadmapContent, cwd);
+      // #3184/#2946: scope the unstarted-phase guard to the same `version`
+      // window `getMilestonePhaseFilter` used above, NOT to
+      // extractCurrentMilestone's own STATE.md-derived window — those two
+      // can disagree (that disagreement is exactly what the WARNING above
+      // detects), and scoping this guard to the wrong window under-detects
+      // unstarted phases on the destructive completion path. Calls the same
+      // sliceMilestoneWindow owner getMilestonePhaseFilter's versionOverride
+      // branch calls (a prior pass here re-composed locate+select+section-end
+      // locally, which review caught as a second, disagreeing derivation of
+      // the same window — ADR-3180 Decision 4(c)); falls back to
+      // extractCurrentMilestone's whole-document result only for the
+      // free-form (no versioned milestones anywhere) shape, where both
+      // windows converge to the same value regardless of which version drove
+      // the lookup.
+      const scopedContent = sliceMilestoneWindow(roadmapContent, version) ?? extractCurrentMilestone(roadmapContent, cwd);
       // #1729: `(?:\s*\([^)\n]{0,200}\))?` tolerates a pre-colon ( ) tag (literal mirror of OPTIONAL_PHASE_TAG_SOURCE).
       const phasePattern = new RegExp(`#{2,4}\\s*Phase\\s+(${PHASE_NUMBER_TOKEN_SOURCE})(?:\\s*\\([^)\\n]{0,200}\\))?\\s*:\\s*([^\\n]+)`, 'gi');
       const noDirectoryPhases: string[] = [];
@@ -600,14 +681,14 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
         // milestone completion. Mirrors the engine-wide sentinel convention
         // (phase-id getMilestoneFromPhaseId, roadmap-command-router SENTINELS,
         // the #1445 /^999/ progress filters). (#1580)
-        const major = parseInt(phaseNum, 10);
-        if (major === 0 || major === 999) continue;
+        // #3185: canonical sentinel predicate (SENTINEL_RANGES [0,999]) — this local check already covered both 0 and 999; now delegates to the single canonical owner.
+        if (isSentinelPhaseId(phaseNum)) continue;
         const normalized = normalizePhaseName(phaseNum);
         // A phase has disk_status: 'no_directory' when no phase directory
-        // with a matching token exists on disk. Use the same phaseTokenMatches
-        // helper that roadmap.analyze uses to avoid false positives on decimal
-        // (2.1) and letter-suffix (12A) phase IDs.
-        const hasDirectory = phaseDirEntries.some((d) => phaseTokenMatches(d, normalized));
+        // with a matching token exists on disk. Use the same matchPhaseDirs
+        // owner that roadmap.analyze uses to avoid false positives on decimal
+        // (2.1) and letter-suffix (12A) phase IDs. (#2528)
+        const hasDirectory = matchPhaseDirs(phaseDirEntries, normalized).matches.length > 0;
         if (!hasDirectory) {
           noDirectoryPhases.push(phaseNum);
         }
@@ -633,20 +714,21 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
   const accomplishments: string[] = [];
 
   try {
-    const entries = fs.readdirSync(phasesDir, { withFileTypes: true });
-    const dirs = entries
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name)
-      .sort();
+    // #3185 (ADR-3180 Decision 1): "which phase directories belong to the
+    // CURRENT milestone" — routed through the canonical owner (with the
+    // explicit `version` this command already resolved) instead of a
+    // hand-rolled readdirSync + isDirInMilestone filter, which also never
+    // excluded sentinels, unlike the owner.
+    const dirs = listMilestonePhaseDirs(phasesDir, { cwd, versionOverride: version }).value;
 
     for (const dir of dirs) {
-      if (!isDirInMilestone(dir)) continue;
-
       phaseCount++;
-      const phaseFiles = fs.readdirSync(path.join(phasesDir, dir));
-      const plans = phaseFiles.filter((f) => f.endsWith('-PLAN.md') || f === 'PLAN.md');
-      const summaries = phaseFiles.filter((f) => f.endsWith('-SUMMARY.md') || f === 'SUMMARY.md');
-      totalPlans += plans.length;
+      // #3183: canonical plan/summary sets (root+nested, superseded-excluded)
+      // from the single owner, rather than a root-only hand-rolled readdirSync
+      // filter.
+      const phaseScan = scanPhasePlans(path.join(phasesDir, dir));
+      const summaries = phaseScan.summaryFiles;
+      totalPlans += phaseScan.planCount;
 
       // Extract one-liners from summaries
       for (const s of summaries) {
@@ -690,14 +772,10 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
   if (options.dryRun) {
     const phaseDirsToArchive: string[] = [];
     if (options.archivePhases !== false) {
-      try {
-        const entries = fs.readdirSync(phasesDir, { withFileTypes: true });
-        for (const e of entries) {
-          if (e.isDirectory() && isDirInMilestone(e.name)) {
-            phaseDirsToArchive.push(e.name);
-          }
-        }
-      } catch { /* phasesDir missing — nothing to archive */ }
+      // #3185 (ADR-3180 Decision 1): same routed derivation as the stats loop
+      // above — the dry-run preview must list exactly what the real archive
+      // pass below would move.
+      phaseDirsToArchive.push(...listMilestonePhaseDirs(phasesDir, { cwd, versionOverride: version }).value);
     }
     const dryRunResult = {
       dry_run: true,
@@ -725,6 +803,14 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
     output(dryRunResult, raw);
     return;
   }
+
+  // Ensure archive directory exists. Deliberately placed AFTER the dry-run
+  // early return and every refusal/guard above (missingExplicitVersion, the
+  // scope refusal, the unstarted-phase guard) — #3184 review finding: this
+  // used to run before those checks, so a refused run still left an empty
+  // archive directory behind. Reaching this point means the run is
+  // committed to mutating.
+  platformEnsureDir(archiveDir);
 
   // Archive ROADMAP.md
   if (fs.existsSync(roadmapPath)) {
@@ -762,7 +848,13 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
       platformWriteSync(milestonesPath, `# Milestones\n\n${milestoneEntry}`);
     } else {
       // Insert after the header line(s) for reverse chronological order (newest first)
-      const headerMatch = existing.match(/^(#{1,3}\s+[^\n]*\n\n?)/);
+      // #3415: empirically verified linear-time up to 5MB adversarial input (worst-case
+      // no-newline-at-all forcing full [^\r\n]* backtrack: 0.11ms@10KB -> 6.9ms@5MB).
+      // Non-global, `^`-anchored (no /m) so this is a single match attempt at position 0
+      // only — never rescanned at every offset — with no nested repeated group, so it
+      // cannot exhibit the #2128-class catastrophic backtracking.
+      // eslint-disable-next-line local/no-unbounded-quantifier -- single ^-anchored non-global attempt at pos 0, measured linear to 5MB, no nested quantifier
+      const headerMatch = existing.match(/^(#{1,3}\s+[^\r\n]*\r?\n(?:\r?\n)?)/);
       if (headerMatch) {
         const header = headerMatch[1];
         const rest = existing.slice(header.length);
@@ -782,19 +874,86 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
   // reset, Operator Next Steps reset) is the pure `milestoneCompleteCore` in
   // src/state-transition.cts, backed by the field-classification table. The
   // runtime-specific next-milestone slash command is resolved here and injected
-  // via the intent so the core stays pure. writeStateMd still owns the lock and
-  // the steady-state syncStateFrontmatter post-sync.
+  // via the intent so the core stays pure.
+  //
+  // ADR-3408 §8.3 / #3469: this used to write via `writeStateMd`, which gets
+  // sync and NO preservation — the identical shape #3374 reported for
+  // `phase.complete` (a stale body value silently clobbering fresher
+  // frontmatter). Routed through the single write-seam composition
+  // (`syncAndPreserveStateMd`) instead, under the same lock discipline
+  // `cmdPhaseComplete`'s atomic-commit adapter already uses: `withStateLock`
+  // wraps read + transform + sync + preserve + write so the read this
+  // transaction bases its transform on cannot be raced by a concurrent
+  // writer (closing a pre-existing TOCTOU gap `writeStateMd`'s own internal
+  // lock never covered, since the read used to happen before any lock was
+  // taken). `resync: true` mirrors `cmdPhaseComplete`'s posture (progress
+  // recomputed from disk; only the preserve-when-unchanged deltas apply) —
+  // milestone completion is the same kind of lifecycle transition.
   if (fs.existsSync(statePath)) {
-    const result = transitionCore(
-      fs.readFileSync(statePath, 'utf-8'),
-      {
-        kind: 'milestoneComplete',
-        version,
-        nextMilestoneCommand: formatGsdSlash('new-milestone', resolveRuntime(cwd)) as string,
-      },
-      { clock: realClock, sourcePath: statePath },
-    );
-    writeStateMd(statePath, result.content, cwd);
+    withStateLock(statePath, () => {
+      const originalStateContent = platformReadSync(statePath) || '';
+      const result = transitionCore(
+        originalStateContent,
+        {
+          kind: 'milestoneComplete',
+          version,
+          nextMilestoneCommand: formatGsdSlash('new-milestone', resolveRuntime(cwd)) as string,
+        },
+        { clock: realClock, sourcePath: statePath },
+      );
+      const divergedFields: string[] = [];
+      // #2111 (found by #3471 review): `milestoneCompleteCore` never declares
+      // `current_phase`/`current_phase_name` among the fields it touches — but
+      // its ## Current Position reset REWRITES the `Phase:` prose line to a
+      // closure message ("Milestone vX.Y complete"), which is not a number.
+      // That is an unavoidable side effect of the wholesale section reset
+      // `resetSectionVerbatim` performs, not an intent to change the phase.
+      // Downstream, `current_phase`/`current_phase_name` are
+      // `preserve-when-unchanged` rows: the #1230 delta heuristic sees the
+      // body source go from a real value to unparseable and — correctly, per
+      // ADR-3408 §8.5 Row 2 — lets the derived (empty) value win, discarding
+      // the curated phase entirely. §8.5 Row 2 governs a genuine mid-write
+      // body edit (e.g. `state.patch` deleting the Phase line); milestone
+      // closure is a different shape — the transition never intended to
+      // touch these fields at all. Re-assert them via `authoritativeFm` (the
+      // same #2736 intent-first mechanism `beginPhaseCore`/`completePhaseCore`
+      // already use to freeze a field the transition resolved out-of-band),
+      // so the closure-message side effect cannot clobber the last real
+      // phase. Scoped to non-empty strings only, mirroring #2736's own guard.
+      const authoritativeFm: Record<string, unknown> = {};
+      const preFm = extractFrontmatter(originalStateContent, statePath) as Record<string, unknown>;
+      const preCurrentPhase = preFm['current_phase'];
+      const preCurrentPhaseName = preFm['current_phase_name'];
+      if (typeof preCurrentPhase === 'string' && preCurrentPhase.trim().length > 0) {
+        authoritativeFm['current_phase'] = preCurrentPhase;
+      }
+      if (typeof preCurrentPhaseName === 'string' && preCurrentPhaseName.trim().length > 0) {
+        authoritativeFm['current_phase_name'] = preCurrentPhaseName;
+      }
+      const finalContent = syncAndPreserveStateMd(
+        originalStateContent,
+        result.content,
+        statePath,
+        cwd,
+        {
+          resync: true,
+          authoritativeFm: Object.keys(authoritativeFm).length > 0 ? authoritativeFm : undefined,
+          divergedFields,
+        },
+      );
+      platformWriteSync(statePath, finalContent);
+      for (const field of divergedFields) {
+        preservationWarnings.push({ field, reason: 'preserved-over-disagreeing-derived' });
+      }
+      // The authoritativeFm re-assert above (unlike a delta-based restore) is
+      // invisible to `divergedFields` — #2736's re-assert runs after that
+      // diff — so surface it explicitly here for "liberal but visible".
+      for (const field of Object.keys(authoritativeFm)) {
+        if (!divergedFields.includes(field)) {
+          preservationWarnings.push({ field, reason: 'preserved-over-disagreeing-derived' });
+        }
+      }
+    });
   }
 
   // Archive phase directories if requested
@@ -813,10 +972,12 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
       const phaseArchiveDir = path.join(archiveDir, `${version}-phases`);
       platformEnsureDir(phaseArchiveDir);
 
-      const phaseEntries = fs.readdirSync(phasesDir, { withFileTypes: true });
-      const phaseDirNames = phaseEntries.filter((e) => e.isDirectory()).map((e) => e.name);
+      // #3185 (ADR-3180 Decision 1): same routed derivation as the stats
+      // loop above — only the CURRENT milestone's phase directories move,
+      // never a sentinel or an out-of-window directory left for a later
+      // milestone.
+      const phaseDirNames = listMilestonePhaseDirs(phasesDir, { cwd, versionOverride: version }).value;
       for (const dir of phaseDirNames) {
-        if (!isDirInMilestone(dir)) continue;
         retryRenameSync(path.join(phasesDir, dir), path.join(phaseArchiveDir, dir));
         archivedCount++;
       }
@@ -845,6 +1006,7 @@ function cmdMilestoneComplete(cwd: string, version: string, options: MilestoneCo
     },
     milestones_updated: true,
     state_updated: fs.existsSync(statePath),
+    preservation_warnings: preservationWarnings,
   };
 
   output(result, raw);
@@ -886,7 +1048,13 @@ function cmdPhasesClear(cwd: string, raw: boolean, args: string[]): void {
 
   if (fs.existsSync(phasesDir)) {
     const entries = fs.readdirSync(phasesDir, { withFileTypes: true });
-    const dirs = entries.filter((e) => e.isDirectory() && !/^999(?:\.|$)/.test(e.name));
+    // #3185 (ADR-3180 Decision 1): this carried the FIFTH copy of the
+    // sentinel rule and its THIRD regex variant — `/^999(?:\.|$)/` — which
+    // excluded 999 but NOT 0. Because this is the DESTRUCTIVE path, that
+    // divergence meant a `0-*` directory `roadmap analyze` preserves as a
+    // sentinel was DELETED here. Routed through the canonical predicate so
+    // every reader of "is this a sentinel phase" agrees by construction.
+    const dirs = entries.filter((e) => e.isDirectory() && !isSentinelPhaseId(e.name));
 
     if (dirs.length > 0 && !confirm) {
       error(
@@ -978,7 +1146,13 @@ function archivePhaseDirectories(cwd: string, phasesDir: string, dirs: ReadonlyA
   let archiveVersion: string | null = safeOverride;
   if (!archiveVersion) {
     try {
-      const liveVersion = getMilestoneInfo(cwd).version ?? null;
+      // #3216 (ADR-3180 §7.2 Decision): getMilestoneInfo's version becomes a
+      // DIRECTORY NAME below — only a COMPLETE scope's identity is trustworthy
+      // enough to act on destructively. On any other scope, treat the version
+      // as unavailable so control falls through to the dated-label fallback,
+      // same as an unreadable ROADMAP/STATE.
+      const info = getMilestoneInfo(cwd);
+      const liveVersion = info.scope === SCOPE.COMPLETE ? (info.value?.version ?? null) : null;
       // Defense in depth (#2288 security): getMilestoneInfo reads STATE.md's
       // `milestone:` field, which is unvalidated file content. Only accept it
       // as a path component if it is a safe version label; a crafted value

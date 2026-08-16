@@ -19,13 +19,22 @@
 
 process.env.GSD_TEST_MODE = '1';
 
-const { test, describe } = require('node:test');
+const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const os = require('node:os');
 
 const { createTempDir, cleanup } = require('./helpers.cjs');
+const { runNode } = require('./helpers/process-seam.cjs');
+const { INSTALL_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+const {
+  INSTALL_SCRIPT,
+  MANIFEST_NAME,
+  installerEnv,
+  stripAnsi,
+} = require('./helpers/install-shared.cjs');
 
 const {
   installRuntimeArtifacts,
@@ -42,6 +51,7 @@ const {
 } = require('../gsd-core/bin/lib/runtime-artifact-layout.cjs');
 
 const { applySurface } = require('../gsd-core/bin/lib/surface.cjs');
+const { escapeRegex } = require('../gsd-core/bin/lib/pattern.cjs');
 
 const {
   loadSkillsManifest,
@@ -433,7 +443,7 @@ describe('installOpencodeFamilySkills — emits skills/<name>/SKILL.md (#784)', 
         );
         // Regression guard for the prefix-overlap double-rewrite (e.g. kilo-alt-alt).
         assert.ok(
-          !new RegExp(`${defaultBase.replace(/[\\.*+?^${}()|[\]]/g, '\\$&')}-[^/\\s]*-`).test(body),
+          !new RegExp(`${escapeRegex(defaultBase)}-[^/\\s]*-`).test(body),
           `${skillName}: must not contain a doubled config-dir suffix`,
         );
       }
@@ -3387,50 +3397,22 @@ describe('#769/#1319 convertClaudeCommandToClaudeSkill: preserves context and em
       `SKILL.md frontmatter must include context: fork\nActual frontmatter:\n${fm}`);
   });
 
-  test('normalizes effort: xhigh/max to effort: high in emitted SKILL.md frontmatter (#1319/#3039)', () => {
-    const input = [
-      '---',
-      'name: gsd:test-heavy',
-      'description: Test heavy skill',
-      'context: fork',
-      'effort: xhigh',
-      'allowed-tools:',
-      '  - Read',
-      '  - Bash',
-      '---',
-      '',
-      'Heavy skill body.',
-    ].join('\n');
-
-    const result = convertClaudeCommandToClaudeSkill(input, 'test-heavy');
-    const end = result.indexOf('---', 3);
-    const fm = result.substring(3, end);
-
-    assert.match(fm, /^effort:[ \t]*high$/m,
-      `SKILL.md frontmatter must include portable effort: high (#3039)\nActual frontmatter:\n${fm}`);
-    assert.doesNotMatch(fm, /^effort:[ \t]*(xhigh|max)$/m,
-      `SKILL.md frontmatter must not include rejected effort: xhigh or max (#1319/#3039)\nActual frontmatter:\n${fm}`);
-  });
-
-  test('preserves effort: low in emitted SKILL.md frontmatter', () => {
-    const input = [
-      '---',
-      'name: gsd:test-light',
-      'description: Test light skill',
-      'effort: low',
-      'allowed-tools:',
-      '  - Read',
-      '---',
-      '',
-      'Light skill body.',
-    ].join('\n');
-
-    const result = convertClaudeCommandToClaudeSkill(input, 'test-light');
-    const end = result.indexOf('---', 3);
-    const fm = result.substring(3, end);
-
-    assert.match(fm, /^effort:[ \t]*low$/m,
-      `SKILL.md frontmatter must include effort: low\nActual frontmatter:\n${fm}`);
+  test('#3151: does NOT emit effort: into SKILL.md frontmatter (a static effort value invalidates the caller\'s prompt cache)', () => {
+    // Whatever effort the source command declares, the installed SKILL.md must
+    // NOT carry it: Claude Code applies SKILL.md `effort:` as output_config.effort,
+    // and any change from the session baseline invalidates the prompt cache at both
+    // scope boundaries (entry + exit). Verified by the reporter's owned measurement.
+    const inputs = [
+      ['xhigh source', '---\nname: gsd:test-heavy\ndescription: Heavy\ncontext: fork\neffort: xhigh\nallowed-tools:\n  - Read\n---\n\nBody.\n'],
+      ['low source', '---\nname: gsd:test-light\ndescription: Light\neffort: low\nallowed-tools:\n  - Read\n---\n\nBody.\n'],
+    ];
+    for (const [label, input] of inputs) {
+      const result = convertClaudeCommandToClaudeSkill(input, label === 'xhigh source' ? 'test-heavy' : 'test-light');
+      const end = result.indexOf('---', 3);
+      const fm = result.substring(3, end);
+      assert.doesNotMatch(fm, /^effort:/m,
+        `SKILL.md frontmatter must NOT include effort: for ${label} (#3151)\nActual frontmatter:\n${fm}`);
+    }
   });
 
   test('does NOT emit context: or effort: when absent from source', () => {
@@ -3460,7 +3442,7 @@ describe('#769/#1319 convertClaudeCommandToClaudeSkill: preserves context and em
 
 // #921/#922: after install, spawning orchestrators must NOT carry context: fork
 // in their emitted SKILL.md. #1319: heavyweight skills must use portable max effort.
-describe('#769/#921/#1319 Claude global install: spawning-orchestrator SKILL.md files have effort: high (clamped from max) but NOT context: fork', () => {
+describe('#769/#921/#3151 Claude global install: SKILL.md files emit NO effort (#3151 — static effort invalidates caller cache) and NOT context: fork', () => {
   let tmpDir;
   let claudeHome;
 
@@ -3482,14 +3464,12 @@ describe('#769/#921/#1319 Claude global install: spawning-orchestrator SKILL.md 
       `gsd-autonomous is a spawning orchestrator; its SKILL.md must NOT have context: fork (#921)\nActual:\n${fm}`);
   });
 
-  test('gsd-autonomous SKILL.md has effort: max after global install (#1319)', () => {
+  test('gsd-autonomous SKILL.md does NOT emit effort: after global install (#3151)', () => {
     runClaudeGlobalInstall(claudeHome);
     const skillPath = flatSkillPath(path.join(claudeHome, 'skills'),'autonomous');
     const fm = readFrontmatter(skillPath);
-    assert.match(fm, /^effort:[ \t]*high$/m,
-      `gsd-autonomous SKILL.md must have effort: high\nActual:\n${fm}`);
-    assert.doesNotMatch(fm, /^effort:[ \t]*xhigh$/m,
-      `gsd-autonomous SKILL.md must not have rejected effort: xhigh or max (#1319/#3039)\nActual:\n${fm}`);
+    assert.doesNotMatch(fm, /^effort:/m,
+      `gsd-autonomous SKILL.md must NOT emit effort: (#3151 — a static value invalidates the caller's prompt cache)\nActual:\n${fm}`);
   });
 
   test('gsd-execute-phase SKILL.md does NOT have context: fork after global install (#921)', () => {
@@ -3500,14 +3480,12 @@ describe('#769/#921/#1319 Claude global install: spawning-orchestrator SKILL.md 
       `gsd-execute-phase is a spawning orchestrator; its SKILL.md must NOT have context: fork (#921)\nActual:\n${fm}`);
   });
 
-  test('gsd-execute-phase SKILL.md has effort: max after global install (#1319)', () => {
+  test('gsd-execute-phase SKILL.md does NOT emit effort: after global install (#3151)', () => {
     runClaudeGlobalInstall(claudeHome);
     const skillPath = flatSkillPath(path.join(claudeHome, 'skills'),'execute-phase');
     const fm = readFrontmatter(skillPath);
-    assert.match(fm, /^effort:[ \t]*high$/m,
-      `gsd-execute-phase SKILL.md must have effort: high\nActual:\n${fm}`);
-    assert.doesNotMatch(fm, /^effort:[ \t]*xhigh$/m,
-      `gsd-execute-phase SKILL.md must not have rejected effort: xhigh or max (#1319/#3039)\nActual:\n${fm}`);
+    assert.doesNotMatch(fm, /^effort:/m,
+      `gsd-execute-phase SKILL.md must NOT emit effort: (#3151)\nActual:\n${fm}`);
   });
 
   test('gsd-plan-phase SKILL.md does NOT have context: fork after global install (#921)', () => {
@@ -3518,30 +3496,28 @@ describe('#769/#921/#1319 Claude global install: spawning-orchestrator SKILL.md 
       `gsd-plan-phase is a spawning orchestrator; its SKILL.md must NOT have context: fork (#921)\nActual:\n${fm}`);
   });
 
-  test('gsd-plan-phase SKILL.md has effort: max after global install (#1319)', () => {
+  test('gsd-plan-phase SKILL.md does NOT emit effort: after global install (#3151)', () => {
     runClaudeGlobalInstall(claudeHome);
     const skillPath = flatSkillPath(path.join(claudeHome, 'skills'),'plan-phase');
     const fm = readFrontmatter(skillPath);
-    assert.match(fm, /^effort:[ \t]*high$/m,
-      `gsd-plan-phase SKILL.md must have effort: high\nActual:\n${fm}`);
-    assert.doesNotMatch(fm, /^effort:[ \t]*xhigh$/m,
-      `gsd-plan-phase SKILL.md must not have rejected effort: xhigh or max (#1319/#3039)\nActual:\n${fm}`);
+    assert.doesNotMatch(fm, /^effort:/m,
+      `gsd-plan-phase SKILL.md must NOT emit effort: (#3151)\nActual:\n${fm}`);
   });
 
-  test('gsd-progress SKILL.md has effort: low after global install', () => {
+  test('gsd-progress SKILL.md does NOT emit effort: after global install (#3151)', () => {
     runClaudeGlobalInstall(claudeHome);
     const skillPath = flatSkillPath(path.join(claudeHome, 'skills'),'progress');
     const fm = readFrontmatter(skillPath);
-    assert.match(fm, /^effort:[ \t]*low$/m,
-      `gsd-progress SKILL.md must have effort: low\nActual:\n${fm}`);
+    assert.doesNotMatch(fm, /^effort:/m,
+      `gsd-progress SKILL.md must NOT emit effort: (#3151)\nActual:\n${fm}`);
   });
 
-  test('gsd-stats SKILL.md has effort: low after global install', () => {
+  test('gsd-stats SKILL.md does NOT emit effort: after global install (#3151)', () => {
     runClaudeGlobalInstall(claudeHome);
     const skillPath = flatSkillPath(path.join(claudeHome, 'skills'),'stats');
     const fm = readFrontmatter(skillPath);
-    assert.match(fm, /^effort:[ \t]*low$/m,
-      `gsd-stats SKILL.md must have effort: low\nActual:\n${fm}`);
+    assert.doesNotMatch(fm, /^effort:/m,
+      `gsd-stats SKILL.md must NOT emit effort: (#3151)\nActual:\n${fm}`);
   });
 });
   });
@@ -3773,10 +3749,16 @@ describe('#443 Config-driven: effort.agent_overrides drives install-time effort'
     fs.mkdirSync(path.join(projectDir, '.planning'), { recursive: true });
 
     // Write a project config with effort.agent_overrides overriding gsd-planner to 'low'.
-    // runtime:"codex" pins a Codex-native model, so emitting model_reasoning_effort
-    // remains valid under the #838 model/effort coupling rule.
+    // #3241: runtime:"codex" alone (with no model_overrides) no longer auto-pins a
+    // per-tier model — the resolver-only embed was removed (D1). These tests add an
+    // explicit model_overrides pin below so a real Codex model id survives (#3241
+    // row 4, "unchanged"), which keeps emitting model_reasoning_effort valid under
+    // the #838 model/effort coupling rule.
     const config = {
       runtime: 'codex',
+      model_overrides: {
+        'gsd-planner': 'gpt-5.6-sol',
+      },
       effort: {
         agent_overrides: {
           'gsd-planner': 'low',
@@ -3815,9 +3797,13 @@ describe('#443 Config-driven: effort.agent_overrides drives install-time effort'
 
   test('Codex .toml clamps effort max → xhigh when agent_overrides.gsd-planner=max', () => {
     const projectDir = path.dirname(codexHome);
-    // Overwrite config with max override
+    // Overwrite config with max override. #3241: include an explicit
+    // model_overrides pin (D1 removed the resolver-only auto-embed).
     const config = {
       runtime: 'codex',
+      model_overrides: {
+        'gsd-planner': 'gpt-5.6-sol',
+      },
       effort: {
         agent_overrides: {
           'gsd-planner': 'max',
@@ -3840,6 +3826,133 @@ describe('#443 Config-driven: effort.agent_overrides drives install-time effort'
       `gsd-planner.toml should clamp max → xhigh for Codex\nActual:\n${tomlContent.slice(0, 500)}`);
     assert.doesNotMatch(tomlContent, /model_reasoning_effort\s*=\s*"max"/,
       'Codex .toml must never contain model_reasoning_effort = "max"');
+  });
+});
+
+// ─── describe 4b: #3241 — deprecation warning when a resolver-sourced model is dropped ─
+//
+// Phase 1 (#3241) removes the automatic per-tier Codex model embed sourced from
+// readGsdRuntimeProfileResolver. These tests assert the observable side of that
+// removal at full-install granularity — a one-time deprecation warning on
+// stderr, never on stdout, emitted exactly once across an install even though
+// every Codex agent hits the same "resolver would have pinned a model" branch
+// simultaneously (the design's Rejected #2: "warn per agent").
+//
+// RED (pre-fix): no such warning exists anywhere in bin/install.js today, so
+// captured stderr is empty for this config shape and every assertion below
+// that looks for warning text fails.
+//
+// Pinned wording (maintainer-confirmed, so the implementer matches it):
+//   - single line, on stderr
+//   - begins "gsd: notice — " (deliberately distinct from the existing
+//     "gsd: warning — " dropped-override text — this is a notice about an
+//     intentional behavior change, not a malformed value)
+//   - contains the literal substring "model_overrides" (the recovery path)
+//   - contains the literal substring "session model" (what the agent gets
+//     instead)
+//   - names neither a specific agent nor a specific model — it is a
+//     whole-install condition, not a per-agent one
+// Tests assert on these substrings plus "exactly one matching line", not on
+// the full sentence, so the prose can improve without breaking the test.
+
+describe('#3241 Codex install: deprecation warning when a resolver-sourced model is dropped', () => {
+  let tmpDir;
+  let projectDir;
+  let codexHome;
+  let stderrChunks;
+  let stdoutChunks;
+  let origStderrWrite;
+  let origStdoutWrite;
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir('gsd-3241-codex-warn-');
+    projectDir = path.join(tmpDir, 'project');
+    codexHome = path.join(projectDir, '.codex');
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.mkdirSync(path.join(projectDir, '.planning'), { recursive: true });
+    // runtime:"codex" + default model_profile:"balanced", no model_overrides —
+    // the exact shipping shape (per 50-test-matrix.md's "Altitude" note) that
+    // resolves a tier model per-agent via readGsdRuntimeProfileResolver (#2517).
+    fs.writeFileSync(
+      path.join(projectDir, '.planning', 'config.json'),
+      JSON.stringify({ runtime: 'codex' }, null, 2)
+    );
+    stderrChunks = [];
+    stdoutChunks = [];
+    origStderrWrite = process.stderr.write;
+    origStdoutWrite = process.stdout.write;
+    process.stderr.write = (chunk) => { stderrChunks.push(String(chunk)); return true; };
+    process.stdout.write = (chunk) => { stdoutChunks.push(String(chunk)); return true; };
+  });
+
+  afterEach(() => {
+    process.stderr.write = origStderrWrite;
+    process.stdout.write = origStdoutWrite;
+    cleanup(tmpDir);
+  });
+
+  test('warns exactly once on stderr with the pinned notice wording, and never on stdout (#3241)', () => {
+    runGlobalInstall('codex', codexHome);
+    const stderr = stderrChunks.join('');
+    const stdout = stdoutChunks.join('');
+    const noticeLines = stderr.split(/\r?\n/).filter((line) => line.startsWith('gsd: notice — '));
+    assert.strictEqual(noticeLines.length, 1,
+      `expected exactly one matching notice line, got ${noticeLines.length}\nstderr:\n${stderr}`);
+    assert.match(noticeLines[0], /model_overrides/,
+      'the notice must name model_overrides as the recovery path');
+    assert.match(noticeLines[0], /session model/,
+      'the notice must name the session model as what the agent gets instead');
+    assert.doesNotMatch(stdout, /gsd: notice — /,
+      'stdout must never carry the notice text — stdout carries installer result data');
+  });
+
+  test('the deprecation notice fires exactly once per install across every Codex agent, not once per agent, and no agent .toml pins a model by default (#3241)', () => {
+    // This test rides two properties deliberately: the notice's per-install
+    // dedupe (its original subject) AND the actual emitted-file content. The
+    // three describe-4 tests above (#443 Config-driven) all supply an
+    // explicit model_overrides pin to keep exercising unrelated effort-
+    // resolution behavior, so none of them prove the default (no
+    // model_overrides) install path actually stops pinning a model — only
+    // the unit-level generateCodexAgentToml tests in codex-config.test.cjs
+    // did. This is therefore the only install()-altitude coverage of Phase
+    // 1's headline behavior until Phase 4's health-check/sync land.
+    runGlobalInstall('codex', codexHome);
+    const stderr = stderrChunks.join('');
+    const installedTomls = fs.readdirSync(path.join(codexHome, 'agents'))
+      .filter((name) => name.endsWith('.toml'));
+    // Sanity check: this config shape must actually install more than one
+    // Codex agent — otherwise "exactly once, not once per agent" is untestable.
+    assert.ok(installedTomls.length > 1,
+      `sanity check: install must produce more than one Codex agent .toml, got ${installedTomls.length}`);
+    const noticeLines = stderr.split(/\r?\n/).filter((line) => line.startsWith('gsd: notice — '));
+    assert.strictEqual(noticeLines.length, 1,
+      `expected the notice exactly once across ${installedTomls.length} installed agents, saw ${noticeLines.length}\nstderr:\n${stderr}`);
+
+    // Emission check. Trap (same one ADR-2313 flags for Phase 3's sync):
+    // `developer_instructions` is a `'''`-quoted TOML multiline block holding
+    // the agent's raw prompt text, and GSD agent prompts discuss "model"
+    // constantly — a bare `content.includes('model =')` would match prose
+    // inside that block and false-fail. Guard against it by only scanning the
+    // lines BEFORE the `developer_instructions = '''` marker (generateCodexAgentToml
+    // always emits model / model_reasoning_effort, if present, ahead of that
+    // marker — bin/install.js's `lines` array construction), and by anchoring
+    // each check on a line that STARTS a TOML key (`^model\s*=`), never a bare
+    // substring match.
+    for (const tomlName of installedTomls) {
+      const tomlPath = path.join(codexHome, 'agents', tomlName);
+      const content = fs.readFileSync(tomlPath, 'utf8');
+      const lines = content.split(/\r?\n/);
+      const bodyStart = lines.findIndex((line) => line.startsWith("developer_instructions = '''"));
+      assert.notStrictEqual(bodyStart, -1,
+        `${tomlName}: expected a developer_instructions = ''' marker to scope the header scan against\nActual:\n${content.slice(0, 500)}`);
+      const header = lines.slice(0, bodyStart);
+      const modelLine = header.find((line) => /^model\s*=/.test(line));
+      const effortLine = header.find((line) => /^model_reasoning_effort\s*=/.test(line));
+      assert.strictEqual(modelLine, undefined,
+        `${tomlName} must not pin a model by default (#3241 — no model_overrides configured) — found line: ${JSON.stringify(modelLine)}`);
+      assert.strictEqual(effortLine, undefined,
+        `${tomlName} must not emit model_reasoning_effort with no model pinned (#838 coupling) — found line: ${JSON.stringify(effortLine)}`);
+    }
   });
 });
 
@@ -3913,17 +4026,143 @@ describe('#443 resolveInstallTimeEffort: invalid tokens fall through to valid ef
 
   test('effort.default="ultra" (invalid) + runtime:"codex" -> Codex .toml model_reasoning_effort is VALID', () => {
     // BUG before fix: "ultra" written into .toml verbatim
-    writeProjectConfig({ runtime: 'codex', effort: { default: 'ultra' } });
+    // #3241: include an explicit model_overrides pin — D1 removed the
+    // resolver-only auto-embed, and model_reasoning_effort is only emitted
+    // when a model is pinned (#838 coupling), so a pin is required to
+    // exercise this test's actual target (effort-token fallback validity).
+    writeProjectConfig({
+      runtime: 'codex',
+      model_overrides: { 'gsd-planner': 'gpt-5.6-sol' },
+      effort: { default: 'ultra' },
+    });
     runGlobalInstall('codex', codexHome);
     const tomlContent = fs.readFileSync(
       path.join(codexHome, 'agents', 'gsd-planner.toml'), 'utf8'
     );
     assert.match(tomlContent, /^model\s*=\s*"gpt-5.6-sol"$/m,
       `gsd-planner.toml should pin Codex model when runtime:"codex" is configured\nActual:\n${tomlContent.slice(0, 500)}`);
+    // eslint-disable-next-line local/no-unbounded-quantifier -- parses output of an actual install run against test-controlled config, bounded, not adversarial input
     const match = tomlContent.match(/^model_reasoning_effort\s*=\s*"([^"]+)"/m);
     assert.ok(match, `model_reasoning_effort must be present in .toml\nActual:\n${tomlContent.slice(0, 500)}`);
     assert.ok(VALID_EFFORTS.includes(match[1]),
       `model_reasoning_effort must be VALID, got: "${match[1]}"\nActual:\n${tomlContent.slice(0, 500)}`);
+  });
+});
+
+// ─── describe 5d: #3533 (10d) — inherit omits the effort key at install ──────
+
+describe('#3533 inherit: install writes NO effort key when the agent resolves to inherit', () => {
+  let tmpDir;
+  let claudeHome;
+  let codexHome;
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir('gsd-3533-inherit-');
+    const projectDir = path.join(tmpDir, 'project');
+    claudeHome = path.join(projectDir, '.claude');
+    codexHome = path.join(projectDir, '.codex');
+    fs.mkdirSync(claudeHome, { recursive: true });
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.mkdirSync(path.join(projectDir, '.planning'), { recursive: true });
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  function writeProjectConfig(config) {
+    const projectDir = path.dirname(claudeHome);
+    fs.writeFileSync(
+      path.join(projectDir, '.planning', 'config.json'),
+      JSON.stringify(config, null, 2)
+    );
+  }
+
+  test('claude .md frontmatter has no effort: key for an inherit-resolving agent', () => {
+    writeProjectConfig({ effort: { agent_overrides: { 'gsd-planner': 'inherit' } } });
+    runGlobalInstall('claude', claudeHome);
+    const fm = readFrontmatter(path.join(claudeHome, 'agents', 'gsd-planner.md'));
+    assert.doesNotMatch(fm, /^effort:/m,
+      `an inherit-resolving agent must carry NO effort key\nActual:\n${fm}`);
+    // A non-inherit agent still gets its concrete value.
+    const fmExecutor = readFrontmatter(path.join(claudeHome, 'agents', 'gsd-executor.md'));
+    const m = fmExecutor.match(/^effort:\s*(\S+)$/m);
+    assert.ok(m && m[1] === 'high', `gsd-executor keeps its concrete tier value, got: ${m && m[1]}`);
+  });
+
+  test('codex .toml omits model_reasoning_effort for an inherit-resolving pinned agent', () => {
+    writeProjectConfig({
+      runtime: 'codex',
+      model_overrides: { 'gsd-planner': 'gpt-5.6-sol' },
+      effort: { agent_overrides: { 'gsd-planner': 'inherit' } },
+    });
+    runGlobalInstall('codex', codexHome);
+    const toml = fs.readFileSync(path.join(codexHome, 'agents', 'gsd-planner.toml'), 'utf8');
+    assert.match(toml, /^model\s*=\s*"gpt-5.6-sol"$/m, 'the model pin stays');
+    assert.doesNotMatch(toml, /^model_reasoning_effort\s*=/m,
+      `inherit must not pin a literal effort level\nActual:\n${toml.slice(0, 400)}`);
+  });
+});
+
+// ─── describe 5c: #3531 (10c) — a partial effort block must not discard manifest tier defaults ──
+//
+// Regression fixture from issue #3160: adding four agent_overrides produced a
+// 23-agent dry-run diff that DOWNGRADED xhigh-tier agents to high and UPGRADED
+// low-tier agents to high — because an effort block without
+// routing_tier_defaults disabled the built-in tier ladder (manifest tier
+// defaults were consulted only when the whole effort block was absent).
+
+describe('#3531 resolveInstallTimeEffort: agent_overrides-only effort block keeps manifest tier defaults', () => {
+  let tmpDir;
+  let claudeHome;
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir('gsd-3531-tier-merge-');
+    const projectDir = path.join(tmpDir, 'project');
+    claudeHome = path.join(projectDir, '.claude');
+    fs.mkdirSync(claudeHome, { recursive: true });
+    fs.mkdirSync(path.join(projectDir, '.planning'), { recursive: true });
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  function writeProjectConfig(config) {
+    const projectDir = path.dirname(claudeHome);
+    fs.writeFileSync(
+      path.join(projectDir, '.planning', 'config.json'),
+      JSON.stringify(config, null, 2)
+    );
+  }
+
+  function readInstalledEffort(agentFile) {
+    const fm = readFrontmatter(path.join(claudeHome, 'agents', agentFile));
+    const match = fm.match(/^effort:\s*(\S+)$/m);
+    assert.ok(match, `effort: must be present in ${agentFile} frontmatter\nActual:\n${fm}`);
+    return match[1];
+  }
+
+  test('agent_overrides-only block leaves untiered agents on their manifest tier defaults', () => {
+    // The exact #3160 shape: one agent overridden, no routing_tier_defaults.
+    writeProjectConfig({ effort: { agent_overrides: { 'gsd-code-reviewer': 'medium' } } });
+    runGlobalInstall('claude', claudeHome);
+
+    // Before #3531: every non-overridden agent collapsed to the manifest
+    // default 'high' — downgrading planner (xhigh) and upgrading mapper (low).
+    assert.strictEqual(readInstalledEffort('gsd-planner.md'), 'xhigh');
+    assert.strictEqual(readInstalledEffort('gsd-executor.md'), 'high');
+    assert.strictEqual(readInstalledEffort('gsd-codebase-mapper.md'), 'low');
+    // The one agent the user actually named still gets its override.
+    assert.strictEqual(readInstalledEffort('gsd-code-reviewer.md'), 'medium');
+  });
+
+  test('partial routing_tier_defaults fills gaps from the manifest at install', () => {
+    writeProjectConfig({ effort: { routing_tier_defaults: { heavy: 'medium' } } });
+    runGlobalInstall('claude', claudeHome);
+    assert.strictEqual(readInstalledEffort('gsd-planner.md'), 'medium');
+    assert.strictEqual(readInstalledEffort('gsd-executor.md'), 'high');
+    assert.strictEqual(readInstalledEffort('gsd-codebase-mapper.md'), 'low');
   });
 });
 
@@ -4646,7 +4885,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 
-const { cleanup } = require('./helpers.cjs');
+const { cleanup, TEST_ENV_BASE } = require('./helpers.cjs');
 
 const ROOT = path.join(__dirname, '..');
 const PROFILE_OUTPUT = path.join(ROOT, 'gsd-core', 'bin', 'lib', 'profile-output.cjs');
@@ -4672,7 +4911,12 @@ describe('Bug #2973: dev-preferences default writer path is skills/gsd-dev-prefe
         m.cmdGenerateDevPreferences(${JSON.stringify(tmpHome)}, { analysis: ${JSON.stringify(analysisPath)} }, false);
       `);
       const result = cp.spawnSync(process.execPath, [driver], {
-        env: Object.assign({}, process.env, { HOME: tmpHome, USERPROFILE: tmpHome }),
+        // #2665: TEST_ENV_BASE must be merged in explicitly here. This is a RAW
+        // spawn, not runGsdTools, so nothing scrubs the config-location vars for
+        // it -- and the writer under test resolves them env-FIRST. Sandboxing
+        // HOME alone let an ambient CLAUDE_CONFIG_DIR win, and the SKILL.md
+        // landed in the developer's live config dir instead of tmpHome.
+        env: Object.assign({}, process.env, TEST_ENV_BASE, { HOME: tmpHome, USERPROFILE: tmpHome }),
         encoding: 'utf-8',
         // Bound the subprocess so a regression that hangs the writer
         // (or the dispatcher) cannot deadlock CI (PR #3003 CR feedback).
@@ -4703,6 +4947,7 @@ describe('Bug #2973: profile-user.md confirmation message references the skills 
   test('the Display message points at $HOME/.claude/skills/gsd-dev-preferences/SKILL.md', () => {
     const md = fs.readFileSync(WORKFLOW, 'utf-8');
     // Match the structured Display: line; capture the path value.
+    // eslint-disable-next-line local/no-unbounded-quantifier -- parses maintainer-authored profile-user.md workflow, bounded prose, not adversarial input
     const m = md.match(/Display:\s*"[^"]*Generated\s*\/gsd-dev-preferences\s*at\s*([^"]+)"/);
     assert.notEqual(m, null, 'expected a Display: "Generated /gsd-dev-preferences at <path>" line');
     const referencedPath = m[1].trim();
@@ -5842,6 +6087,7 @@ describe('bug-2808: SKILL.md name: uses hyphen form', () => {
       const skillContent = fs.readFileSync(skillMdPath, 'utf-8');
       // Scope the name: lookup to the YAML frontmatter block so a stray
       // `name:` line in the body cannot satisfy the assertion.
+      // eslint-disable-next-line local/no-unbounded-quantifier -- parses this repo's own generated SKILL.md frontmatter, fixed-size author-controlled content
       const fmMatch = skillContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
       assert.ok(fmMatch, `${relPath}: generated SKILL.md must include frontmatter`);
       const nameLine = fmMatch[1].split(/\r?\n/).find((l) => /^name:\s*/.test(l));
@@ -6133,3 +6379,754 @@ describe('Gap 2: installer ships the capability registry generator scripts (#192
 });
   });
 }
+
+// ─── #2218 cross-scope shadowing — coexistence gate (C1) + 4b guard pair
+// (E13/E14, #2873, epic #2866 Phase 4a) ────────────────────────────────────
+//
+// Moved here from the now-deleted tests/install-cross-scope-shadowing.test.cjs:
+// `scripts/lint-test-file-count.allowlist.json` grandfathers the `install`
+// prefix at 8 files, and that suite's own `_doc` says adding a 9th file to a
+// capped module is a novel offender, not a fix — this gate is folded into
+// the emitted-artifact suite instead, which is already allowlisted and,
+// per #2873's acceptance criteria, is the correct home ("written against the
+// existing `runMinimalInstall` harness").
+//
+// Implements the coexistence gate (`C1`) and the 4b behavioral pair
+// (`E13`/`E14`) from
+// `.gsd/phase/feat-2873-cross-scope-shadowing/50-test-matrix.md`. Per that
+// matrix's "Red-first order": C1 must go RED against `next` (no
+// `install-shadow-report.cjs` report exists today), E14 must go RED today
+// (the global skill's spec-root include points at the global tree even when
+// a coexisting local install has its own project-local copy of that
+// workflow file), and E13 must stay GREEN both before and after — it is the
+// guard that phase 4b does not break today's global-only case.
+//
+// This section does NOT implement the 4b spec-root emission transform
+// (E1-E12, a separate matrix section) — that transform
+// (`resolveSpecRootReference`, `runtime-artifact-conversion.cts`) landed
+// separately and is exercised here only via its INSTALLED OUTPUT. #2873
+// Task 3 (2026-08-14): re-verified against a real global+local double
+// install — 4b has landed and E14 below is GREEN, not the known-RED case
+// this comment block originally described. The "Red-first order" paragraph
+// above is left as-is: it accurately records the matrix's ORIGINAL red-first
+// plan, not a live claim about E14's current state.
+
+/**
+ * Extract the `@`-include lines from an emitted markdown body — structural
+ * parsing, never substring/regex matching on the whole body (CONTRIBUTING.md
+ * "Prohibited: Raw Text Matching on Test Outputs"). Splits on newlines
+ * (CRLF-tolerant) and keeps only lines whose first character is `@`.
+ *
+ * @param {string} content
+ * @returns {string[]}
+ */
+function extractAtIncludeLines(content) {
+  return content.split(/\r?\n/).filter((line) => line.startsWith('@'));
+}
+
+describe('#2218 cross-scope shadowing', () => {
+  let root;
+  let projectDir;
+  let globalInstallResult;
+  let localInstallResult;
+
+  before(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2218-shadow-'));
+    projectDir = path.join(root, 'myrepo');
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    // Global half: cannot use runMinimalInstall here — its scope:'global'
+    // path pushes `--config-dir <root>`, which pins the install AT `<root>`
+    // itself (manifest at `<root>/gsd-file-manifest.json`), not at
+    // `<root>/.claude`. That is not the shape #2218 describes: the reporter's
+    // configuration is a HOME-resolved global install (no --config-dir)
+    // sitting alongside a project-local one. Spawn the installer directly,
+    // with HOME=root and no --config-dir, so it resolves its own config home
+    // the way a real global install does. Must run BEFORE the local half —
+    // order matters for this fixture (a separate test covers order-independence).
+    globalInstallResult = runNode([INSTALL_SCRIPT, '--claude', '--global'], {
+      cwd: root,
+      env: installerEnv({ HOME: root, USERPROFILE: root }),
+      timeoutMs: INSTALL_TIMEOUT_MS,
+    });
+    assert.strictEqual(globalInstallResult.exitCode, 0,
+      `global install exited with status ${globalInstallResult.exitCode} ` +
+      `(outcome=${globalInstallResult.outcome})\n` +
+      `stdout: ${globalInstallResult.stdout}\nstderr: ${globalInstallResult.stderr}`);
+
+    // Local half: runMinimalInstall cannot be reused for this either — for
+    // scope:'local' it sets cwd=root, which would install into
+    // `<root>/.claude` and collide with the global install above. Spawn the
+    // installer directly instead, with cwd pinned at the project dir.
+    localInstallResult = runNode([INSTALL_SCRIPT, '--claude', '--local'], {
+      cwd: projectDir,
+      env: installerEnv({ HOME: root, USERPROFILE: root }),
+      timeoutMs: INSTALL_TIMEOUT_MS,
+    });
+    assert.strictEqual(localInstallResult.exitCode, 0,
+      `local install exited with status ${localInstallResult.exitCode} ` +
+      `(outcome=${localInstallResult.outcome})\n` +
+      `stdout: ${localInstallResult.stdout}\nstderr: ${localInstallResult.stderr}`);
+  });
+
+  after(() => {
+    cleanup(root);
+  });
+
+  test('both installs land their own manifest', () => {
+    const globalManifestPath = path.join(root, '.claude', MANIFEST_NAME);
+    const localManifestPath = path.join(projectDir, '.claude', MANIFEST_NAME);
+
+    assert.ok(fs.existsSync(globalManifestPath), 'global manifest should exist');
+    assert.ok(fs.statSync(globalManifestPath).isFile(), 'global manifest should be a file');
+    assert.ok(fs.existsSync(localManifestPath), 'local manifest should exist');
+    assert.ok(fs.statSync(localManifestPath).isFile(), 'local manifest should be a file');
+
+    const globalManifest = JSON.parse(fs.readFileSync(globalManifestPath, 'utf8'));
+    const localManifest = JSON.parse(fs.readFileSync(localManifestPath, 'utf8'));
+
+    assert.strictEqual(globalManifest.scope, 'global');
+    assert.strictEqual(localManifest.scope, 'local');
+  });
+
+  test('the local install reports the shadowing it causes', () => {
+    // #2218/#2873: install-shadow-report.cjs does not exist yet — this
+    // require is the intended RED. buildShadowReport is the pure IR builder
+    // described in .gsd/phase/feat-2873-cross-scope-shadowing/40-design.md
+    // (row 3): claude installed at both G and L reports N triggers shadowed,
+    // winner skills@global, loser commands@local.
+    const { buildShadowReport } = require('../gsd-core/bin/lib/install-shadow-report.cjs');
+    const report = buildShadowReport('claude', { home: root, cwd: projectDir });
+
+    assert.strictEqual(report.shadowed, true);
+    assert.strictEqual(report.winner.kind, 'skills');
+    assert.strictEqual(report.winner.scope, 'global');
+    assert.strictEqual(report.shadowedSide.kind, 'commands');
+    assert.strictEqual(report.shadowedSide.scope, 'local');
+    assert.ok(report.triggers.length > 0, 'expected at least one shadowed trigger');
+  });
+
+  test('global-only install resolves the same spec file it does today', () => {
+    const skillPath = path.join(root, '.claude', 'skills', 'gsd-plan-phase', 'SKILL.md');
+    const content = fs.readFileSync(skillPath, 'utf8');
+    const atLines = extractAtIncludeLines(content);
+
+    assert.ok(
+      atLines.includes('@~/.claude/gsd-core/references/ui-brand.md'),
+      `expected the ui-brand reference @-line among: ${JSON.stringify(atLines)}`,
+    );
+  });
+
+  // #2218 / phase #2873: before 4b, the global SKILL.md's spec-root include
+  // was a static `@~/.claude/gsd-core/workflows/plan-phase.md` reference,
+  // which always resolved against the GLOBAL tree even when a coexisting
+  // local install has its own project-local copy of that workflow file.
+  // Phase 4b (`resolveSpecRootReference`, `runtime-artifact-conversion.cts`)
+  // replaces that static include with a two-step imperative form that names
+  // both candidate paths and lets the runtime prefer the local one when it
+  // exists. #2873 Task 3 (2026-08-14): re-verified GREEN against a real
+  // global+local double install — 4b landed after this test package was
+  // authored, so this is no longer the known-RED case the original comment
+  // above it described.
+  test('the winning global skill points at the project-local spec tree (E14)', () => {
+    const skillPath = path.join(root, '.claude', 'skills', 'gsd-plan-phase', 'SKILL.md');
+    const content = fs.readFileSync(skillPath, 'utf8');
+    const atLines = extractAtIncludeLines(content);
+
+    assert.ok(
+      !atLines.includes('@~/.claude/gsd-core/workflows/plan-phase.md'),
+      `expected the static global workflow @-line to be replaced, but found it among: ${JSON.stringify(atLines)}`,
+    );
+    // The reference @-include (a DIFFERENT spec root, row E4) survives
+    // untouched — structural proof 4b did not over-fire on this file.
+    assert.ok(
+      atLines.includes('@~/.claude/gsd-core/references/ui-brand.md'),
+      `expected the ui-brand reference @-line to survive among: ${JSON.stringify(atLines)}`,
+    );
+
+    const localSpecPath = path.join(projectDir, '.claude', 'gsd-core', 'workflows', 'plan-phase.md');
+    assert.ok(fs.existsSync(localSpecPath), 'local spec-root workflow file should exist on disk');
+
+    // Positive assertion, not just absence-of-the-old-include: the emitted
+    // body must actually NAME the project-local candidate path. Exact-string
+    // presence check on the literal candidate path `resolveSpecRootReference`
+    // emits (never a substring-scan for prose wording — CONTRIBUTING →
+    // "Prohibited: Raw Text Matching on Test Outputs"; this checks for the
+    // PATH token, not sentence phrasing).
+    assert.ok(
+      content.includes('.claude/gsd-core/workflows/plan-phase.md'),
+      `expected the emitted body to name the project-local candidate path, got: ${JSON.stringify(content)}`,
+    );
+  });
+});
+
+// ─── #2873 matrix section C — install-time report (spawned installer) ─────
+//
+// Implements rows C1-C6 from
+// `.gsd/phase/feat-2873-cross-scope-shadowing/50-test-matrix.md`. The
+// `#2218 cross-scope shadowing` suite above calls `buildShadowReport`
+// DIRECTLY — real coverage of the pure IR, but it proves nothing about the
+// INSTALLER'S OWN WIRING at bin/install.js's writeManifest-adjacent
+// try/catch block (the only call site that ever prints a report). These
+// rows instead spawn the real installer and inspect its own stdout/stderr
+// and exit code — the actual product surface #2218 reported a gap in.
+
+describe('#2873 C1-C6 — install-time shadow report (spawned installer wiring)', () => {
+  const { buildShadowReport, renderShadowReport, SHADOW_REASON } = require('../gsd-core/bin/lib/install-shadow-report.cjs');
+  const SHADOW_THROWS_PRELOAD = path.join(__dirname, 'helpers', 'shadow-report-throws-preload.cjs');
+
+  function spawnInstall(args, cwd, root, nodeFlags = []) {
+    return runNode([...nodeFlags, INSTALL_SCRIPT, ...args], {
+      cwd,
+      env: installerEnv({ HOME: root, USERPROFILE: root }),
+      timeoutMs: INSTALL_TIMEOUT_MS,
+    });
+  }
+
+  /**
+   * Assert `stderr` (the installer's own `console.warn` shadow-report
+   * output) actually carries `expectedReport`'s rendered lines, verbatim.
+   * `expectedReport`/its lines are computed by CALLING the module's own
+   * pure `buildShadowReport`/`renderShadowReport` against the SAME on-disk
+   * fixture the spawned installer just produced — never a guessed/hardcoded
+   * literal. This is the typed-count-plus-content route the review brief
+   * asks for: structural comparison against a pure function's own computed
+   * output (mirrors this file's own `extractAtIncludeLines`/E14 pattern
+   * above), not prose matching.
+   */
+  function assertReportRendered(stderr, expectedReport) {
+    const lines = renderShadowReport(expectedReport);
+    assert.ok(lines.length > 0,
+      'fixture must actually be shadowed for this to be a meaningful positive assertion');
+    const stripped = stripAnsi(stderr);
+    for (const line of lines) {
+      assert.ok(stripped.includes(line),
+        `expected installer stderr to carry the typed report line ${JSON.stringify(line)}\nstderr: ${stderr}`);
+    }
+  }
+
+  /**
+   * Negative-proof counterpart to `assertReportRendered`, for fixtures where
+   * no report is expected. `expectedReport` is computed by calling the
+   * module's own pure `buildShadowReport` against the SAME on-disk fixture
+   * the spawned installer just produced. Asserts the typed IR itself is
+   * `not_shadowed`, that `renderShadowReport` therefore computes ZERO lines
+   * for it, and then — for every line it WOULD have computed had the IR been
+   * shadowed (structurally empty here) — that none of them appear in
+   * `stderr`. This replaces matching a hardcoded literal fragment
+   * (`' shadowed: the '`) with a structural comparison against
+   * `renderShadowReport`'s own (empty) output, so there is no longer a
+   * guessed string for `local/no-source-grep`/`allow-test-rule` to flag.
+   */
+  function assertReportAbsent(stderr, expectedReport) {
+    assert.strictEqual(expectedReport.shadowed, false,
+      'fixture must not be shadowed for this to be a meaningful negative assertion');
+    assert.strictEqual(expectedReport.reason, SHADOW_REASON.NOT_SHADOWED,
+      `expected reason ${SHADOW_REASON.NOT_SHADOWED}, got ${expectedReport.reason}`);
+    const lines = renderShadowReport(expectedReport);
+    assert.deepStrictEqual(lines, [],
+      'renderShadowReport must compute zero lines for a not_shadowed report');
+    const stripped = stripAnsi(stderr);
+    for (const line of lines) {
+      assert.ok(!stripped.includes(line),
+        `expected installer stderr NOT to carry the typed report line ${JSON.stringify(line)}\nstderr: ${stderr}`);
+    }
+  }
+
+  test('C1: global-then-local double install reports shadowing on the second install, exit 0', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2873-c1-'));
+    const projectDir = path.join(root, 'myrepo');
+    fs.mkdirSync(projectDir, { recursive: true });
+    t.after(() => cleanup(root));
+
+    const g = spawnInstall(['--claude', '--global'], root, root);
+    assert.strictEqual(g.exitCode, 0, `global install failed: ${g.stdout}\n${g.stderr}`);
+
+    const l = spawnInstall(['--claude', '--local'], projectDir, root);
+    assert.strictEqual(l.exitCode, 0, `local install failed: ${l.stdout}\n${l.stderr}`);
+
+    const expectedReport = buildShadowReport('claude', { home: root, cwd: projectDir });
+    assert.strictEqual(expectedReport.shadowed, true);
+    assertReportRendered(l.stderr, expectedReport);
+  });
+
+  test('C2: local-then-global double install reports shadowing symmetrically, exit 0', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2873-c2-'));
+    const projectDir = path.join(root, 'myrepo');
+    fs.mkdirSync(projectDir, { recursive: true });
+    t.after(() => cleanup(root));
+
+    const l = spawnInstall(['--claude', '--local'], projectDir, root);
+    assert.strictEqual(l.exitCode, 0, `local install failed: ${l.stdout}\n${l.stderr}`);
+
+    // The global install's own production `buildShadowReport(runtime)` call
+    // (bin/install.js) takes no injected opts — it defaults to
+    // `process.cwd()` to detect a coexisting LOCAL scope. Run it with cwd
+    // INSIDE the already-locally-installed project (the real #2218 shape: a
+    // developer running the global install from inside an existing
+    // project), or it structurally cannot see the local scope at all —
+    // verified empirically: cwd=root (a global install's usual cwd) never
+    // reports, cwd=projectDir does.
+    const g = spawnInstall(['--claude', '--global'], projectDir, root);
+    assert.strictEqual(g.exitCode, 0, `global install failed: ${g.stdout}\n${g.stderr}`);
+
+    const expectedReport = buildShadowReport('claude', { home: root, cwd: projectDir });
+    assert.strictEqual(expectedReport.shadowed, true);
+    assertReportRendered(g.stderr, expectedReport);
+  });
+
+  test('C3: global-only install stays quiet, exit 0 (negative proof)', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2873-c3-'));
+    t.after(() => cleanup(root));
+
+    const g = spawnInstall(['--claude', '--global'], root, root);
+    assert.strictEqual(g.exitCode, 0, `global install failed: ${g.stdout}\n${g.stderr}`);
+
+    // Typed control: a single-scope fixture can never be shadowed by
+    // construction (buildShadowReport requires two installed scopes) —
+    // confirms this negative-proof fixture is not accidentally shadowed.
+    const controlReport = buildShadowReport('claude', { home: root, cwd: root });
+    assertReportAbsent(g.stderr, controlReport);
+  });
+
+  test('C4: an install that fails before writeManifest never emits a report', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2873-c4-'));
+    t.after(() => cleanup(root));
+
+    // Structural failure, never chmod (chmod 0o000 no-ops under root —
+    // CONTRIBUTING.md): pre-create the global config dir's OWN path as a
+    // plain file. installerMigrations' lock-acquisition mkdirSync (which
+    // runs before ANY artifact copy, long before writeManifest at
+    // bin/install.js) then throws ENOTDIR/EEXIST — verified empirically,
+    // and works identically whether or not the test runner is root.
+    fs.writeFileSync(path.join(root, '.claude'), 'blocker');
+
+    const g = spawnInstall(['--claude', '--global'], root, root);
+    assert.notStrictEqual(g.exitCode, 0,
+      `expected the structural collision to fail the install: ${g.stdout}\n${g.stderr}`);
+
+    const manifestPath = path.join(root, '.claude', MANIFEST_NAME);
+    assert.ok(!fs.existsSync(manifestPath), 'writeManifest must never have run');
+
+    // Same fixture the failed install just left on disk: nothing was ever
+    // written, so the typed IR is not_shadowed by construction — the failure
+    // path never reaches the report call site at all (it runs strictly after
+    // writeManifest).
+    const expectedReport = buildShadowReport('claude', { home: root, cwd: root });
+    assertReportAbsent(g.stdout + g.stderr, expectedReport);
+  });
+
+  test('C5: a throwing report builder never fails the install, report suppressed', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2873-c5-'));
+    t.after(() => cleanup(root));
+
+    const g = spawnInstall(['--claude', '--global'], root, root, ['--require', SHADOW_THROWS_PRELOAD]);
+    assert.strictEqual(g.exitCode, 0,
+      `a throwing buildShadowReport must never fail the install: ${g.stdout}\n${g.stderr}`);
+
+    const manifestPath = path.join(root, '.claude', MANIFEST_NAME);
+    assert.ok(fs.existsSync(manifestPath),
+      'writeManifest must still have run — the report call happens strictly after it');
+
+    // Same single-scope fixture as C3 (writeManifest ran, but the report
+    // builder was preloaded to throw): the typed IR built from the real
+    // installer's own scope is still not_shadowed, and — because the
+    // injected throw is caught before renderShadowReport ever runs — no
+    // report text should reach stderr either.
+    const expectedReport = buildShadowReport('claude', { home: root, cwd: root });
+    assertReportAbsent(g.stderr, expectedReport);
+  });
+
+  test('C6: re-running the same scope twice produces the same report', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2873-c6-'));
+    const projectDir = path.join(root, 'myrepo');
+    fs.mkdirSync(projectDir, { recursive: true });
+    t.after(() => cleanup(root));
+
+    const g = spawnInstall(['--claude', '--global'], root, root);
+    assert.strictEqual(g.exitCode, 0, `global install failed: ${g.stdout}\n${g.stderr}`);
+
+    const l1 = spawnInstall(['--claude', '--local'], projectDir, root);
+    assert.strictEqual(l1.exitCode, 0, `first local install failed: ${l1.stdout}\n${l1.stderr}`);
+    const l2 = spawnInstall(['--claude', '--local'], projectDir, root);
+    assert.strictEqual(l2.exitCode, 0, `second local install failed: ${l2.stdout}\n${l2.stderr}`);
+
+    const expectedReport = buildShadowReport('claude', { home: root, cwd: projectDir });
+    assert.strictEqual(expectedReport.shadowed, true);
+    assertReportRendered(l1.stderr, expectedReport);
+    assertReportRendered(l2.stderr, expectedReport);
+  });
+});
+
+// ─── #3543: an unverifiable model_profile must bake no tier model ───
+//
+// readGsdRuntimeProfileResolver probes for the project's
+// .planning/config.json by walking up from the install's targetDir. A GLOBAL
+// OpenCode/Kilo install (targetDir ~/.config/<runtime>) can never reach the
+// consuming project, and ~/.gsd/defaults.json never carries model_profile
+// (writeNonClaudeDefaults writes only resolve_model_ids + runtime), so the
+// resolver silently fell back to 'balanced' and baked e.g.
+// anthropic/claude-opus-4-8 into the emitted agent frontmatter — defeating a
+// project's explicit model_profile:"inherit" (OpenCode subagents use the
+// static frontmatter model, which overrides the live /model selection).
+//
+// The contract under test (issue #3543, maintainer Agent Brief):
+//   - "no project config found" is NOT "profile absent": the profile is
+//     UNVERIFIABLE, and an unverifiable profile bakes no model key.
+//   - a found config keeps the documented 'balanced' default (local installs).
+//   - a profile (or model_overrides pin) declared in ~/.gsd/defaults.json is
+//     machine-level and still bakes on a global install.
+//   - Kilo mirrors OpenCode (static-frontmatter twin, #2093).
+{
+  const { describe: __d3543, test: __t3543, beforeEach: __be3543, afterEach: __ae3543 } = require('node:test');
+  const { install: __install3543, readGsdRuntimeProfileResolver: __resolver3543 } = require('../bin/install.js');
+  const { captureConsole: __capture3543 } = require('./helpers.cjs');
+
+  // Installer-written shape for a non-Claude runtime (writeNonClaudeDefaults).
+  const __INSTALLER_DEFAULTS_3543 = { resolve_model_ids: 'omit', runtime: 'opencode' };
+  // Tier ids from gsd-core/bin/shared/model-catalog.json runtimeTierDefaults.
+  // gsd-roadmapper distinguishes profiles: balanced → sonnet, quality → opus.
+  const __SONNET_3543 = 'anthropic/claude-sonnet-5';
+  const __OPUS_3543 = 'anthropic/claude-opus-4-8';
+
+  function __writeJson3543(p, obj) {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf-8');
+  }
+
+  function __agentsDir3543(configHome, runtime) {
+    return path.join(configHome, '.config', runtime, 'agents');
+  }
+
+  function __listAgents3543(agentsDir) {
+    return fs.readdirSync(agentsDir).filter((f) => f.startsWith('gsd-') && f.endsWith('.md'));
+  }
+
+  // Extract the baked model line (or null) — assertions compare it for
+  // equality against the expected literal rather than building a RegExp
+  // from the model id (CodeQL: incomplete backslash escaping).
+  function __modelLine3543(content) {
+    const m = content.match(/^model:.*$/m);
+    return m ? m[0] : null;
+  }
+
+  __d3543('#3543 unverifiable model_profile bakes no tier model', () => {
+    let __root3543;
+    let __home3543;
+    let __project3543;
+    let __prevEnv3543;
+    let __prevCwd3543;
+    // opencode/kilo global config homes resolve through an XDG descriptor whose
+    // env chain is [<RUNTIME>_CONFIG_DIR, <RUNTIME>_CONFIG, XDG_CONFIG_HOME]
+    // before falling back to <HOME>/.config/<name>. CI runners export
+    // XDG_CONFIG_HOME, which would route a "global" install into the runner's
+    // REAL config home (the live-config guard fails the job on exactly that);
+    // clearing the whole chain pins resolution to the isolated HOME fallback.
+    const __XDG_ENV_3543 = [
+      'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG',
+      'KILO_CONFIG_DIR', 'KILO_CONFIG',
+      'XDG_CONFIG_HOME',
+    ];
+
+    __be3543(() => {
+      __root3543 = createTempDir('gsd-3543-');
+      __home3543 = path.join(__root3543, 'home');
+      __project3543 = path.join(__root3543, 'project');
+      fs.mkdirSync(__project3543, { recursive: true });
+      __writeJson3543(path.join(__home3543, '.gsd', 'defaults.json'), __INSTALLER_DEFAULTS_3543);
+      __writeJson3543(path.join(__project3543, '.planning', 'config.json'), {
+        runtime: 'opencode',
+        model_profile: 'inherit',
+      });
+      __prevEnv3543 = {
+        HOME: process.env.HOME,
+        USERPROFILE: process.env.USERPROFILE,
+        SKIP: process.env.GSD_SKIP_STALE_SDK_CHECK,
+        XDG: Object.fromEntries(__XDG_ENV_3543.map((k) => [k, process.env[k]])),
+      };
+      __prevCwd3543 = process.cwd();
+      process.env.HOME = __home3543;
+      process.env.USERPROFILE = __home3543;
+      process.env.GSD_SKIP_STALE_SDK_CHECK = '1';
+      for (const k of __XDG_ENV_3543) delete process.env[k];
+      process.chdir(__project3543);
+    });
+
+    __ae3543(() => {
+      process.chdir(__prevCwd3543);
+      if (__prevEnv3543.HOME === undefined) delete process.env.HOME;
+      else process.env.HOME = __prevEnv3543.HOME;
+      if (__prevEnv3543.USERPROFILE === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = __prevEnv3543.USERPROFILE;
+      if (__prevEnv3543.SKIP === undefined) delete process.env.GSD_SKIP_STALE_SDK_CHECK;
+      else process.env.GSD_SKIP_STALE_SDK_CHECK = __prevEnv3543.SKIP;
+      for (const [k, v] of Object.entries(__prevEnv3543.XDG)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      cleanup(__root3543);
+    });
+
+    function runInstall3543(isGlobal, runtime) {
+      __capture3543(() => __install3543(isGlobal, runtime));
+    }
+
+    // Row 1 — unit half: the resolver as a GLOBAL install invokes it.
+    __t3543('resolver returns null when the only inherit declaration lives in a project the global probe cannot reach', () => {
+      const resolver = __resolver3543(path.join(__home3543, '.config', 'opencode'));
+      assert.equal(resolver, null,
+        'a global install cannot verify a profile — it must not resolve tier models');
+    });
+
+    // Row 1 — install half (criterion 1 + 5): the packaged defaults file
+    // containing only resolve_model_ids + runtime, project declaring inherit.
+    __t3543('global OpenCode install bakes no model line for any gsd-* agent when the profile is unverifiable', () => {
+      runInstall3543(true, 'opencode');
+
+      const agentsDir = __agentsDir3543(__home3543, 'opencode');
+      assert.ok(fs.existsSync(agentsDir), 'global install should create the agents directory');
+      const files = __listAgents3543(agentsDir);
+      assert.ok(files.includes('gsd-planner.md'), `gsd-planner.md should be emitted (found: ${files.slice(0, 5).join(', ')}…)`);
+      for (const f of files) {
+        const content = fs.readFileSync(path.join(agentsDir, f), 'utf-8');
+        assert.doesNotMatch(content, /^model:/m,
+          `${f} must carry no baked model — the profile is unverifiable at global scope`);
+      }
+    });
+
+    // Row 2 — control: a LOCAL install's probe reaches the project's inherit.
+    __t3543('local OpenCode install keeps honoring a reachable model_profile inherit', () => {
+      runInstall3543(false, 'opencode');
+
+      const agentsDir = path.join(__project3543, '.opencode', 'agents');
+      assert.ok(fs.existsSync(agentsDir), 'local install should create the agents directory');
+      for (const f of __listAgents3543(agentsDir)) {
+        const content = fs.readFileSync(path.join(agentsDir, f), 'utf-8');
+        assert.doesNotMatch(content, /^model:/m, `${f} must carry no baked model under inherit`);
+      }
+    });
+
+    // Row 3 — boundary: a FOUND config with an absent profile key keeps the
+    // documented 'balanced' default ("profile absent" ≠ "not found").
+    __t3543('local install with found config and absent profile key still bakes the balanced default', () => {
+      __writeJson3543(path.join(__project3543, '.planning', 'config.json'), {
+        runtime: 'opencode',
+      });
+      runInstall3543(false, 'opencode');
+
+      const roadmapper = fs.readFileSync(
+        path.join(__project3543, '.opencode', 'agents', 'gsd-roadmapper.md'), 'utf-8');
+      assert.equal(__modelLine3543(roadmapper), `model: ${__SONNET_3543}`,
+        'gsd-roadmapper balanced → sonnet tier must still bake on a local install');
+    });
+
+    // Row 4 — a machine-declared profile is verifiable and still bakes globally.
+    __t3543('global install bakes the tier of a model_profile declared in ~/.gsd/defaults.json', () => {
+      __writeJson3543(path.join(__home3543, '.gsd', 'defaults.json'), {
+        resolve_model_ids: 'omit',
+        runtime: 'opencode',
+        model_profile: 'quality',
+      });
+      runInstall3543(true, 'opencode');
+
+      const roadmapper = fs.readFileSync(
+        path.join(__agentsDir3543(__home3543, 'opencode'), 'gsd-roadmapper.md'), 'utf-8');
+      assert.equal(__modelLine3543(roadmapper), `model: ${__OPUS_3543}`,
+        'gsd-roadmapper quality → opus tier must bake when the profile is machine-declared');
+    });
+
+    // Row 5 — explicit model_overrides pins keep working at any scope.
+    __t3543('global install still bakes an explicit model_overrides pin from ~/.gsd/defaults.json', () => {
+      __writeJson3543(path.join(__home3543, '.gsd', 'defaults.json'), {
+        resolve_model_ids: 'omit',
+        runtime: 'opencode',
+        model_overrides: { 'gsd-roadmapper': 'explicit-global-pin-3543' },
+      });
+      runInstall3543(true, 'opencode');
+
+      const roadmapper = fs.readFileSync(
+        path.join(__agentsDir3543(__home3543, 'opencode'), 'gsd-roadmapper.md'), 'utf-8');
+      assert.equal(__modelLine3543(roadmapper), 'model: explicit-global-pin-3543',
+        'explicit model_overrides pins are the highest precedence and must bake');
+    });
+
+    // Row 6 — inherit declared at machine level.
+    __t3543('global install bakes nothing when ~/.gsd/defaults.json itself declares inherit', () => {
+      __writeJson3543(path.join(__home3543, '.gsd', 'defaults.json'), {
+        resolve_model_ids: 'omit',
+        runtime: 'opencode',
+        model_profile: 'inherit',
+      });
+      runInstall3543(true, 'opencode');
+
+      for (const f of __listAgents3543(__agentsDir3543(__home3543, 'opencode'))) {
+        const content = fs.readFileSync(path.join(__agentsDir3543(__home3543, 'opencode'), f), 'utf-8');
+        assert.doesNotMatch(content, /^model:/m, `${f} must carry no baked model under inherit`);
+      }
+    });
+
+    // Row 7 — doc contract: targetDir null consults only the global defaults.
+    __t3543('null targetDir with runtime-only home defaults resolves null (unverifiable)', () => {
+      assert.equal(__resolver3543(null), null,
+        'with no project to probe and no declared profile, the resolver must be inert');
+    });
+
+    // Row 8 — falsy home model_profile values count as undeclared, matching
+    // the existing || merge semantics.
+    __t3543('falsy model_profile in ~/.gsd/defaults.json counts as undeclared', () => {
+      const defaultsPath = path.join(__home3543, '.gsd', 'defaults.json');
+      const globalDir = path.join(__home3543, '.config', 'opencode');
+      for (const falsy of ['', null]) {
+        __writeJson3543(defaultsPath, {
+          resolve_model_ids: 'omit',
+          runtime: 'opencode',
+          model_profile: falsy,
+        });
+        assert.equal(__resolver3543(globalDir), null,
+          `model_profile ${JSON.stringify(falsy)} must be treated as undeclared`);
+      }
+    });
+
+    // Row 9 — a local install into a tree with no .planning anywhere is just
+    // as unverifiable as a global one: bake nothing, crash nowhere.
+    __t3543('local install without .planning bakes no model and does not crash', () => {
+      cleanup(path.join(__project3543, '.planning'));
+      runInstall3543(false, 'opencode');
+
+      const agentsDir = path.join(__project3543, '.opencode', 'agents');
+      assert.ok(fs.existsSync(agentsDir), 'local install should create the agents directory');
+      const planner = fs.readFileSync(path.join(agentsDir, 'gsd-planner.md'), 'utf-8');
+      assert.doesNotMatch(planner, /^model:/m,
+        'with no reachable project config the profile is unverifiable — no bake');
+    });
+
+    // Row 10 — Kilo parity (criterion 4): the static-frontmatter twin.
+    __t3543('global Kilo install bakes no model line on an unverifiable profile', () => {
+      runInstall3543(true, 'kilo');
+
+      const agentsDir = __agentsDir3543(__home3543, 'kilo');
+      assert.ok(fs.existsSync(agentsDir), 'global kilo install should create the agents directory');
+      for (const f of __listAgents3543(agentsDir)) {
+        const content = fs.readFileSync(path.join(agentsDir, f), 'utf-8');
+        assert.doesNotMatch(content, /^model:/m,
+          `${f} must carry no baked model — Kilo shares OpenCode's static-frontmatter constraint`);
+      }
+    });
+  });
+}
+
+// ─── #2874 (epic #2866 Phase 5) — G1/G3: the additive-contract guard ────────
+// Governed by ADR-58 (docs/adr/58-runtime-install-policy-module.md).
+// Design:      .gsd/phase/feat-2874-executed-plan-return/40-design.md
+// Test matrix: .gsd/phase/feat-2874-executed-plan-return/50-test-matrix.md
+//
+// G1 and G3 must be GREEN both BEFORE and AFTER the executed-plan return
+// lands — they are the guard proving the return value is additive (AC4),
+// never a behavior change. No production code is touched by this file.
+
+/**
+ * Recursively hash a directory tree into a stable, order-independent digest.
+ * `stripDir`, if given, is textually removed from each UTF-8-decodable
+ * file's content before hashing, so two installs into DIFFERENT temp
+ * directories (whose absolute paths get baked into rewritten skill bodies)
+ * can still be compared for content-identity.
+ *
+ * Both `stripDir` and the file content are normalized to forward slashes
+ * before the strip, unconditionally (never gated on `path.sep`) — production
+ * (`posixNormalize` in shell-command-projection.cts) rewrites `\` -> `/` in
+ * the resolved configDir before baking it into skill bodies, so on Windows
+ * `stripDir` (a raw fs.mkdtempSync path, backslash-separated) would never
+ * match the posix-normalized text actually written, leaving each install's
+ * unique temp-dir suffix embedded and making every file's hash diverge.
+ */
+function hashDirTree(rootDir, stripDir) {
+  const entries = [];
+  const stripDirPosix = stripDir ? stripDir.replace(/\\/g, '/') : stripDir;
+  const walk = (relPath, absPath) => {
+    for (const entry of fs.readdirSync(absPath, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name))) {
+      const childRel = relPath ? `${relPath}/${entry.name}` : entry.name;
+      const childAbs = path.join(absPath, entry.name);
+      if (entry.isDirectory()) {
+        walk(childRel, childAbs);
+      } else if (entry.isFile()) {
+        const buf = fs.readFileSync(childAbs);
+        const normalized = stripDirPosix
+          ? buf.toString('utf8').replace(/\\/g, '/').split(stripDirPosix).join('<CONFIGDIR>')
+          : buf;
+        entries.push(`${childRel}:${crypto.createHash('sha256').update(normalized).digest('hex')}`);
+      }
+    }
+  };
+  if (fs.existsSync(rootDir)) walk('', rootDir);
+  return entries.sort().join('\n');
+}
+
+describe('installRuntimeArtifacts — G1: void-ignoring caller is unaffected (AC4)', () => {
+  test('writes are byte-identical whether or not the caller uses the return value', (t) => {
+    const configDirIgnored = createTempDir('gsd-g1-ignored-');
+    const configDirCaptured = createTempDir('gsd-g1-captured-');
+    t.after(() => cleanup(configDirIgnored));
+    t.after(() => cleanup(configDirCaptured));
+
+    // Caller A: discards the return value entirely — today's every call site
+    // (bin/install.js, both existing adapter test doubles).
+    installRuntimeArtifacts('claude', configDirIgnored, 'global', RESOLVED_CORE);
+
+    // Caller B: captures the return value. Its shape is not asserted here —
+    // section E owns that — only that capturing it changes nothing about
+    // what gets written, and that capturing never itself throws.
+    const captured = installRuntimeArtifacts('claude', configDirCaptured, 'global', RESOLVED_CORE);
+    assert.ok(
+      captured === undefined || (captured !== null && typeof captured === 'object'),
+      'G1: the return value, whatever its shape, must be undefined (today) or a plain object ' +
+      '(after) — never something a capturing caller could not safely ignore',
+    );
+
+    assert.strictEqual(
+      hashDirTree(configDirCaptured, configDirCaptured),
+      hashDirTree(configDirIgnored, configDirIgnored),
+      'G1: writes must be byte-identical regardless of whether the caller captures the return value',
+    );
+  });
+});
+
+describe('installRuntimeArtifacts — G3: adapter calling-convention regression guard', () => {
+  // tests/adapter-declarative-equivalence.test.cjs:52 and
+  // tests/adapter-imperative.test.cjs:80 pin their OWN behavior via a
+  // module-ref monkeypatch of installRuntimeArtifacts — neither file ever
+  // invokes the real function, and neither is read or modified here. This
+  // row proves those two files' SUBJECT — the real installRuntimeArtifacts,
+  // called with the exact positional shape each adapter uses — still
+  // behaves: a real, successful, byte-on-disk install.
+
+  test('declarative-adapter call shape (5 positional args, no capabilityRegistry) still installs', (t) => {
+    const configDir = createTempDir('gsd-g3-declarative-');
+    t.after(() => cleanup(configDir));
+
+    // Matches tests/adapter-declarative-equivalence.test.cjs:62-66's
+    // captured shape: [runtime, configDir, scope, resolvedProfile, resolveAttribution].
+    const resolveAttribution = () => 'attr-claude';
+    installRuntimeArtifacts('claude', configDir, 'global', RESOLVED_CORE, resolveAttribution);
+
+    assert.ok(
+      fs.existsSync(path.join(configDir, 'skills', 'gsd-help', 'SKILL.md')),
+      'G3: the declarative adapter\'s calling convention must still produce a real install',
+    );
+  });
+
+  test('imperative-adapter call shape (6 positional args incl. composed capability registry) still installs', (t) => {
+    const configDir = createTempDir('gsd-g3-imperative-');
+    t.after(() => cleanup(configDir));
+
+    // Matches tests/adapter-imperative.test.cjs:88's captured shape:
+    // [runtime, configDir, scope, resolvedProfile, resolveAttribution, capabilityRegistry].
+    const capabilityRegistry = { capabilityClusters: {} };
+    installRuntimeArtifacts('claude', configDir, 'global', RESOLVED_CORE, undefined, capabilityRegistry);
+
+    assert.ok(
+      fs.existsSync(path.join(configDir, 'skills', 'gsd-help', 'SKILL.md')),
+      'G3: the imperative adapter\'s calling convention must still produce a real install',
+    );
+  });
+});

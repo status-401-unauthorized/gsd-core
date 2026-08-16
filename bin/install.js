@@ -34,7 +34,13 @@ const {
   getGlobalConfigDir,
   getGlobalSkillsBase,
   resolveKimiHooksTomlDir,
+  isRegisteredRuntimeId,
 } = require('../gsd-core/bin/lib/runtime-homes.cjs');
+// #2870: the Install Scope Module — turns a bare 'global' | 'local' scope id
+// plus a runtime into one resolved value (configHome, settingsFile,
+// consentRequired, hostPrecedenceRank) instead of the id being re-derived
+// and re-interpreted at each call site. See src/install-scope.cts.
+const { resolveScope } = require('../gsd-core/bin/lib/install-scope.cjs');
 // getDirName (runtime -> local config dir name) is relocated out of this
 // installer to the runtime-name-policy leaf (ADR-1508 / #1510 Phase 1) so the
 // conversion module's rewrite engine can consume it without importing
@@ -53,6 +59,11 @@ const { composeWorkflow } = require('../gsd-core/bin/lib/workflow-fragments.cjs'
 // MCP catalog, src/mcp-catalog.cts) — see the comment at its call site below.
 const { shouldCompose } = require('../gsd-core/bin/lib/mcp-catalog.cjs');
 const runtimeArtifactConversion = require('../gsd-core/bin/lib/runtime-artifact-conversion.cjs');
+const { escapeRegex: escapeRegExp } = require('../gsd-core/bin/lib/pattern.cjs');
+// #2873: cross-scope shadow detection — reports (never fails) when a
+// GSD-owned scope shadows another on this machine (design doc:
+// .gsd/phase/feat-2873-cross-scope-shadowing/40-design.md).
+const { buildShadowReport, renderShadowReport } = require('../gsd-core/bin/lib/install-shadow-report.cjs');
 // #2544: the CommonJS marker's single source of truth. classifyMarker() backs
 // BOTH ensureCommonJsMarker() (install) and removeCommonJsMarker() (uninstall),
 // so the write side can no longer clobber a package.json the remove side would
@@ -335,7 +346,7 @@ const GSD_WINDSURF_HOOK_SCRIPTS = [
   GSD_WINDSURF_PRE_COMMAND_HOOK_SCRIPT,
 ];
 
-// GSD-managed files under hooks/lib/ (helpers required by gsd-*.sh hooks).
+// GSD-managed files under hooks/lib/ (helpers required by gsd-*.js hooks).
 // git-cmd.js does not start with "gsd-" (shared classifier for #3129), gsd-graphify-rebuild.sh does.
 // cursor-workspace.js (#2587) is required by the Cursor lifecycle hooks. Those
 // are staged individually by writeCursorHooksJson (Cursor sets
@@ -343,7 +354,10 @@ const GSD_WINDSURF_HOOK_SCRIPTS = [
 // copy below) — that function stages this helper alongside them. Listing it
 // here keeps uninstall and the manifest managing it for every OTHER runtime
 // that does receive hooks/lib.
-const GSD_HOOK_LIB_FILES = ['git-cmd.js', 'gsd-graphify-rebuild.sh', 'cursor-workspace.js'];
+// injection-patterns.js (#3504) is required by gsd-prompt-guard.js and
+// gsd-read-injection-scanner.js — the shared prompt-injection pattern list the
+// two guards require so their copies cannot drift.
+const GSD_HOOK_LIB_FILES = ['git-cmd.js', 'gsd-graphify-rebuild.sh', 'cursor-workspace.js', 'injection-patterns.js'];
 
 /**
  * Directory name GSD stages its shared hook bundle under, inside a runtime's
@@ -359,6 +373,21 @@ const GSD_HOOK_LIB_FILES = ['git-cmd.js', 'gsd-graphify-rebuild.sh', 'cursor-wor
  * working.
  */
 const SHARED_HOOKS_DIR_DEFAULT = 'hooks';
+
+// #3184 — GSD-managed file enumerations for scripts/changeset/ and scripts/lib/
+// uninstall. The install-side copy of both directories is wholesale ("copy every
+// file present"), so these enumerations MUST be kept in parity with the real
+// directory contents or an added file ships on install and then orphans on
+// uninstall (survives removal, keeps the dir non-empty, blocks its rmdir).
+// Hoisted to module scope (and exported below) so tests/install.test.cjs can
+// assert parity against fs.readdirSync(scripts/lib) / fs.readdirSync(scripts/changeset)
+// without source-grepping this file.
+const GSD_CHANGESET_FILES = [
+  'cli.cjs', 'parse.cjs', 'render.cjs', 'serialize.cjs',
+  'github-release-notes.cjs', 'lint.cjs', 'new.cjs',
+  'README.md', // documentation only — not user-authored
+];
+const GSD_SCRIPTS_LIB_FILES = ['cli-exit.cjs', 'allowlist-ratchet.cjs', 'drift-scan.cjs', 'alias-drift-families.cjs'];
 
 /**
  * Resolve a runtime's shared-hooks directory name from its descriptor.
@@ -452,10 +481,10 @@ const _gsdLibDir = path.join(__dirname, '..', 'gsd-core', 'bin', 'lib');
 const { MODEL_PROFILES: GSD_MODEL_PROFILES } = require(path.join(_gsdLibDir, 'model-profiles.cjs'));
 const {
   RUNTIME_PROFILE_MAP: GSD_RUNTIME_PROFILE_MAP,
+  isAnthropicFlavoredModel: gsdIsAnthropicFlavoredModel,
 } = require(path.join(_gsdLibDir, 'model-catalog.cjs'));
 const {
   resolveTierEntry: gsdResolveTierEntry,
-  CLAUDE_AGENT_ALIASES,
 } = require(path.join(_gsdLibDir, 'model-resolver.cjs'));
 
 // #2071 — install-time effort resolution (readGsdEffectiveEffortConfig /
@@ -529,6 +558,17 @@ try {
 // hardcoded string-equality branch) so behavior degrades CLOSED (safe), never open.
 // The live descriptor (capabilities/claude/capability.json) remains the source of
 // truth; this mirrors only the privacy-load-bearing subset. (ADR-1239 / #2086)
+//
+// #2870: NOT routed through the Install Scope Module (resolveScope,
+// src/install-scope.cts) despite that module owning per-scope settings-file
+// resolution elsewhere in this file. resolveScope's own descriptor lookup
+// goes through the SAME capability registry require this floor exists to
+// survive the failure of (see getRegistry() in install-scope.cts) — so on
+// exactly the "registry failed to load" path this constant is for,
+// resolveScope would throw too. Routing through it here would trade a
+// graceful, documented degrade for a crash in the one case this floor was
+// added to prevent. This hardcoded literal is the correct, honest answer,
+// not an un-migrated leftover.
 const FALLBACK_HOST_BEHAVIORS = Object.freeze({
   claude: Object.freeze({
     settingsFileByScope: Object.freeze({ local: 'settings.local.json', global: 'settings.json' }),
@@ -591,6 +631,22 @@ function _hostIntegrationDispatch(runtime) {
 }
 
 /**
+ * #2870: shared install()/uninstall() scope resolution. Routes `id` through
+ * the Install Scope Module (src/install-scope.cts) and degrades to `null` on
+ * failure (unknown/non-installable runtime, broken registry bundle) instead
+ * of throwing, so each call site's own plain-id fallback keeps working
+ * exactly as it did before this migration. Both call sites previously carried
+ * their own copy of this try/catch; this is the one shared copy.
+ */
+function _resolveScopeSafe(id, runtime) {
+  try {
+    return resolveScope({ id, runtime });
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
  * Resolve the ACTUAL on-disk skills-install directory for a runtime, honoring a
  * skills-kind `home` override (ADR-1239 upgrade 3 / #2088: e.g. Codex skills ->
  * $HOME/.agents/skills instead of the runtime's configDir). Descriptor-driven
@@ -624,6 +680,7 @@ function _runtimeAdapter(runtime) {
 const {
   applyInstallerMigrationPlan,
   discoverInstallerMigrations,
+  MANIFEST_SCHEMA_VERSION,
   runInstallerMigrations,
 } = require(path.join(_gsdLibDir, 'installer-migrations.cjs'));
 const {
@@ -1057,6 +1114,15 @@ const applyClaudeCodeBrandSwap = runtimeArtifactConversion.applyClaudeCodeBrandS
 
 function rewriteLegacyManagedNodeHookCommands(settings, absoluteRunner, opts) {
   return hooksSurface.rewriteLegacyManagedNodeHookCommands(settings, absoluteRunner, opts);
+}
+
+// #3329: rewrite already-registered managed `.sh` hook commands to the shape
+// the current installer would generate (the #580/#3393 bash-runner-omission
+// migration the register-only-if-absent path never applied to existing
+// entries). Invoked inside applySettingsJsonHooks in the compiled surface
+// module; re-bound here for tests/consumers, mirroring the #2979 rewriter.
+function reconcileManagedShellHookCommands(settings, expected, opts) {
+  return hooksSurface.reconcileManagedShellHookCommands(settings, expected, opts);
 }
 
 /**
@@ -1568,7 +1634,10 @@ const READONLY_AGENT_DISALLOWED_TOOLS = {
  * Returns null if no `runtime` is configured (preserves prior behavior — only
  * model_overrides is embedded, no tier/reasoning-effort inference). Returns
  * null when `model_profile` is `inherit` so the literal alias passes through
- * unchanged.
+ * unchanged. Returns null when no project config is reachable AND
+ * `~/.gsd/defaults.json` declares no `model_profile` (#3543): the profile is
+ * unverifiable at global scope, and baking the 'balanced' default would
+ * defeat a consuming project's explicit `inherit`.
  *
  * Returns { runtime, resolve(agentName) -> { model, reasoning_effort? } | null }
  */
@@ -1617,6 +1686,24 @@ function readGsdRuntimeProfileResolver(targetDir = null) {
   };
 
   if (!merged.runtime) return null;
+
+  // #3543 — "no project config found" is not "profile absent". The probe
+  // above starts at the install's targetDir, which for a GLOBAL install
+  // (~/.config/<runtime>) can never reach the consuming project's
+  // .planning/config.json — and writeNonClaudeDefaults never stores
+  // model_profile in ~/.gsd/defaults.json. Falling through to 'balanced'
+  // here baked a tier-default model (e.g. anthropic/claude-opus-4-8) into
+  // the static OpenCode/Kilo agent frontmatter, defeating a project's
+  // explicit `model_profile: "inherit"` — those runtimes use the frontmatter
+  // model over the live session selection. A profile is bakeable only when
+  // verifiable: declared in the found project config (local install —
+  // loadConfig reads the same file at dispatch time) or in the machine-wide
+  // defaults. Otherwise bake nothing and let the runtime's default/session
+  // model govern — the documented non-Claude posture
+  // (references/model-profiles.md, #1156).
+  if (!projectConfig && !(homeDefaults && homeDefaults.model_profile)) {
+    return null;
+  }
 
   const profile = String(merged.model_profile).toLowerCase();
   if (profile === 'inherit') return null;
@@ -1924,10 +2011,6 @@ function buildKiloAgentPermissionBlock(claudeTools) {
   return lines;
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function replaceRelativePathReference(content, fromPath, toPath) {
   const escapedPath = escapeRegExp(fromPath);
   return content.replace(
@@ -2048,12 +2131,6 @@ function skillFrontmatterName(skillDirName) {
   return skillDirName;
 }
 
-function normalizeClaudeSkillEffort(effort) {
-  // #3039: `max` is rejected by Anthropic models when extended thinking is disabled.
-  if (effort === 'xhigh' || effort === 'max') return 'high';
-  return effort;
-}
-
 /**
  * Qwen Code skills accept an optional numeric `priority` frontmatter field.
  * Per the Qwen skills spec (qwen-code/docs/users/features/skills.md, verified
@@ -2110,10 +2187,11 @@ function convertClaudeCommandToClaudeSkill(content, skillName, runtime = null, c
   const description = extractFrontmatterField(frontmatter, 'description') || '';
   const argumentHint = extractFrontmatterField(frontmatter, 'argument-hint');
   const agent = extractFrontmatterField(frontmatter, 'agent');
-  // #769: preserve context: and effort: from source command files so they
-  // are emitted into the installed SKILL.md frontmatter unchanged.
+  // #769: preserve context: from source command files so it is emitted into
+  // the installed SKILL.md frontmatter unchanged. (#3151: effort: is no longer
+  // emitted into skill frontmatter — a static effort value invalidates the
+  // caller's prompt cache at both scope boundaries.)
   const context = extractFrontmatterField(frontmatter, 'context');
-  const effort = extractFrontmatterField(frontmatter, 'effort');
 
   // Preserve allowed-tools as YAML multiline list (Claude native format)
   const toolsMatch = frontmatter.match(/^allowed-tools:\s*\n((?:\s+-\s+.+\n?)*)/m);
@@ -2147,12 +2225,13 @@ function convertClaudeCommandToClaudeSkill(content, skillName, runtime = null, c
   }
   if (argumentHint) fm += `argument-hint: ${yamlQuote(argumentHint)}\n`;
   if (agent) fm += `agent: ${agent}\n`;
-  // #769: emit context: and effort: when present so the runtime can honour
-  // them natively (context: fork = isolated subagent window; effort: =
-  // token-budget tier). Fields are Claude-specific; unknown frontmatter
-  // fields are silently ignored by other runtimes (backward-compatible).
+  // #769: emit context: when present so the runtime can honour it natively
+  // (context: fork = isolated subagent window). Claude-specific; unknown
+  // frontmatter fields are silently ignored by other runtimes (backward-compatible).
+  // (#3151: effort: is intentionally NOT emitted into skill frontmatter — a
+  // static effort value changes output_config.effort on invocation and
+  // invalidates the caller's prompt cache at both scope boundaries.)
   if (context) fm += `context: ${context}\n`;
-  if (effort) fm += `effort: ${normalizeClaudeSkillEffort(effort)}\n`;
   if (toolsBlock) fm += toolsBlock;
   fm += '---';
 
@@ -3966,7 +4045,7 @@ Typed mapping (agent_type-capable schema only):
   to \`spawn_agent\` when the runtime/tool supports it. Omit missing, empty,
   inherited, or unsupported values; do not invent one-off effort literals in
   workflow prose.
-- \`fork_context: false\` by default — GSD agents load their own context via \`<files_to_read>\` blocks
+- \`fork_context: false\` by default — GSD agents load their own context via \`<required_reading>\` blocks
 - \`task_name\` — required by the collaboration schema; provide a descriptive name for each spawned task
 - \`fork_turns\` — optional parameter controlling turn-forking depth; coexists with \`fork_context\` (not a replacement)
 - \`Task(isolation="worktree")\` / \`Agent(isolation="worktree")\` → no direct \`spawn_agent\` mapping,
@@ -4061,15 +4140,19 @@ purpose: ${toSingleLine(description)}
 /**
  * #2310 — True if `model` is an Anthropic-flavored value that must never appear as a
  * Codex agent `.toml` `model`. Two forms: (a) a bare Claude Agent-tool tier alias
- * (opus/sonnet/haiku/fable — the canonical CLAUDE_AGENT_ALIASES, imported from
- * src/model-resolver.cts so it can't diverge); (b) any Claude model id in any provider
- * namespacing — `claude-*`, `anthropic/claude-*`, `us.anthropic.claude-*` (the forms the
- * catalog assigns to opencode/hermes/kilo, reachable on a Codex .toml via the runtime-
- * resolver path). No OpenAI/Codex model id contains "claude", so a case-insensitive
- * substring test is a safe, exhaustive guard for (b). Codex/ChatGPT rejects all of these.
+ * (opus/sonnet/haiku/fable — the canonical CLAUDE_AGENT_ALIASES); (b) any Claude model
+ * id in any provider namespacing — `claude-*`, `anthropic/claude-*`, `us.anthropic.claude-*`
+ * (the forms the catalog assigns to opencode/hermes/kilo, reachable on a Codex .toml via
+ * the runtime-resolver path). No OpenAI/Codex model id contains "claude", so a
+ * case-insensitive substring test is a safe, exhaustive guard for (b). Codex/ChatGPT
+ * rejects all of these.
+ *
+ * #3241 — thin delegation to the shared predicate on src/model-catalog.cts (moved there
+ * so it can't diverge across Codex-posture surfaces); kept as a local name because it
+ * reads better at the call sites below.
  */
 function _isAnthropicFlavoredModel(model) {
-  return typeof model === 'string' && (CLAUDE_AGENT_ALIASES.has(model) || model.toLowerCase().includes('claude'));
+  return gsdIsAnthropicFlavoredModel(model);
 }
 
 // #2310 — dedupe stderr warnings so repeated agent emits don't spam (mirrors the
@@ -4086,6 +4169,42 @@ function _warnCodexModelOverrideDropped(agentName, value) {
     `(Anthropic alias/id); dropping it so Codex uses a valid default. ` +
     `Set runtime:"codex" or pin a gpt-* model to route it.\n`,
   );
+}
+
+// #3241 — one-time per-install deprecation notice: the automatic runtime-resolver
+// per-tier Codex model embed was removed (D1/D5, ADR-2313 passive-posture epic). When
+// the resolver *would have* supplied a model and nothing else ends up pinned, this
+// notice points the user at model_overrides as the explicit-pin replacement. Dedupes
+// with a module-level boolean (mirrors _codexModelOverrideDroppedWarned's Set above)
+// so a multi-agent install — every Codex agent hits this condition simultaneously —
+// emits exactly one line, not one per agent. Reset once per install() call (see
+// install()) so the "at most once" window is per-install, not per-process. That
+// reset lives ONLY inside install() (~:10116) — generateCodexAgentToml is also
+// exported standalone (~:13460), and a caller invoking it directly/repeatedly
+// outside install() gets process-lifetime dedupe instead of per-install. No
+// current test depends on the standalone caller's dedupe window.
+let _codexResolverModelOmittedWarned = false;
+function _warnCodexResolverModelOmitted() {
+  if (_codexResolverModelOmittedWarned) return;
+  _codexResolverModelOmittedWarned = true;
+  process.stderr.write(
+    'gsd: notice — Codex agents no longer auto-pin a per-tier model from the runtime ' +
+    'resolver; set model_overrides for an agent if you want a specific Codex model ' +
+    'instead of the session model.\n',
+  );
+}
+
+// Test seam only — bin/install.js deliberately keeps per-install warning/notice
+// dedupe in module scope (both the _codexModelOverrideDroppedWarned Set above and
+// the _codexResolverModelOmittedWarned boolean; install() resets the latter at
+// ~:10116). A unit test that drives generateCodexAgentToml() directly, without
+// going through install(), has no other way to reset either store between
+// assertions without busting the require.cache (which breaks module-instance
+// sharing with the rest of the suite). This is the single sanctioned way for a
+// unit test to clear both dedupe stores — exported so tests can call it instead.
+function _resetCodexWarningDedupeForTests() {
+  _codexModelOverrideDroppedWarned.clear();
+  _codexResolverModelOmittedWarned = false;
 }
 
 /**
@@ -4120,37 +4239,57 @@ function generateCodexAgentToml(agentName, agentContent, modelOverrides = null, 
   // Embed model override when configured in ~/.gsd/defaults.json so that
   // model_overrides is respected on Codex (which uses static TOML, not inline
   // Task() model parameters). See #2256.
-  // Precedence: per-agent model_overrides > runtime-aware tier resolution (#2517).
   // #2310 — a Codex .toml `model` MUST be a real Codex/OpenAI model id. Codex is a
   // passive/session-only model host (ADR-1239): GSD cannot reliably route per-agent
   // tiers, and a bare GSD/Claude tier alias (opus/sonnet/haiku/fable) or a claude-*
   // id 400s on a ChatGPT-account Codex ("The 'sonnet' model is not supported when
   // using Codex with a ChatGPT account"). So: embed ONLY an explicit real-Codex
   // model pin from model_overrides; omit anything Anthropic-flavored so the agent
-  // inherits the always-available session model. (Removing the runtime-resolver
-  // per-tier embedding below is the ADR-2310 passive-posture epic.)
+  // inherits the always-available session model.
+  // #3241 (D1/D5) — the runtime-aware tier-resolver auto-embed that used to fall
+  // through here when model_overrides had nothing was removed: Codex is passive by
+  // default now, and only an explicit model_overrides pin survives. See the
+  // deprecation-notice block below for the population that used to get a pin from
+  // the resolver and no longer does.
   const rawModelOverride = modelOverrides?.[resolvedName] || modelOverrides?.[agentName];
   let pinnedModel = null;
   if (rawModelOverride) {
-    if (typeof rawModelOverride === 'string' && rawModelOverride && !_isAnthropicFlavoredModel(rawModelOverride)) {
-      pinnedModel = rawModelOverride;   // explicit real-Codex model pin → embed verbatim (#2256)
+    // Trim before the truthiness test (#3241 defect fix): a whitespace-only value
+    // (e.g. '   ') is a truthy JS string but not a model id — it must not be
+    // embedded verbatim (`model = "   "`, a live pre-fix defect) or routed to
+    // _warnCodexModelOverrideDropped, whose "is not a valid Codex model
+    // (Anthropic alias/id)" text would misdescribe a blank config field. It is
+    // silently dropped, matching how '' already behaves (no pin, no warning).
+    const trimmedOverride = typeof rawModelOverride === 'string' ? rawModelOverride.trim() : rawModelOverride;
+    if (typeof trimmedOverride === 'string' && trimmedOverride && !_isAnthropicFlavoredModel(trimmedOverride)) {
+      pinnedModel = trimmedOverride;   // explicit real-Codex model pin → embed verbatim (#2256)
+    } else if (typeof rawModelOverride === 'string' && trimmedOverride === '') {
+      // whitespace-only override — no pin, no warning (#3241).
     } else {
       _warnCodexModelOverrideDropped(resolvedName, rawModelOverride);   // alias/claude-* → omit
     }
   }
-  if (!pinnedModel && runtimeResolver) {
-    // #2517 — runtime-aware tier resolution. Embeds Codex-native model + reasoning_effort
-    // from RUNTIME_PROFILE_MAP / model_profile_overrides for the configured tier.
-    // (Superseded on the default path by the ADR-2310 passive-posture epic.)
-    const entry = runtimeResolver.resolve(resolvedName) || runtimeResolver.resolve(agentName);
-    if (entry?.model) pinnedModel = entry.model;
-  }
   // #2310 — final safety gate: never emit an Anthropic-flavored model into a Codex
-  // .toml, even from the runtime-resolver path (e.g. a defaults.json runtime that
-  // does not match the codex install target).
+  // .toml, even one that reached here through some other path than the override
+  // check above.
   if (pinnedModel && _isAnthropicFlavoredModel(pinnedModel)) {
     _warnCodexModelOverrideDropped(resolvedName, pinnedModel);
     pinnedModel = null;
+  }
+  // #3241 — one-time deprecation notice: if nothing ends up pinned but the
+  // runtime resolver would have supplied a per-tier model that would actually
+  // have been EMBEDDED (the population that loses a pin now that the
+  // auto-embed above is gone), point the user at model_overrides. The would-be
+  // model must also clear the #2310 Anthropic-flavored gate above — if it
+  // wouldn't have survived that gate, the user never had that pin pre-Phase-1
+  // either, and the notice would be false. Never fires when the resolver is
+  // null, resolves to nothing, resolves to an Anthropic-flavored model, or an
+  // explicit real-Codex pin survived — in all of those cases nothing was lost.
+  if (!pinnedModel && runtimeResolver) {
+    const wouldHavePinned = runtimeResolver.resolve(resolvedName) || runtimeResolver.resolve(agentName);
+    if (wouldHavePinned?.model && !_isAnthropicFlavoredModel(wouldHavePinned.model)) {
+      _warnCodexResolverModelOmitted();
+    }
   }
   let hasPinnedModel = false;
   if (pinnedModel) {
@@ -4171,8 +4310,12 @@ function generateCodexAgentToml(agentName, agentContent, modelOverrides = null, 
   // follows GSD. Keep those knobs coupled unless GSD also pins the model.
   if (hasPinnedModel) {
     const _universalEffortCodex = resolveInstallTimeEffort(effortCfg, resolvedName !== agentName ? resolvedName : agentName);
-    const _renderedEffortCodex = _getGsdEffortCatalog().renderEffortForRuntime('codex', _universalEffortCodex).value;
-    lines.push(`model_reasoning_effort = ${JSON.stringify(_renderedEffortCodex)}`);
+    // #3533 (10d): 'inherit' means OMIT the pin — the agent follows the host's
+    // own effort default. Never write the literal.
+    if (_universalEffortCodex !== 'inherit') {
+      const _renderedEffortCodex = _getGsdEffortCatalog().renderEffortForRuntime('codex', _universalEffortCodex).value;
+      lines.push(`model_reasoning_effort = ${JSON.stringify(_renderedEffortCodex)}`);
+    }
   }
 
   // #774 — Emit service_tier and model_verbosity for light-tier agents.
@@ -7783,6 +7926,15 @@ function copyWithPathReplacement(srcDir, destDir, pathPrefix, runtime, isCommand
     const srcPath = path.join(srcDir, entry.name);
     const destPath = path.join(destDir, entry.name);
 
+    // #3333: srcPath was enumerated by readdirSync above, but a filesystem is not
+    // transactional — the file it named can vanish between listing and this read
+    // (a concurrent process, or another test in this suite writing/cleaning up a
+    // fixture inside this same real directory). Treat "gone by the time we get
+    // here" as benign and skip it, never a fatal crash of the whole install.
+    if (!entry.isDirectory() && !fs.existsSync(srcPath)) {
+      continue;
+    }
+
     if (entry.isDirectory()) {
       copyWithPathReplacement(srcPath, destPath, pathPrefix, runtime, isCommand, isGlobal, confinementRoot);
     } else if (entry.name.endsWith('.md')) {
@@ -7835,8 +7987,20 @@ function copyWithPathReplacement(srcDir, destDir, pathPrefix, runtime, isCommand
         content = content.replace(globalClaudeRegex, pathPrefix);
         content = content.replace(globalClaudeHomeRegex, pathPrefix);
         content = content.replace(localClaudeRegex, `./${dirName}/`);
-        content = content.replace(/~\/\.claude\b/g, pathPrefix.replace(/\/$/, ''));
-        content = content.replace(/\$HOME\/\.claude\b/g, pathPrefix.replace(/\/$/, ''));
+        // #3544 review (Finding 1 fallout): guarded with the SAME
+        // negative-lookahead convention already used at ~:2859-2860 below
+        // ("preserve .claude-plugin and .claudeignore"). A naive `\b` here
+        // is satisfied by ANY non-word character, including '-' — so for a
+        // --config-dir whose name EXTENDS '.claude' (e.g. '.claude-work',
+        // pathPrefix '$HOME/.claude-work/'), this pass re-matched the
+        // '$HOME/.claude' PREFIX of its own slash-form output (lines above)
+        // and re-appended the full prefix, corrupting every emitted path to
+        // '$HOME/.claude-work-work/...'. Harmless no-op for the literal
+        // default '.claude' (self-replace with an identical string), which
+        // is why this went undetected until a non-default config-dir name
+        // was exercised.
+        content = content.replace(/~\/\.claude(?![\w-])/g, pathPrefix.replace(/\/$/, ''));
+        content = content.replace(/\$HOME\/\.claude(?![\w-])/g, pathPrefix.replace(/\/$/, ''));
         content = content.replace(/\.\/\.claude\b/g, `./${dirName}`);
         content = content.replace(/~\/\.qwen\//g, pathPrefix);
         content = content.replace(/\$HOME\/\.qwen\//g, pathPrefix);
@@ -7844,6 +8008,17 @@ function copyWithPathReplacement(srcDir, destDir, pathPrefix, runtime, isCommand
         content = content.replace(/~\/\.hermes\//g, pathPrefix);
         content = content.replace(/\$HOME\/\.hermes\//g, pathPrefix);
         content = content.replace(/\.\/\.hermes\//g, `./${dirName}/`);
+        // #3544: restore @-file-reference lines to the tilde form Claude Code
+        // actually expands — the SAME correction #3133 already applies to
+        // skill/command bodies via _applyRuntimeRewrites's 'claude' case (see
+        // restoreClaudeGlobalAtRefTilde's doc comment in
+        // runtime-artifact-conversion.cts). This is the gsd-core/ spec-tree
+        // emit path, which never had it: every @~/.claude/gsd-core/… include
+        // in a global install's workflows/references tree silently resolved
+        // to nothing (54 includes across 22 files on a live install).
+        if (runtime === 'claude') {
+          content = runtimeArtifactConversion._restoreClaudeGlobalAtRefTilde(content, pathPrefix);
+        }
       }
       content = processAttribution(content, getCommitAttribution(runtime));
 
@@ -8129,7 +8304,16 @@ function uninstall(isGlobal, runtime = DEFAULT_RUNTIME) {
   } catch {}
 
   // 1. Remove GSD commands/skills (layout-driven)
-  const scope = isGlobal ? 'global' : 'local';
+  // #2870: scope id resolved ONCE here and reused below (was two independent
+  // isGlobal-derived re-derivations). Routed through the Install Scope
+  // Module (src/install-scope.cts) when the capability registry is
+  // available; degrades to the plain id on failure (unknown/non-installable
+  // runtime, broken bundle) so this function's scope-id uses — which never
+  // depended on registry availability before this migration — keep working
+  // exactly as they did pre-migration.
+  const _uninstallScopeId = isGlobal ? 'global' : 'local';
+  const _resolvedUninstallScope = _resolveScopeSafe(_uninstallScopeId, runtime);
+  const scope = _resolvedUninstallScope ? _resolvedUninstallScope.id : _uninstallScopeId;
   // ADR-1239 / #2086: drive uninstall through the public Host-Integration Interface.
   // Fail-open to the engine directly if the composed-registry adapter can't load.
   const _uninstallAdapter = _runtimeAdapter(runtime);
@@ -8497,7 +8681,7 @@ function uninstall(isGlobal, runtime = DEFAULT_RUNTIME) {
       fs.rmSync(legacyDir, { recursive: true });
       removedCount++;
       console.log(`  ${green}✓${reset} Removed legacy commands/gsd/`);
-      const _uninstallScope = isGlobal ? 'global' : 'local';
+      const _uninstallScope = scope;
       if (migrateLegacyDevPreferencesToSkill(targetDir, savedLegacyArtifacts, runtime, _uninstallScope)) {
         // Compute the actual path written so the log line is accurate per-runtime
         const _layout = resolveRuntimeArtifactLayout(runtime, targetDir, _uninstallScope);
@@ -8663,13 +8847,8 @@ function uninstall(isGlobal, runtime = DEFAULT_RUNTIME) {
   // Any file NOT in this set is user-owned and must survive uninstall.
   // After removing GSD files, attempt to rmdir — if the directory is still
   // non-empty (user has custom helpers) it stays; otherwise it goes cleanly.
-  const GSD_CHANGESET_FILES = [
-    'cli.cjs', 'parse.cjs', 'render.cjs', 'serialize.cjs',
-    'github-release-notes.cjs', 'lint.cjs', 'new.cjs',
-    'README.md', // documentation only — not user-authored
-  ];
-  const GSD_SCRIPTS_LIB_FILES = ['cli-exit.cjs', 'allowlist-ratchet.cjs'];
-
+  // GSD_CHANGESET_FILES / GSD_SCRIPTS_LIB_FILES are module-scoped (#3184) so
+  // tests can assert their parity against the real directory contents.
   const changesetUninstallDir = path.join(targetDir, 'scripts', 'changeset');
   if (fs.existsSync(changesetUninstallDir)) {
     let removedChangeset = 0;
@@ -9546,13 +9725,31 @@ function writeManifest(configDir, runtime = DEFAULT_RUNTIME, options = {}) {
   // so the manifest records what's actually on disk. _resolveSkillsRootDir already
   // resolves destSubpath (which includes hermes's 'skills/gsd' nesting) — do not
   // re-append 'gsd' or the hermes dir gets double-nested to skills/gsd/gsd.
-  const codexSkillsDir = _resolveSkillsRootDir(runtime, configDir, options.scope === 'local' ? 'local' : 'global');
+  // #2872 (ADR-2866 Phase 3): the scope used to pick the skills root and the
+  // scope RECORDED in the manifest are one value, resolved once. Two reads of
+  // `options.scope` could drift; one cannot.
+  const resolvedScope = options.scope === 'local' ? 'local' : 'global';
+  const codexSkillsDir = _resolveSkillsRootDir(runtime, configDir, resolvedScope);
   const codexSkillsManifestPrefix = _hostBehaviors(runtime).skillsManifestPrefix || 'skills/';
   const agentsDir = path.join(configDir, 'agents');
   const manifest = {
+    // Schema version of this DOCUMENT (#2872) — distinct from `version`
+    // below, which is the GSD package version. Absent ⇒ a pre-#2872 (v1)
+    // manifest, which readInstallManifest still reads without error and
+    // without requiring a reinstall. Read from the Installer Migration
+    // Module rather than repeated as a second literal: the writer here and
+    // the reader's normalizeManifestVersion are two surfaces over one
+    // constant, and this repo's "generative fix divergence" class is exactly
+    // two such literals drifting apart.
+    manifestVersion: MANIFEST_SCHEMA_VERSION,
     version: pkg.version,
     timestamp: new Date().toISOString(),
     mode: options.mode === 'minimal' ? 'minimal' : 'full',
+    // Recorded so an Installed Surface Resolver can answer "which surfaces
+    // are installed, at which scopes, for which runtimes" without re-deriving
+    // it from the directory it happened to be found in (#2872).
+    runtime,
+    scope: resolvedScope,
     files: {},
   };
 
@@ -10080,6 +10277,12 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   const dirName = getDirName(runtime);
   const src = path.join(__dirname, '..');
 
+  // #3241 — the Codex resolver-model-omitted notice dedupes "at most once", but
+  // scoped per install() call rather than per process — each install() run gets
+  // its own fresh window so a second install (e.g. a second runtime, or a test
+  // re-running install()) can warn again if the same condition recurs.
+  _codexResolverModelOmittedWarned = false;
+
   if (_hostBehaviors(runtime).localInstallDeferred && !isGlobal) {
     console.log(`  ${yellow}⚠${reset} Kimi local install is deferred for Phase 2.`);
     console.log(`      No .kimi-code/skills or .agents/skills project artifacts were written.`);
@@ -10096,6 +10299,19 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       rollbackInstallerMigrations: () => {},
     };
   }
+
+  // #2870: scope id resolved ONCE here and reused at every use below (was 10
+  // independent isGlobal-derived re-derivations). Placed AFTER the kimi
+  // local-deferred early return above so that return path does no extra
+  // work. Routed through the Install Scope Module (src/install-scope.cts)
+  // when the capability registry is available; degrades to the plain id on
+  // failure (unknown/non-installable runtime, broken bundle) so this
+  // function's plain scope-id uses — which never depended on registry
+  // availability before this migration — keep working exactly as they did
+  // pre-migration. `_installScope` (the full resolved value, not just the
+  // id) additionally backs the settingsFileByScope routing below.
+  const _installScopeId = isGlobal ? 'global' : 'local';
+  const _installScope = _resolveScopeSafe(_installScopeId, runtime);
 
   // Reusable helper to copy hooks/lib/ (git-cmd.js + gsd-graphify-rebuild.sh).
   // Defined early so it is visible to both the main and Codex code paths.
@@ -10294,7 +10510,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   const codexPreInstallAgentContents = new Map();
   let codexPreInstallVersionBytes = null;
   if (_hostBehaviors(runtime).tomlConfigInstall && !isMinimalMode(_effectiveInstallMode)) {
-    const _preSkillsDir = _resolveSkillsRootDir(runtime, targetDir, isGlobal ? 'global' : 'local');
+    const _preSkillsDir = _resolveSkillsRootDir(runtime, targetDir, _installScopeId);
     if (fs.existsSync(_preSkillsDir)) {
       for (const entry of fs.readdirSync(_preSkillsDir, { withFileTypes: true })) {
         if (entry.isDirectory() && entry.name.startsWith('gsd-')) {
@@ -10350,7 +10566,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   const _codexPreConfigRollback = !_hostBehaviors(runtime).tomlConfigInstall || isMinimalMode(_effectiveInstallMode) ? null : () => {
     rollbackInstallerMigrations();
     // skills/gsd-* — pass 1: restore snapshot entries (may be absent if deleted mid-install).
-    const _earlySkillsDir = _resolveSkillsRootDir(runtime, targetDir, isGlobal ? 'global' : 'local');
+    const _earlySkillsDir = _resolveSkillsRootDir(runtime, targetDir, _installScopeId);
     for (const skillName of codexPreInstallSkillNames) {
       const skillDirPath = path.join(_earlySkillsDir, skillName);
       const fileMap = codexPreInstallSkillContents.get(skillName);
@@ -10448,7 +10664,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   installerMigrationResult = runInstallerMigrations({
     configDir: targetDir,
     runtime,
-    scope: isGlobal ? 'global' : 'local',
+    scope: _installScopeId,
     migrations: options.installerMigrations,
     baselineScan: true,
   });
@@ -10581,7 +10797,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
 
   if (_isSkillsRuntime) {
     // Layout-driven install for skills-based runtimes (full and minimal modes)
-    const scope = isGlobal ? 'global' : 'local';
+    const scope = _installScopeId;
     // ADR-1239 upgrade 3 / #2088: a kind may declare an alternate install `home`
     // (e.g. Codex skills -> $HOME/.agents/skills) instead of the runtime's normal
     // configDir. Resolve the ACTUAL on-disk skills root here, descriptor-driven
@@ -10953,7 +11169,12 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // grok: convertClaudeAgentToGrokAgent via artifactLayout (must stay here —
   // without exclusion the legacy loop below path-rewrites agents RAW and
   // overwrites the descriptor-written bodies, dropping tool-name rewrites).
-  const _DESCRIPTOR_AGENTS_RUNTIMES = new Set(['cursor', 'windsurf', 'augment', 'trae', 'codebuddy', 'copilot', 'antigravity', 'qwen', 'kimi', 'grok']);
+  // #3384: zcode cut over — its agents kind now declares
+  // convertClaudeAgentToZcodeAgent (strips mcp__* grants ZCode's dispatcher
+  // treats as required MCP servers). Without this exclusion the legacy inline
+  // loop below deletes+re-copies zcode's agents RAW, bypassing the converter
+  // (the same hazard the qwen comment above documents).
+  const _DESCRIPTOR_AGENTS_RUNTIMES = new Set(['cursor', 'windsurf', 'augment', 'trae', 'codebuddy', 'copilot', 'antigravity', 'qwen', 'kimi', 'grok', 'zcode']);
 
   // Always remove stale gsd-* agents first so re-installing with
   // `--minimal` actually shrinks a previously-full install.
@@ -11111,8 +11332,13 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
           const _effortCfg = readGsdEffectiveEffortConfig(targetDir);
           const _agentName = entry.name.replace(/\.md$/, '');
           const _universalEffort = resolveInstallTimeEffort(_effortCfg, _agentName);
-          const _renderedEffort = _getGsdEffortCatalog().renderEffortForRuntime(runtime, _universalEffort).value;
-          content = injectEffortFrontmatter(content, _renderedEffort);
+          // #3533 (10d): 'inherit' means the effort: key must NOT exist —
+          // Claude Code then follows the session effort. The canonical source
+          // agents carry no effort key, so skipping injection is the whole job.
+          if (_universalEffort !== 'inherit') {
+            const _renderedEffort = _getGsdEffortCatalog().renderEffortForRuntime(runtime, _universalEffort).value;
+            content = injectEffortFrontmatter(content, _renderedEffort);
+          }
           const _disallowedTools = READONLY_AGENT_DISALLOWED_TOOLS[_agentName];
           if (_disallowedTools) content = injectDisallowedToolsFrontmatter(content, _disallowedTools);
         }
@@ -11514,11 +11740,34 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   }
 
   // Write file manifest for future modification detection
-  writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
+  writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: _installScopeId });
   console.log(`  ${green}✓${reset} Wrote file manifest (${MANIFEST_NAME})`);
 
   // Report any backed-up local patches
   reportLocalPatches(targetDir, runtime);
+
+  // #2873: cross-scope shadow report. Fires ONCE per install (this is the
+  // only writeManifest call site that gets it — the other four sites are
+  // sub-writes within a single install, not separate installs). A shadowed
+  // install is a warning, never a failure (ADR-2866 Consequences), so this
+  // never touches `failures` or `process.exit`, and the whole block is
+  // wrapped in a try/catch that swallows everything: a report failure must
+  // never fail an otherwise-successful install (design row C5). No options
+  // are injected into buildShadowReport — this is the production call shape,
+  // resolving the real machine via os.homedir()/process.cwd() defaults
+  // inside the resolver.
+  try {
+    const shadowReport = buildShadowReport(runtime);
+    const shadowLines = renderShadowReport(shadowReport);
+    if (shadowLines.length > 0) {
+      console.warn(`\n  ${yellow}⚠${reset}  ${shadowLines[0]}`);
+      for (const line of shadowLines.slice(1)) {
+        console.warn(`  ${dim}${line}${reset}`);
+      }
+    }
+  } catch (_shadowReportErr) {
+    // Never fail an install over a reporting concern — see comment above.
+  }
 
   // Verify no leaked .claude paths in non-Claude runtimes (manifest-scoped)
   if (!_hostBehaviors(runtime).ownsClaudePaths) {
@@ -11665,7 +11914,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       //     (copyCommandsAsCodexSkills removes pre-existing gsd-* dirs before re-writing)
       //     are restored even when they are absent from disk at rollback time (#3245 CR).
       //   • Dirs that did not pre-exist: remove entirely.
-      const _rollbackSkillsDir = _resolveSkillsRootDir(runtime, targetDir, isGlobal ? 'global' : 'local');
+      const _rollbackSkillsDir = _resolveSkillsRootDir(runtime, targetDir, _installScopeId);
       // Pass 1 — restore snapshot entries (may be absent from disk if deleted mid-install).
       for (const skillName of codexPreInstallSkillNames) {
         const skillDirPath = path.join(_rollbackSkillsDir, skillName);
@@ -11780,7 +12029,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       // Re-write the manifest now that .toml agent files exist on disk.
       // The initial writeManifest call (before Codex config generation) could
       // not include agents/gsd-*.toml because those files did not yet exist.
-      writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
+      writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: _installScopeId });
     } else {
       console.log(`  ${dim}↳${reset} Skipping Codex agent config generation (minimal install)`);
     }
@@ -12068,7 +12317,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     // manifest-tracked (verified) — uninstall removes them explicitly via
     // removeCursorHooksJson + its script list, and reconcile is idempotent.
     // The re-run is retained for parity with the settings.json install path.
-    writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
+    writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: _installScopeId });
     persistActiveProfileMarker();
     return { settingsPath: null, settings: null, statuslineCommand: null, updateBannerCommand: null, runtime, configDir: targetDir };
   }
@@ -12175,7 +12424,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       // explicitly via removeWindsurfHooksJson, and reconcileWindsurfHooksJson
       // is idempotent on repeated installs, so manifest tracking isn't needed
       // for correctness here.
-      writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
+      writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: _installScopeId });
     }
 
     persistActiveProfileMarker();
@@ -12189,7 +12438,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     writeClineArtifacts(targetDir, isGlobal);
     // Re-run the manifest pass: these artifacts are written *after* the earlier
     // writeManifest() call, so a second pass is needed to hash-track them.
-    writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: isGlobal ? 'global' : 'local' });
+    writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: _installScopeId });
     persistActiveProfileMarker();
     return { settingsPath: null, settings: null, statuslineCommand: null, updateBannerCommand: null, runtime, configDir: targetDir };
   }
@@ -12204,10 +12453,24 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // #338: local Claude installs write to settings.local.json (Claude Code's per-user/gitignored slot)
   // so engineer-specific absolute paths (Node binary, home dir) never land in the repo-shared
   // settings.json. Global installs and all other runtimes continue to use settings.json.
+  // #2870: the CURRENT scope's settings filename is sourced from the Install
+  // Scope Module (_installScope.settingsFile, resolveScope's per-scope field)
+  // instead of indexing _scopedSettings by hand. _scopedSettings itself is
+  // retained unchanged as the #338-privacy fail-safe path: _hostBehaviors
+  // already degrades to FALLBACK_HOST_BEHAVIORS (see that constant's comment
+  // above) when the registry fails to load, whereas resolveScope's registry
+  // lookup throws in that same scenario (_installScope is null when it did).
+  // Falling back to _scopedSettings[_installScopeId] there — and keeping the
+  // non-local-claude branch's expression untouched — means this is
+  // byte-identical to the pre-migration computation in every case, including
+  // the broken-registry fail-safe floor.
   const _scopedSettings = _hostBehaviors(runtime).settingsFileByScope || null;
-  const isLocalClaude = (!isGlobal && !!(_scopedSettings && _scopedSettings.local));
+  const _currentScopeSettingsFile = _installScope
+    ? _installScope.settingsFile
+    : (_scopedSettings ? (_scopedSettings[_installScopeId] ?? null) : null);
+  const isLocalClaude = (!isGlobal && !!_currentScopeSettingsFile);
   const settingsFileName = isLocalClaude
-    ? _scopedSettings.local
+    ? _currentScopeSettingsFile
     : ((_scopedSettings && _scopedSettings.global) || 'settings.json');
   // ADR-1239 Phase B write-confinement: the descriptor-sourced settings filename
   // must resolve under targetDir (this path also drives a recursive mkdirSync).
@@ -13494,6 +13757,7 @@ module.exports = {
     convertClaudeAgentToCursorAgent,
     convertClaudeAgentToCodexAgent,
     generateCodexAgentToml,
+    _resetCodexWarningDedupeForTests,
     cleanupCodexSkillMetadataSidecars,
     cleanupWindsurfLegacyDevinSkills,
     cleanupMovedSkillsOldLocation,
@@ -13528,6 +13792,10 @@ module.exports = {
     // #3023 — shared hook bundle directory name, descriptor-driven
     SHARED_HOOKS_DIR_DEFAULT,
     resolveSharedHooksDirName,
+    // #3184 — uninstall-side GSD-managed file enumerations, exported for
+    // parity assertions against the wholesale-copy source directories
+    GSD_CHANGESET_FILES,
+    GSD_SCRIPTS_LIB_FILES,
     convertSlashCommandsToCodexSkillMentions,
     convertClaudeCommandToCodexSkill,
     convertClaudeCommandToKimiSkill,
@@ -13660,6 +13928,7 @@ module.exports = {
     referencesHook,
     applySettingsJsonHooks,
     rewriteLegacyManagedNodeHookCommands,
+    reconcileManagedShellHookCommands,
     buildCodexHookBlock,
     rewriteLegacyCodexHookBlock,
     buildCodexHookWindowsShimIR,
@@ -13709,7 +13978,19 @@ if (require.main === module && !process.env.GSD_TEST_MODE) {
       console.error('Usage: node install.js --skills-root <runtime>');
       process.exit(1);
     }
-    const skillsRoot = getGlobalSkillsBase(runtimeArg);
+    // #3024: validate the runtime id against the shipped capability registry
+    // BEFORE resolving anything. getGlobalSkillsBase's bare `runtimes[runtime]`
+    // lookup falls through the prototype chain to claude's skills root for an
+    // unregistered/hostile id (`__proto__`, `constructor`, `prototype`, …)
+    // instead of failing loudly. isRegisteredRuntimeId is the SAME validator
+    // gsd-tools' `routeSkillsRoot` calls, so this entry point and the shipped
+    // `gsd-tools query skills-root` entry point can never diverge on which
+    // runtime ids they accept.
+    if (!isRegisteredRuntimeId(runtimeArg)) {
+      console.error(`Unknown runtime "${runtimeArg}" — must be a registered runtime id`);
+      process.exit(1);
+    }
+    const skillsRoot = getGlobalSkillsBase(runtimeArg.trim());
     if (skillsRoot === null) {
       console.error(`${runtimeArg} does not use a skills directory`);
       process.exit(1);

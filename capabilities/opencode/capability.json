@@ -1,7 +1,7 @@
 {
   "id": "opencode",
   "role": "runtime",
-  "version": "1.9.1",
+  "version": "1.10.0",
   "title": "OpenCode",
   "description": "OpenCode — XDG-based config dir; flat commands/ + skills artifact layout; settings-json config format; no lifecycle hook registration; tier-2 support.",
   "tier": "core",
@@ -59,6 +59,7 @@
         }
       ]
     },
+    "triggerPrecedence": ["skills", "commands"],
     "commandStyle": "slash-hyphen",
     "hooksSurface": "none",
     "extensionEvents": "opencode",
@@ -109,8 +110,7 @@
       "skipHomePrefixSubstitution": true,
       "skipSettingsUi": true,
       "skipUpdateBannerCommand": true,
-      "skipCodexSkillsManifest": true,
-      "reviewerCli": true
+      "skipCodexSkillsManifest": true
     }
   },
   "reviewer": {

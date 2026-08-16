@@ -2,7 +2,8 @@
 
 /**
  * git-fixture — the shared throw-on-failure mechanism for process-seam
- * results, plus a throw-preserving wrapper over the seam's `runGit`.
+ * results, its non-throwing counterpart, plus a throw-preserving wrapper
+ * over the seam's `runGit`.
  *
  * Why this exists: `execSync`/`execFileSync` throw on any non-zero exit,
  * and 237+ sites in this repo's test suite are written against that throw —
@@ -24,6 +25,13 @@
  * etc.) calls `throwIfFailed` directly instead of hand-rolling its own copy
  * of this shape — five call sites did exactly that before this module
  * exported it, and drifted from each other in the process (#3144).
+ *
+ * `toLegacyResult` is the non-throwing sibling: call sites that already
+ * branch on exit status as data (never wanted a throw) still need the
+ * result reshaped onto the legacy `{ status, stdout, stderr }` field names
+ * their assertions read — ~8 test files hand-rolled that identical mapping
+ * before this module exported it too (#3147).
+ *
  * `tests/helpers/process-seam.cjs` itself is NOT modified by this module —
  * its never-throws contract is intact; this is a layer on top, not a change
  * underneath.
@@ -41,6 +49,31 @@ const { runGit, OUTCOME } = require('./process-seam.cjs');
  * budget.
  */
 const DEFAULT_GIT_TIMEOUT_MS = 15000;
+
+/**
+ * Timeout for git calls that CONSTRUCT a fixture repository, in milliseconds.
+ *
+ * A distinct class from `DEFAULT_GIT_TIMEOUT_MS` above, which is sized for
+ * plumbing READS (rev-parse, branch, log) against an existing repo.
+ * `createFixture` (`tests/fixtures/index.cjs`) issues SIX sequential spawns to
+ * build one repo — `init`, three `config` writes, `add -A`, `commit` — and
+ * `init`/`commit` each write dozens of files. On Windows every one of those
+ * spawns is Defender-scanned, so the construction sequence is materially
+ * heavier than any single read.
+ *
+ * CI (PR #3323, `full test (windows-latest, 22, shard 2/3)`) recorded
+ * `gitOrThrow: git init failed — outcome=timed_out exitCode=null` and the same
+ * for `git commit --allow-empty`, with sibling tests in the same block taking
+ * 15.6-22.0s, while every other lane — including windows-latest node 24, all
+ * three shards — passed the same commit. That is a bound sized for the wrong
+ * class, not a slow machine: the identical conclusion, in the identical job,
+ * that `HOOK_FANOUT_TIMEOUT_MS` records for PR #3285.
+ *
+ * 60000ms is 4x the bound that failed and half `INSTALL_TIMEOUT_MS` — the same
+ * ratio `HOOK_FANOUT_TIMEOUT_MS` uses, and the right order for a call that is
+ * far heavier than a plumbing read but much lighter than a full installer run.
+ */
+const GIT_FIXTURE_TIMEOUT_MS = 60000;
 
 /**
  * Throw on anything other than a clean (exit 0) process-seam result,
@@ -111,4 +144,38 @@ function gitOrThrow(args, options = {}) {
   return r.stdout;
 }
 
-module.exports = { gitOrThrow, throwIfFailed, DEFAULT_GIT_TIMEOUT_MS };
+/**
+ * The NON-throwing counterpart to `throwIfFailed`: maps any process-seam
+ * result onto the legacy `execSync`/`execFileSync` `{ status, stdout,
+ * stderr }` shape, without ever throwing. For call sites that already read
+ * exit status as data (they branch on `.status`/`.stdout`/`.stderr`
+ * themselves) rather than wanting a throw on failure — the same "the shape
+ * is defined once rather than re-derived per suite" motivation as
+ * `throwIfFailed`, just for the non-throwing half of the split. Before this
+ * export existed, ~8 test files hand-rolled the identical three-line mapping
+ * (#3147 pre-PR review finding).
+ *
+ * This is intentionally a bare mapping and nothing more: some call sites
+ * layer additional site-specific behavior on top (an extra field, a parsed
+ * JSON body in place of raw `stdout`, etc.) — those compose `toLegacyResult`
+ * as a building block (e.g. `{ ...toLegacyResult(result), extra }`) rather
+ * than folding their extra behavior into this helper, so this shape stays
+ * exactly one thing everywhere it's used.
+ *
+ * @param {object} result - a process-seam result: `{outcome, exitCode,
+ *   stdout, stderr, timedOut, signal}` (plus any seam-specific fields).
+ * @returns {{status: number|null, stdout: string, stderr: string}} —
+ *   `status` is the legacy `spawnSync`/`execFileSync` field name for
+ *   `result.exitCode`; `stdout`/`stderr` pass through unchanged.
+ */
+function toLegacyResult(result) {
+  return { status: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+}
+
+module.exports = {
+  gitOrThrow,
+  throwIfFailed,
+  toLegacyResult,
+  DEFAULT_GIT_TIMEOUT_MS,
+  GIT_FIXTURE_TIMEOUT_MS,
+};

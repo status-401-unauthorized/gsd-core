@@ -8,11 +8,12 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { execSync, execFileSync } = require('node:child_process');
 const fs = require('fs');
 const path = require('path');
 const { runGsdTools, createTempProject, createTempDir, cleanup } = require('./helpers.cjs');
 const fc = require('./helpers/fast-check-setup.cjs');
+const { gitOrThrow, throwIfFailed } = require('./helpers/git-fixture.cjs');
+const { runNode } = require('./helpers/process-seam.cjs');
 
 describe('history-digest command', () => {
   let tmpDir;
@@ -522,9 +523,12 @@ describe('progress command', () => {
   });
 
   test('renders JSON progress', () => {
+    // #3217: no version token — genuinely free-form, so windowing scope is
+    // COMPLETE (§7.1) rather than UNSCOPED (a title merely mentioning "v1.0"
+    // with no STATE.md milestone pointer cannot be windowed to that version).
     fs.writeFileSync(
       path.join(tmpDir, '.planning', 'ROADMAP.md'),
-      `# Roadmap v1.0 MVP\n`
+      `# Roadmap MVP\n`
     );
     const p1 = path.join(tmpDir, '.planning', 'phases', '01-foundation');
     fs.mkdirSync(p1, { recursive: true });
@@ -544,9 +548,10 @@ describe('progress command', () => {
   });
 
   test('renders bar format', () => {
+    // #3217: no version token — see 'renders JSON progress' above.
     fs.writeFileSync(
       path.join(tmpDir, '.planning', 'ROADMAP.md'),
-      `# Roadmap v1.0\n`
+      `# Roadmap\n`
     );
     const p1 = path.join(tmpDir, '.planning', 'phases', '01-test');
     fs.mkdirSync(p1, { recursive: true });
@@ -575,9 +580,10 @@ describe('progress command', () => {
   });
 
   test('does not crash when summaries exceed plans (orphaned SUMMARY.md)', () => {
+    // #3217: no version token — see 'renders JSON progress' above.
     fs.writeFileSync(
       path.join(tmpDir, '.planning', 'ROADMAP.md'),
-      `# Roadmap v1.0 MVP\n`
+      `# Roadmap MVP\n`
     );
     const p1 = path.join(tmpDir, '.planning', 'phases', '01-foundation');
     fs.mkdirSync(p1, { recursive: true });
@@ -963,6 +969,56 @@ describe('current-timestamp command', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// cmdCurrentTimestamp exact-value tests (#3314 — ADR-456 subprocess clock pin)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('current-timestamp command — exact value under GSD_NOW_MS pin', () => {
+  let tmpDir;
+  // Pinned instant with a non-zero millisecond fraction so the 'full' format
+  // assertion can't accidentally pass against a truncated value.
+  const PINNED_MS = 1_700_000_000_123; // 2023-11-14T22:13:20.123Z
+  const PIN_ENV = { GSD_TEST_MODE: '1', GSD_NOW_MS: String(PINNED_MS) };
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  test('date format: exact value for pinned instant', () => {
+    const result = runGsdTools('current-timestamp date', tmpDir, PIN_ENV);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const expected = new Date(PINNED_MS).toISOString().split('T')[0];
+    assert.strictEqual(output.timestamp, expected);
+  });
+
+  test('filename format: exact value for pinned instant', () => {
+    const result = runGsdTools('current-timestamp filename', tmpDir, PIN_ENV);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const expected = new Date(PINNED_MS).toISOString().replace(/:/g, '-').replace(/\..+/, '');
+    assert.strictEqual(output.timestamp, expected);
+  });
+
+  test('full format: exact value for pinned instant', () => {
+    const result = runGsdTools('current-timestamp full', tmpDir, PIN_ENV);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.timestamp, new Date(PINNED_MS).toISOString());
+  });
+
+  test('default format: exact value for pinned instant', () => {
+    const result = runGsdTools('current-timestamp', tmpDir, PIN_ENV);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.timestamp, new Date(PINNED_MS).toISOString());
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // cmdListTodos tests (CMD-02)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1303,7 +1359,8 @@ describe('resolve-model command', () => {
 
 describe('commit command', () => {
   const { createTempGitProject } = require('./helpers.cjs');
-  const { execSync, execFileSync } = require('child_process');
+  const { gitOrThrow, throwIfFailed } = require('./helpers/git-fixture.cjs');
+  const { runNode } = require('./helpers/process-seam.cjs');
   let tmpDir;
 
   beforeEach(() => {
@@ -1332,8 +1389,8 @@ describe('commit command', () => {
   test('skips when .planning is gitignored', () => {
     // Add .planning/ to .gitignore and commit it so git recognizes the ignore
     fs.writeFileSync(path.join(tmpDir, '.gitignore'), '.planning/\n');
-    execSync('git add .gitignore', { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git commit -m "add gitignore"', { cwd: tmpDir, stdio: 'pipe' });
+    gitOrThrow(['add', '.gitignore'], { cwd: tmpDir });
+    gitOrThrow(['commit', '-m', 'add gitignore'], { cwd: tmpDir });
 
     const result = runGsdTools('commit "test message"', tmpDir);
     assert.ok(result.success, `Command failed: ${result.error}`);
@@ -1366,7 +1423,7 @@ describe('commit command', () => {
     assert.strictEqual(output.reason, 'committed');
 
     // Verify via git log
-    const gitLog = execSync('git log --oneline -1', { cwd: tmpDir, encoding: 'utf-8' }).trim();
+    const gitLog = gitOrThrow(['log', '--oneline', '-1'], { cwd: tmpDir }).trim();
     assert.ok(gitLog.includes('test: add test file'), 'git log should contain the commit message');
     assert.ok(gitLog.includes(output.hash), 'git log should contain the returned hash');
   });
@@ -1374,8 +1431,8 @@ describe('commit command', () => {
   test('amend mode works without crashing', () => {
     // Create a file and commit it first
     fs.writeFileSync(path.join(tmpDir, '.planning', 'amend-file.md'), '# Initial\n');
-    execSync('git add .planning/amend-file.md', { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git commit -m "initial file"', { cwd: tmpDir, stdio: 'pipe' });
+    gitOrThrow(['add', '.planning/amend-file.md'], { cwd: tmpDir });
+    gitOrThrow(['commit', '-m', 'initial file'], { cwd: tmpDir });
 
     // Modify the file and amend
     fs.writeFileSync(path.join(tmpDir, '.planning', 'amend-file.md'), '# Amended\n');
@@ -1387,10 +1444,10 @@ describe('commit command', () => {
     assert.strictEqual(output.committed, true, 'amend should succeed');
 
     // Verify only 2 commits total (initial setup + amended)
-    const logCount = execSync('git log --oneline', { cwd: tmpDir, encoding: 'utf-8' }).trim().split('\n').length;
+    const logCount = gitOrThrow(['log', '--oneline'], { cwd: tmpDir }).trim().split('\n').length;
     assert.strictEqual(logCount, 2, 'should have 2 commits (initial + amended)');
   });
-  test('creates strategy branch before first commit when branching_strategy is milestone (#3079: no switch)', () => {
+  test('#3207: creates AND switches to the milestone branch before first commit', () => {
     // Configure milestone branching strategy
     fs.writeFileSync(
       path.join(tmpDir, '.planning', 'config.json'),
@@ -1415,16 +1472,17 @@ describe('commit command', () => {
     const output = JSON.parse(result.output);
     assert.strictEqual(output.committed, true, 'should have committed');
 
-    // #3079: the branch should be CREATED but NOT switched to.
-    const { execFileSync } = require('child_process');
-    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir, encoding: 'utf-8' }).trim();
-    assert.notStrictEqual(branch, 'gsd/v1.0-initial-release', '#3079: must NOT switch to the milestone branch');
-    // Verify the branch WAS created (exists as a ref)
-    const branchExists = execFileSync('git', ['rev-parse', '--verify', 'gsd/v1.0-initial-release'], { cwd: tmpDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
-    assert.ok(branchExists.trim(), 'milestone branch should be created even without switching');
+    // #3207: the branch should be CREATED and HEAD switched to it, so the first
+    // milestone-scoped commit lands on the milestone branch (#1278 intent). The
+    // prior #3079 no-switch behavior regressed this for fresh creates.
+    const branch = gitOrThrow(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir }).trim();
+    assert.strictEqual(branch, 'gsd/v1.0-initial-release', '#3207: must switch to the milestone branch');
+    // The commit must be reachable on the milestone branch (HEAD is on it).
+    const committedFile = gitOrThrow(['show', 'HEAD:.planning/test-context.md'], { cwd: tmpDir });
+    assert.ok(committedFile.includes('# Context'), 'milestone commit must land on the milestone branch');
   });
 
-  test('creates strategy branch before first commit when branching_strategy is phase (#3079: no switch)', () => {
+  test('#3207: creates AND switches to the phase branch before first commit', () => {
     // Configure phase branching strategy
     fs.writeFileSync(
       path.join(tmpDir, '.planning', 'config.json'),
@@ -1453,15 +1511,16 @@ describe('commit command', () => {
     const output = JSON.parse(result.output);
     assert.strictEqual(output.committed, true, 'should have committed');
 
-    // #3079: the branch should be CREATED but NOT switched to. The commit
-    // lands on the current branch (master/main), and the phase branch exists
-    // as a ref but HEAD did not move.
-    const { execFileSync } = require('child_process');
-    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir, encoding: 'utf-8' }).trim();
-    assert.notStrictEqual(branch, 'gsd/phase-01-setup', '#3079: must NOT switch to the phase branch');
-    // Verify the branch WAS created (exists as a ref)
-    const branchExists = execFileSync('git', ['rev-parse', '--verify', 'gsd/phase-01-setup'], { cwd: tmpDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
-    assert.ok(branchExists.trim(), 'phase branch should be created even without switching');
+    // #3207: the branch should be CREATED and HEAD switched to it, so the first
+    // phase-scoped commit lands on the phase branch (#1278 intent). The prior
+    // #3079 no-switch behavior regressed this for fresh creates.
+    const branch = gitOrThrow(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir }).trim();
+    assert.strictEqual(branch, 'gsd/phase-01-setup', '#3207: must switch to the phase branch');
+    // The commit must be reachable on the phase branch (HEAD is on it).
+    const committedFile = gitOrThrow(
+      ['show', 'HEAD:.planning/phases/01-setup/01-CONTEXT.md'], { cwd: tmpDir }
+    );
+    assert.ok(committedFile.includes('# Context'), 'phase commit must land on the phase branch');
   });
 
   test('decimal phase numbers are captured correctly in branching strategy', () => {
@@ -1493,12 +1552,11 @@ describe('commit command', () => {
     const output = JSON.parse(result.output);
     assert.strictEqual(output.committed, true, 'should have committed');
 
-    // #3079: verify branch is created but NOT switched to (decimal phase)
-    const { execFileSync } = require('child_process');
-    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir, encoding: 'utf-8' }).trim();
-    assert.notStrictEqual(branch, 'gsd/phase-45.14-golden-capture', '#3079: must NOT switch to the phase branch');
+    // #3207: the branch should be CREATED and HEAD switched to it (decimal phase).
+    const branch = gitOrThrow(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir }).trim();
+    assert.strictEqual(branch, 'gsd/phase-45.14-golden-capture', '#3207: must switch to the decimal phase branch');
     // Verify the correct branch name was resolved (not integer-only)
-    const branchExists = execFileSync('git', ['rev-parse', '--verify', 'gsd/phase-45.14-golden-capture'], { cwd: tmpDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const branchExists = gitOrThrow(['rev-parse', '--verify', 'gsd/phase-45.14-golden-capture'], { cwd: tmpDir });
     assert.ok(branchExists.trim(), 'decimal phase branch should be created (45.14, not 14)');
   });
 
@@ -1556,27 +1614,32 @@ describe('commit command', () => {
     const output = JSON.parse(result.output);
     assert.strictEqual(output.committed, true, 'should have committed');
 
-    // #3079: the commit no longer switches to the phase branch. The phase-07
-    // branch should be CREATED (resolving correctly to 07, not the archived 02),
-    // but the commit lands on the current branch.
-    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir, encoding: 'utf-8' }).trim();
+    // #3207: the commit now CREATES and SWITCHES to the phase branch. The
+    // resolved branch is phase-07 (correct, not the archived 02), and HEAD
+    // moves onto it so the phase's work accumulates there.
+    const branch = gitOrThrow(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir }).trim();
     assert.notStrictEqual(
       branch,
       'gsd/phase-02-archived-phase',
       `must NOT be on the archived phase-02 branch (got ${branch})`
     );
+    // #3207: HEAD must land on the CORRECT freshly-created phase-07 branch.
+    assert.strictEqual(
+      branch,
+      'gsd/phase-07-active-phase',
+      `must switch onto the correct phase-07 branch (got ${branch})`
+    );
     // Verify the correct phase-07 branch was created (not the archived 02)
-    const phase07Exists = execFileSync(
-      'git', ['rev-parse', '--verify', 'gsd/phase-07-active-phase'],
-      { cwd: tmpDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
+    const phase07Exists = gitOrThrow(
+      ['rev-parse', '--verify', 'gsd/phase-07-active-phase'],
+      { cwd: tmpDir }
     );
     assert.ok(phase07Exists.trim(), 'phase-07 branch should be created (not the archived phase-02)');
 
     // The committed file must exist on HEAD, proving the commit landed.
-    const committedFile = execFileSync(
-      'git',
+    const committedFile = gitOrThrow(
       ['show', 'HEAD:.planning/phases/PROJECT_V2-07-active-phase/07-CONTEXT.md'],
-      { cwd: tmpDir, encoding: 'utf-8' }
+      { cwd: tmpDir }
     );
     assert.ok(committedFile.includes('# Context'), 'phase-07 file must be in the commit');
   });
@@ -1611,36 +1674,29 @@ describe('commit command', () => {
     // default branch so the working tree is NOT on the phase branch when commit
     // runs. The resolved branch already exists; the pre-fix code silently
     // switched onto it.
-    execFileSync('git', ['branch', 'gsd/phase-01-first-phase'], { cwd: tmpDir, stdio: 'pipe' });
+    gitOrThrow(['branch', 'gsd/phase-01-first-phase'], { cwd: tmpDir });
     // Ensure the file is staged only by the commit command itself (it must run
     // from the current/default branch and must not be force-switched).
-    const beforeBranch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
-      cwd: tmpDir, encoding: 'utf-8',
-    }).trim();
+    const beforeBranch = gitOrThrow(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir }).trim();
 
-    // Invoke gsd-tools via spawnSync so stderr is observable on the success
-    // path — the warning that proves the no-switch path is not silent (#2539
-    // AC2) is written to stderr, which execFileSync discards on success.
+    // Invoke gsd-tools via the process seam so stderr is observable on the
+    // success path — the warning that proves the no-switch path is not silent
+    // (#2539 AC2) is written to stderr, which execFileSync discards on success.
     const { TOOLS_PATH } = require('./helpers.cjs');
-    const { spawnSync } = require('child_process');
-    const proc = spawnSync(process.execPath, [
+    const proc = runNode([
       TOOLS_PATH, 'commit', 'docs(01): add context',
       '--files', '.planning/phases/01-first-phase/01-CONTEXT.md',
-    ], { cwd: tmpDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    ], { cwd: tmpDir });
+    throwIfFailed(proc, 'gsd-tools commit (#2539 no-switch fixture)');
     const stdout = proc.stdout || '';
     const stderr = proc.stderr || '';
-    if (proc.status !== 0) {
-      throw new Error(`gsd-tools commit exited ${proc.status}: stdout=${stdout} stderr=${stderr}`);
-    }
 
     const output = JSON.parse(stdout.trim());
     assert.strictEqual(output.committed, true, 'should have committed');
 
     // The command must NOT have silently switched the working tree onto the
     // pre-existing phase branch. The commit lands on the branch we were on.
-    const afterBranch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
-      cwd: tmpDir, encoding: 'utf-8',
-    }).trim();
+    const afterBranch = gitOrThrow(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir }).trim();
     assert.strictEqual(
       afterBranch,
       beforeBranch,
@@ -1654,6 +1710,96 @@ describe('commit command', () => {
     assert.ok(
       /Warning: resolved.*branch .* already exists/.test(stderr),
       `expected a non-silent warning on stderr when the resolved branch already exists; got stderr=${stderr}`
+    );
+  });
+
+  // #3207 AC3: the fresh-create path must NOT be silent. Pre-fix the first
+  // phase-scoped commit produced no output at all, so the divergence between
+  // "phase branch exists" and "phase work is on it" started invisibly. The fix
+  // logs the create+switch on stderr.
+  test('#3207: fresh phase-branch create is non-silent (logs create+switch)', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({
+        commit_docs: true,
+        branching_strategy: 'phase',
+        phase_branch_template: 'gsd/phase-{phase}-{slug}',
+      })
+    );
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '01-setup'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      '# Roadmap\n\n## Phase 1: Setup\nGoal: Initial setup\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'phases', '01-setup', '01-CONTEXT.md'), '# Context\n'
+    );
+
+    // Observe stderr on the success path via the process seam (execFileSync
+    // discards stderr on success — same reason the #2539 test uses runNode).
+    const { TOOLS_PATH } = require('./helpers.cjs');
+    const proc = runNode([
+      TOOLS_PATH, 'commit', 'docs(01): add context',
+      '--files', '.planning/phases/01-setup/01-CONTEXT.md',
+    ], { cwd: tmpDir });
+    throwIfFailed(proc, 'gsd-tools commit (#3207 non-silent fixture)');
+    const stderr = proc.stderr || '';
+
+    // The fresh create must announce itself — not the "already exists" wording
+    // (that belongs to the existing-branch path) but a create+switch notice.
+    assert.ok(
+      /created.*switched|switched.*created/i.test(stderr) ||
+        /phase-01-setup/i.test(stderr),
+      `expected a non-silent create+switch notice on stderr; got stderr=${stderr}`
+    );
+  });
+
+  // #3207 AC5: once the first commit has switched HEAD onto the phase branch,
+  // a second phase-scoped commit must NOT emit the misleading "already exists"
+  // warning — the currentBranch === branchName guard skips the block entirely.
+  test('#3207: second phase commit does not re-warn once HEAD is on the phase branch', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'config.json'),
+      JSON.stringify({
+        commit_docs: true,
+        branching_strategy: 'phase',
+        phase_branch_template: 'gsd/phase-{phase}-{slug}',
+      })
+    );
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '01-setup'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      '# Roadmap\n\n## Phase 1: Setup\nGoal: Initial setup\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'phases', '01-setup', '01-CONTEXT.md'), '# Context\n'
+    );
+
+    const { TOOLS_PATH } = require('./helpers.cjs');
+
+    // First commit — fresh create, switches onto the phase branch.
+    const first = runNode([
+      TOOLS_PATH, 'commit', 'docs(01): first',
+      '--files', '.planning/phases/01-setup/01-CONTEXT.md',
+    ], { cwd: tmpDir });
+    throwIfFailed(first, 'gsd-tools commit (#3207 first)');
+    const branchAfterFirst = gitOrThrow(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir }).trim();
+    assert.strictEqual(branchAfterFirst, 'gsd/phase-01-setup', 'first commit must switch onto the phase branch');
+
+    // Second commit — HEAD is already on the phase branch, so the block is
+    // skipped and NO "already exists" warning should appear.
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'phases', '01-setup', '02-NOTES.md'), '# Notes\n'
+    );
+    const second = runNode([
+      TOOLS_PATH, 'commit', 'docs(01): second',
+      '--files', '.planning/phases/01-setup/02-NOTES.md',
+    ], { cwd: tmpDir });
+    throwIfFailed(second, 'gsd-tools commit (#3207 second)');
+    const secondStderr = second.stderr || '';
+    assert.ok(
+      !/already exists/i.test(secondStderr),
+      `second commit must not re-warn once on the phase branch; got stderr=${secondStderr}`
     );
   });
 });
@@ -2014,6 +2160,12 @@ describe('stats command', () => {
 
   beforeEach(() => {
     tmpDir = createTempProject();
+    // #3217 (ADR-3180 §7.6 rule 4): a free-form ROADMAP.md (no version token
+    // anywhere) is COMPLETE scope for windowing (§7.1) — without this, an
+    // absent ROADMAP.md is UNREADABLE and stats withholds `percent`/counts.
+    // Individual tests below that write their own ROADMAP.md content
+    // overwrite this baseline.
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), '# Roadmap\n');
   });
 
   afterEach(() => {
@@ -2061,6 +2213,52 @@ describe('stats command', () => {
     assert.strictEqual(stats.total_summaries, 2);
     assert.strictEqual(stats.percent, 50);
     assert.strictEqual(stats.plan_percent, 67);
+  });
+
+  // #3473 F2 (companion to #3357): determinePhaseStatus now resolves its
+  // *-VERIFICATION.md via the shared resolveVerificationFile resolver instead
+  // of a hand-rolled `.find()` over unsorted readdir() order. Before this fix,
+  // which of a canonical report and an ad-hoc `-CORRECTION-VERIFICATION.md`
+  // worksheet "won" was filesystem-dependent; the canonical report must now
+  // win deterministically regardless of directory-listing order.
+  test('#3473 F2: phase status resolves the canonical report over a -CORRECTION- worksheet, not readdir order', () => {
+    const p1 = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(p1, { recursive: true });
+    fs.writeFileSync(path.join(p1, '03-01-PLAN.md'), '# Plan');
+    fs.writeFileSync(path.join(p1, '03-01-SUMMARY.md'), '# Summary');
+    // The ad-hoc worksheet reports gaps_found; if it won the pick, the phase
+    // would read 'Executed', not 'Complete'.
+    fs.writeFileSync(path.join(p1, '03-CORRECTION-VERIFICATION.md'), '---\nstatus: gaps_found\n---\n# Correction worksheet');
+    fs.writeFileSync(path.join(p1, '03-VERIFICATION.md'), '---\nstatus: passed\n---\n# Verification');
+
+    const result = runGsdTools('stats', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const stats = JSON.parse(result.output);
+    const phase = stats.phases.find(p => p.number === '03');
+    assert.ok(phase, 'phase 03 must be present in stats output');
+    assert.strictEqual(phase.status, 'Complete', 'the canonical 03-VERIFICATION.md must win over the CORRECTION worksheet');
+  });
+
+  // #3511 BLOCKER-2 regression: a cross-phase stray VERIFICATION.md must not
+  // resolve as THIS phase's report. Phase 03's directory holds only a
+  // '04-VERIFICATION.md' (belongs to phase 04); an unscoped resolver would
+  // pick it up as phase 03's own report and read 'Complete'.
+  test('#3511: phase status is not Complete off a cross-phase stray VERIFICATION.md', () => {
+    const p1 = path.join(tmpDir, '.planning', 'phases', '03-test');
+    fs.mkdirSync(p1, { recursive: true });
+    fs.writeFileSync(path.join(p1, '03-01-PLAN.md'), '# Plan');
+    fs.writeFileSync(path.join(p1, '03-01-SUMMARY.md'), '# Summary');
+    fs.writeFileSync(path.join(p1, '04-VERIFICATION.md'), '---\nstatus: passed\n---\n# Verification');
+
+    const result = runGsdTools('stats', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const stats = JSON.parse(result.output);
+    const phase = stats.phases.find(p => p.number === '03');
+    assert.ok(phase, 'phase 03 must be present in stats output');
+    assert.notStrictEqual(phase.status, 'Complete',
+      `phase 03 must not report Complete off phase 04's report; got: ${phase.status}`);
   });
 
   test('counts requirements from REQUIREMENTS.md', () => {
@@ -2123,6 +2321,11 @@ describe('stats command', () => {
     fs.writeFileSync(path.join(p2, '15-01-SUMMARY.md'), '# Summary');
     fs.writeFileSync(path.join(p2, 'VERIFICATION.md'), '---\nstatus: passed\n---\n# Verified');
 
+    // #3217 (ADR-3180 §7.6 rule 4): no `vX.Y` token in the milestone heading
+    // — the ROADMAP has no STATE.md milestone pointer, so a real version
+    // token here would resolve to UNSCOPED (§7.1 row 4: "has versioned
+    // milestones, but no version resolved"), not the free-form COMPLETE
+    // window this test's counting assertions depend on.
     fs.writeFileSync(
       path.join(tmpDir, '.planning', 'ROADMAP.md'),
       `# Roadmap
@@ -2131,7 +2334,7 @@ describe('stats command', () => {
 - [x] **Phase 15: Proof Generation**
 - [ ] **Phase 16: Multi-Claim Verification & UX**
 
-## Milestone v1.0 Growth
+## Milestone Growth
 
 ### Phase 14: Auth Hardening
 **Goal:** Improve auth checks
@@ -2163,15 +2366,14 @@ describe('stats command', () => {
   });
 
   test('reports git commit count and first commit date from repository history', () => {
-    execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git config user.email "test@example.com"', { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git config user.name "Test User"', { cwd: tmpDir, stdio: 'pipe' });
+    gitOrThrow(['init'], { cwd: tmpDir });
+    gitOrThrow(['config', 'user.email', 'test@example.com'], { cwd: tmpDir });
+    gitOrThrow(['config', 'user.name', 'Test User'], { cwd: tmpDir });
 
     fs.writeFileSync(path.join(tmpDir, '.planning', 'PROJECT.md'), '# Project\n');
-    execSync('git add -A', { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git commit -m "initial commit"', {
+    gitOrThrow(['add', '-A'], { cwd: tmpDir });
+    gitOrThrow(['commit', '-m', 'initial commit'], {
       cwd: tmpDir,
-      stdio: 'pipe',
       env: {
         ...process.env,
         GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
@@ -2180,10 +2382,9 @@ describe('stats command', () => {
     });
 
     fs.writeFileSync(path.join(tmpDir, 'README.md'), '# Updated\n');
-    execSync('git add README.md', { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git commit -m "second commit"', {
+    gitOrThrow(['add', 'README.md'], { cwd: tmpDir });
+    gitOrThrow(['commit', '-m', 'second commit'], {
       cwd: tmpDir,
-      stdio: 'pipe',
       env: {
         ...process.env,
         GIT_AUTHOR_DATE: '2026-02-01T00:00:00Z',
@@ -2425,7 +2626,7 @@ describe('check-commit command', () => {
     );
     // Stage a non-planning file
     fs.writeFileSync(path.join(tmpDir, 'src.js'), 'console.log("hi")');
-    execSync('git add src.js', { cwd: tmpDir, stdio: 'pipe' });
+    gitOrThrow(['add', 'src.js'], { cwd: tmpDir });
 
     const result = runGsdTools('check-commit', tmpDir);
     assert.ok(result.success, `Command failed: ${result.error}`);
@@ -2439,7 +2640,7 @@ describe('check-commit command', () => {
       JSON.stringify({ commit_docs: false })
     );
     fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), '# State');
-    execSync('git add .planning/STATE.md', { cwd: tmpDir, stdio: 'pipe' });
+    gitOrThrow(['add', '.planning/STATE.md'], { cwd: tmpDir });
 
     const result = runGsdTools('check-commit', tmpDir);
     assert.ok(!result.success, 'should block commit');
@@ -2471,15 +2672,46 @@ describe('_wsParseRetryAfter (#308)', () => {
     assert.strictEqual(_wsParseRetryAfter('120000'), 60000);
   });
 
-  test('future HTTP-date → value in (0, 60000]', () => {
-    const futureDate = new Date(Date.now() + 5000).toUTCString();
-    const v = _wsParseRetryAfter(futureDate);
-    assert.ok(typeof v === 'number' && v > 0 && v <= 60000, `expected (0,60000], got ${v}`);
+  // ADR-456 §(a) reachability rule: this function is required directly
+  // (in-process), so t.mock.timers reaches it without any production change —
+  // it patches the global `Date` that `Date.now()` reads from regardless of
+  // whether the SUT goes through realClock. Fixed, second-aligned pin so the
+  // HTTP-date's whole-second precision doesn't round the expected value away.
+  const PINNED_MS = 1_700_000_000_000; // 2023-11-14T22:13:20.000Z
+
+  test('future HTTP-date 5s ahead → exactly 5000 (deterministic)', (t) => {
+    t.mock.timers.enable(['Date']);
+    t.mock.timers.setTime(PINNED_MS);
+    const futureDate = new Date(PINNED_MS + 5000).toUTCString();
+    assert.strictEqual(_wsParseRetryAfter(futureDate), 5000);
   });
 
-  test('past HTTP-date → 0', () => {
-    const pastDate = new Date(Date.now() - 5000).toUTCString();
+  test('past HTTP-date 5s behind → exactly 0 (deterministic)', (t) => {
+    t.mock.timers.enable(['Date']);
+    t.mock.timers.setTime(PINNED_MS);
+    const pastDate = new Date(PINNED_MS - 5000).toUTCString();
     assert.strictEqual(_wsParseRetryAfter(pastDate), 0);
+  });
+
+  test('boundary: HTTP-date 59s ahead → 59000, not clamped', (t) => {
+    t.mock.timers.enable(['Date']);
+    t.mock.timers.setTime(PINNED_MS);
+    const d = new Date(PINNED_MS + 59_000).toUTCString();
+    assert.strictEqual(_wsParseRetryAfter(d), 59_000);
+  });
+
+  test('boundary: HTTP-date 60s ahead → 60000, at cap exactly', (t) => {
+    t.mock.timers.enable(['Date']);
+    t.mock.timers.setTime(PINNED_MS);
+    const d = new Date(PINNED_MS + 60_000).toUTCString();
+    assert.strictEqual(_wsParseRetryAfter(d), 60_000);
+  });
+
+  test('boundary: HTTP-date 61s ahead → clamped to 60000', (t) => {
+    t.mock.timers.enable(['Date']);
+    t.mock.timers.setTime(PINNED_MS);
+    const d = new Date(PINNED_MS + 61_000).toUTCString();
+    assert.strictEqual(_wsParseRetryAfter(d), 60_000);
   });
 
   test('"garbage" → null', () => {
@@ -2650,25 +2882,23 @@ describe('pr-subrepo', () => {
 
   function initPrSubrepo(dir) {
     fs.mkdirSync(dir, { recursive: true });
-    execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
-    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir, stdio: 'pipe' });
-    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir, stdio: 'pipe' });
+    gitOrThrow(['init'], { cwd: dir });
+    gitOrThrow(['config', 'user.email', 'test@example.com'], { cwd: dir });
+    gitOrThrow(['config', 'user.name', 'Test'], { cwd: dir });
     fs.writeFileSync(path.join(dir, '.gitkeep'), '');
     fs.writeFileSync(path.join(dir, 'feature.js'), '// initial\n');
     fs.writeFileSync(path.join(dir, 'a.js'), '// initial\n');
     fs.writeFileSync(path.join(dir, 'b.js'), '// initial\n');
-    execFileSync('git', ['add', '.gitkeep', 'feature.js', 'a.js', 'b.js'], { cwd: dir, stdio: 'pipe' });
-    execFileSync('git', ['commit', '-m', 'chore: initial commit'], { cwd: dir, stdio: 'pipe' });
+    gitOrThrow(['add', '.gitkeep', 'feature.js', 'a.js', 'b.js'], { cwd: dir });
+    gitOrThrow(['commit', '-m', 'chore: initial commit'], { cwd: dir });
   }
 
   function wirePrSubrepoRemote(repoDir, bareDir) {
     fs.mkdirSync(bareDir, { recursive: true });
-    execFileSync('git', ['init', '--bare'], { cwd: bareDir, stdio: 'pipe' });
-    execFileSync('git', ['remote', 'add', 'origin', bareDir], { cwd: repoDir, stdio: 'pipe' });
-    const branch = execFileSync('git', ['branch', '--show-current'], {
-      cwd: repoDir, encoding: 'utf8',
-    }).trim();
-    execFileSync('git', ['push', 'origin', branch], { cwd: repoDir, stdio: 'pipe' });
+    gitOrThrow(['init', '--bare'], { cwd: bareDir });
+    gitOrThrow(['remote', 'add', 'origin', bareDir], { cwd: repoDir });
+    const branch = gitOrThrow(['branch', '--show-current'], { cwd: repoDir }).trim();
+    gitOrThrow(['push', 'origin', branch], { cwd: repoDir });
   }
 
   describe('regressions (#666 — cmdPrSubrepo seam)', () => {
@@ -2827,13 +3057,13 @@ describe('pr-subrepo', () => {
       // Wire a bare remote with a pre-receive hook that rejects all pushes.
       const rejectingBare = path.join(rootDir, '_rejecting-bare.git');
       fs.mkdirSync(rejectingBare, { recursive: true });
-      execFileSync('git', ['init', '--bare'], { cwd: rejectingBare, stdio: 'pipe' });
+      gitOrThrow(['init', '--bare'], { cwd: rejectingBare });
       const hookPath = path.join(rejectingBare, 'hooks', 'pre-receive');
       fs.writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
       fs.chmodSync(hookPath, 0o755);
 
       // Point origin at the rejecting bare (overwrite the working one wired in beforeEach).
-      execFileSync('git', ['remote', 'set-url', 'origin', rejectingBare], { cwd: subDir, stdio: 'pipe' });
+      gitOrThrow(['remote', 'set-url', 'origin', rejectingBare], { cwd: subDir });
 
       fs.writeFileSync(path.join(subDir, 'feature.js'), 'IMPORTANT USER WORK\n');
 
@@ -2847,21 +3077,17 @@ describe('pr-subrepo', () => {
       assert.ok(!res.success, `Expected failure on rejected push, got success: ${res.output}`);
 
       // The local branch must still exist — work must not be lost.
-      const branches = execFileSync('git', ['branch', '--list', branch], {
-        cwd: subDir, encoding: 'utf8',
-      });
+      const branches = gitOrThrow(['branch', '--list', branch], { cwd: subDir });
       assert.ok(branches.trim().length > 0, `Branch ${branch} was deleted after push failure — user work lost`);
 
       // The commit on that branch must contain the user's changes.
-      const log = execFileSync('git', ['log', branch, '--oneline', '-1'], {
-        cwd: subDir, encoding: 'utf8',
-      });
+      const log = gitOrThrow(['log', branch, '--oneline', '-1'], { cwd: subDir });
       assert.ok(log.trim().length > 0, `No commit on ${branch} — staged work was lost`);
     });
 
     test('pr-subrepo porcelain: staged rename — both old and new paths in result.files', () => {
       // git mv produces "R  old -> new" in porcelain v1; both paths must be staged.
-      execFileSync('git', ['mv', 'feature.js', 'renamed-feature.js'], { cwd: subDir, stdio: 'pipe' });
+      gitOrThrow(['mv', 'feature.js', 'renamed-feature.js'], { cwd: subDir });
 
       const res = runGsdTools(
         ['query', 'pr-subrepo', 'fix(backend): rename',
@@ -2877,8 +3103,8 @@ describe('pr-subrepo', () => {
     test('pr-subrepo porcelain: non-ASCII filename (core.quotePath=false)', () => {
       // Without -c core.quotePath=false, "café.js" is C-escaped → slice(2) parse breaks.
       fs.writeFileSync(path.join(subDir, 'café.js'), '// initial\n');
-      execFileSync('git', ['add', 'café.js'], { cwd: subDir, stdio: 'pipe' });
-      execFileSync('git', ['commit', '-m', 'chore: add café.js'], { cwd: subDir, stdio: 'pipe' });
+      gitOrThrow(['add', 'café.js'], { cwd: subDir });
+      gitOrThrow(['commit', '-m', 'chore: add café.js'], { cwd: subDir });
       fs.writeFileSync(path.join(subDir, 'café.js'), 'updated\n');
 
       const res = runGsdTools(
@@ -2986,12 +3212,12 @@ describe('pr-subrepo', () => {
       // making the assertions vacuous. A tracked modification ensures that WITHOUT the
       // guard the repo WOULD be reported dirty, so the test genuinely fails-first.
       const initDirtyRepo = (dir, file) => {
-        execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
-        execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir, stdio: 'pipe' });
-        execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir, stdio: 'pipe' });
+        gitOrThrow(['init'], { cwd: dir });
+        gitOrThrow(['config', 'user.email', 'test@example.com'], { cwd: dir });
+        gitOrThrow(['config', 'user.name', 'Test'], { cwd: dir });
         fs.writeFileSync(path.join(dir, file), 'committed\n');
-        execFileSync('git', ['add', file], { cwd: dir, stdio: 'pipe' });
-        execFileSync('git', ['-c', 'commit.gpgsign=false', 'commit', '-m', 'init'], { cwd: dir, stdio: 'pipe' });
+        gitOrThrow(['add', file], { cwd: dir });
+        gitOrThrow(['-c', 'commit.gpgsign=false', 'commit', '-m', 'init'], { cwd: dir });
         fs.writeFileSync(path.join(dir, file), 'modified\n');
       };
 
@@ -3020,7 +3246,8 @@ describe('pr-subrepo', () => {
       const subReposJson = JSON.stringify(entries);
 
       try {
-        execFileSync('node', ['-e', script, subReposJson, scanRoot, dirtyFile], { stdio: 'pipe' });
+        const scanResult = runNode(['-e', script, subReposJson, scanRoot, dirtyFile]);
+        throwIfFailed(scanResult, 'node -e <dirty-scan script from pr-branch.md>');
         const dirty = fs.existsSync(dirtyFile) ? fs.readFileSync(dirtyFile, 'utf-8') : '';
         const lines = dirty.split('\n').filter(Boolean);
         assert.ok(
@@ -3453,18 +3680,23 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawnSync } = require('node:child_process');
-
 const { cleanup } = require('./helpers.cjs');
+const { runNode } = require('./helpers/process-seam.cjs');
+const { toLegacyResult } = require('./helpers/git-fixture.cjs');
 
 const GSD_TOOLS = path.resolve(__dirname, '../gsd-core/bin/gsd-tools.cjs');
 
+// This is a DISTINCT, independently-scoped `runCli` — not the file's other
+// local helper of a similar shape (`runGsdTools` above, folded from
+// feat-3251, which already carries its own `timeout: 30000`). This one
+// returns the legacy `{status, stdout, stderr}` shape its callers below read
+// directly (never a throw contract), so it is bounded via `runNode` +
+// `toLegacyResult` rather than `gitOrThrow`/`throwIfFailed`.
 function runCli(args, env = {}) {
-  const result = spawnSync(process.execPath, [GSD_TOOLS, ...args], {
-    encoding: 'utf8',
+  const result = runNode([GSD_TOOLS, ...args], {
     env: { ...process.env, GSD_TEST_MODE: '1', ...env },
   });
-  return result;
+  return toLegacyResult(result);
 }
 
 function makeTmpDir(prefix) {
@@ -3514,6 +3746,88 @@ description: Executes GSD phase plans
 ---
 Body of the agent.
 `;
+
+describe('#3533 effort sync: inherit means the key must not exist', () => {
+  test('10d: sync does not re-add a hand-stripped key when inherit is configured', () => {
+    const tmpDir = makeTmpDir('effort-sync-inherit-absent-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    fs.writeFileSync(path.join(agentsDir, 'gsd-executor.md'), AGENT_WITHOUT_EFFORT);
+    // Tier standard -> inherit.
+    writePlanningConfig(tmpDir, { routing_tier_defaults: { light: 'high', standard: 'inherit', heavy: 'xhigh' } });
+
+    const { cmdEffortSync } = require('../gsd-core/bin/lib/commands.cjs');
+    const result = captureOutput(() =>
+      cmdEffortSync(tmpDir, false, { dryRun: false, configDir: tmpDir, runtime: 'claude' })
+    );
+
+    assert.equal(result.synced, 0, `absent key + inherit is IN SYNC, not drift: ${JSON.stringify(result.changes)}`);
+    assert.equal(result.changes.length, 0, 'no change may be reported for an absent key under inherit');
+    const after = fs.readFileSync(path.join(agentsDir, 'gsd-executor.md'), 'utf8');
+    assert.ok(!/^effort:/m.test(after), 'the effort: key must NOT be re-added');
+
+    cleanup(tmpDir);
+  });
+
+  test('10d: sync strips the key when inherit is configured and a value is present', () => {
+    const tmpDir = makeTmpDir('effort-sync-inherit-strip-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    // Fixture carries its own name so the survivor assertion below is
+    // satisfiable (AGENT_WITH_EFFORT names gsd-planner — wrong file).
+    fs.writeFileSync(path.join(agentsDir, 'gsd-executor.md'), AGENT_WITH_EFFORT.replace('name: gsd-planner', 'name: gsd-executor'));
+    // #3531+#3533 combined: pin every TIER to inherit — a bare effort.default
+    // no longer reaches a tiered agent now that the config block merges over
+    // the built-in tier ladder (the manifest standard tier would answer 'high').
+    writePlanningConfig(tmpDir, { routing_tier_defaults: { light: 'inherit', standard: 'inherit', heavy: 'inherit' } });
+
+    const { cmdEffortSync } = require('../gsd-core/bin/lib/commands.cjs');
+    const result = captureOutput(() =>
+      cmdEffortSync(tmpDir, false, { dryRun: false, configDir: tmpDir, runtime: 'claude' })
+    );
+
+    assert.equal(result.synced, 1);
+    assert.equal(result.changes[0].agent, 'gsd-executor');
+    assert.equal(result.changes[0].from, 'medium');
+    assert.equal(result.changes[0].to, null, 'to: null is the typed IR for omission');
+    const after = fs.readFileSync(path.join(agentsDir, 'gsd-executor.md'), 'utf8');
+    assert.ok(!/^effort:/m.test(after), 'the effort: line must be stripped');
+    assert.ok(after.includes('name: gsd-executor'), 'every other frontmatter line survives');
+    assert.ok(after.includes('Body of the agent.'), 'the body survives');
+
+    cleanup(tmpDir);
+  });
+
+  test('10d: strip preserves CRLF files and leaves comments and sibling keys intact', () => {
+    const tmpDir = makeTmpDir('effort-sync-inherit-crlf-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const crlfAgent = [
+      '---',
+      'name: gsd-executor',
+      '# a hand comment that must survive',
+      'effort: high',
+      'description: Executes GSD phase plans',
+      '---',
+      'Body.',
+      '',
+    ].join('\r\n');
+    const agentPath = path.join(agentsDir, 'gsd-executor.md');
+    fs.writeFileSync(agentPath, crlfAgent);
+    writePlanningConfig(tmpDir, { agent_overrides: { 'gsd-executor': 'inherit' } });
+
+    const { cmdEffortSync } = require('../gsd-core/bin/lib/commands.cjs');
+    const result = captureOutput(() =>
+      cmdEffortSync(tmpDir, false, { dryRun: false, configDir: tmpDir, runtime: 'claude' })
+    );
+
+    assert.equal(result.synced, 1, `expected one strip: ${JSON.stringify(result.changes)}`);
+    const after = fs.readFileSync(agentPath, 'utf8');
+    assert.ok(!/^effort:/m.test(after), 'effort line gone');
+    assert.ok(after.includes('\r\n'), 'CRLF endings preserved');
+    assert.ok(after.includes('# a hand comment that must survive'), 'comment preserved');
+    assert.ok(/^description: Executes GSD phase plans\r?$/m.test(after), 'sibling key preserved');
+
+    cleanup(tmpDir);
+  });
+});
 
 describe('feat-488: effort sync command', () => {
   test('dry-run mode reports pending changes without writing files', () => {
@@ -3586,7 +3900,10 @@ describe('feat-488: effort sync command', () => {
     const agentsDir = makeAgentsDir(tmpDir);
     const agentPath = path.join(agentsDir, 'gsd-executor.md');
     fs.writeFileSync(agentPath, AGENT_WITHOUT_EFFORT);
-    writePlanningConfig(tmpDir, { default: 'max' });
+    // #3531: pin every tier so the injected value is tier-independent — an
+    // effort.default alone no longer answers for a tiered agent now that the
+    // config block merges over the built-in tier ladder.
+    writePlanningConfig(tmpDir, { routing_tier_defaults: { light: 'max', standard: 'max', heavy: 'max' }, default: 'max' });
 
     const { cmdEffortSync } = require('../gsd-core/bin/lib/commands.cjs');
     const result = captureOutput(() =>
@@ -3635,10 +3952,14 @@ describe('feat-488: effort sync command', () => {
     fs.mkdirSync(planningDir, { recursive: true });
     fs.writeFileSync(path.join(planningDir, 'config.json'), JSON.stringify({ model_profile: 'balanced' }));
 
-    // Home defaults set effort.default = low
+    // Home defaults set the heavy tier effort to low. (#3531: a bare home
+    // effort.default would no longer reach gsd-planner — the merged tier
+    // ladder answers for tiered agents — so the home fixture pins the tier,
+    // which is what this test's claim actually exercises: home-level effort
+    // applies when the project config has no effort section.)
     const gsdDir = path.join(tmpHome, '.gsd');
     fs.mkdirSync(gsdDir, { recursive: true });
-    fs.writeFileSync(path.join(gsdDir, 'defaults.json'), JSON.stringify({ effort: { default: 'low' } }));
+    fs.writeFileSync(path.join(gsdDir, 'defaults.json'), JSON.stringify({ effort: { routing_tier_defaults: { heavy: 'low' } } }));
 
     // Isolate HOME (and USERPROFILE for Windows parity) so
     // readGsdEffectiveEffortConfig reads our fixture, not the
@@ -3667,7 +3988,7 @@ describe('feat-488: effort sync command', () => {
       }
     }
 
-    // With home effort.default = 'low' and the agent currently at 'medium',
+    // With home heavy-tier effort 'low' and the agent currently at 'medium',
     // cmdEffortSync must sync exactly 1 agent and set it to 'low'.
     assert.equal(result.synced, 1, 'should sync 1 agent whose effort differs from home default');
     assert.equal(result.changes[0].agent, 'gsd-planner');
@@ -3710,6 +4031,459 @@ describe('feat-488: effort sync command', () => {
     assert.ok(
       fs.readFileSync(agentPath, 'utf8').includes('effort: xhigh'),
       'CLI --apply must write the updated effort value'
+    );
+
+    cleanup(tmpDir);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// #3243 (ADR-2313 D7) — the Codex `.toml` branch of `cmdEffortSync`.
+// Spec: .gsd/phase/feat-3243-codex-toml-sync/{40-design,50-test-matrix}.md
+// Row numbers below (# B<N>) map 1:1 to 50-test-matrix.md's "B — the sync"
+// table. B1/B2 (the claude/opencode rows) are the EXISTING tests directly
+// above this block ('feat-488: effort sync command' + the non-claude-runtime
+// test) and are asserted UNCHANGED — this describe adds only new coverage.
+//
+// Every `.toml` fixture below is hand-authored against the real
+// `generateCodexAgentToml` shape (CONTRIBUTING's fixture-provenance rule,
+// #2371), not produced by calling that writer.
+// ────────────────────────────────────────────────────────────────────────
+describe('#3243 (ADR-2313 D7): Codex .toml effort sync', () => {
+  const { PARSE_REASON } = require('../gsd-core/bin/lib/codex-agent-toml.cjs');
+  const FIXTURES_DIR = path.join(__dirname, 'fixtures', 'adversarial', 'toml');
+
+  function writeCodexAgentToml(agentsDir, agentName, content) {
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, `${agentName}.toml`), content);
+  }
+
+  function syncCodex(tmpDir, dryRun) {
+    const { cmdEffortSync } = require('../gsd-core/bin/lib/commands.cjs');
+    return captureOutput(() =>
+      cmdEffortSync(tmpDir, false, { dryRun, configDir: tmpDir, runtime: 'codex' })
+    );
+  }
+
+  test('B3: model = "sonnet" — the model line stripped; one structured change', () => {
+    const tmpDir = makeTmpDir('codex-sync-b3-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    writeCodexAgentToml(
+      agentsDir,
+      'gsd-planner',
+      'name = "gsd-planner"\nmodel = "sonnet"\ndeveloper_instructions = \'\'\'\nPlan.\n\'\'\'\n',
+    );
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1);
+    assert.equal(result.skipped, 0);
+    assert.equal(result.changes.length, 1);
+    assert.equal(result.changes[0].agent, 'gsd-planner');
+    assert.equal(result.changes[0].field, 'model');
+    assert.equal(result.changes[0].from, 'sonnet');
+    assert.equal(result.changes[0].to, null);
+    const updated = fs.readFileSync(path.join(agentsDir, 'gsd-planner.toml'), 'utf8');
+    assert.ok(!updated.includes('model = "sonnet"'), 'the stale model line must be gone');
+    assert.ok(updated.includes('name = "gsd-planner"'), 'other lines must survive');
+
+    cleanup(tmpDir);
+  });
+
+  test('B4 (negative proof): model = "gpt-5.6-sol" (legal pin) — untouched, reported skipped not synced', () => {
+    const tmpDir = makeTmpDir('codex-sync-b4-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const content = 'name = "gsd-gpt-agent"\nmodel = "gpt-5.6-sol"\ndeveloper_instructions = \'\'\'\nWork.\n\'\'\'\n';
+    writeCodexAgentToml(agentsDir, 'gsd-gpt-agent', content);
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 0, 'a legal pin must never be reported synced');
+    assert.equal(result.skipped, 1);
+    assert.equal(result.changes.length, 0);
+    assert.equal(fs.readFileSync(path.join(agentsDir, 'gsd-gpt-agent.toml'), 'utf8'), content);
+
+    cleanup(tmpDir);
+  });
+
+  test('B5 (negative proof): legal pin plus its coupled effort — both untouched', () => {
+    const tmpDir = makeTmpDir('codex-sync-b5-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const content = 'name = "gsd-pinned-agent"\nmodel = "gpt-5-codex"\nmodel_reasoning_effort = "high"\n' +
+      "developer_instructions = '''\nWork.\n'''\n";
+    writeCodexAgentToml(agentsDir, 'gsd-pinned-agent', content);
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 0);
+    assert.equal(result.skipped, 1);
+    assert.equal(fs.readFileSync(path.join(agentsDir, 'gsd-pinned-agent.toml'), 'utf8'), content);
+
+    cleanup(tmpDir);
+  });
+
+  test('B6: orphaned model_reasoning_effort, no model — the effort stripped', () => {
+    const tmpDir = makeTmpDir('codex-sync-b6-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    writeCodexAgentToml(
+      agentsDir,
+      'gsd-orphan-agent',
+      'name = "gsd-orphan-agent"\nmodel_reasoning_effort = "high"\ndeveloper_instructions = \'\'\'\nWork.\n\'\'\'\n',
+    );
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1);
+    assert.equal(result.changes.length, 1);
+    assert.equal(result.changes[0].field, 'model_reasoning_effort');
+    assert.equal(result.changes[0].from, 'high');
+    const updated = fs.readFileSync(path.join(agentsDir, 'gsd-orphan-agent.toml'), 'utf8');
+    assert.ok(!updated.includes('model_reasoning_effort'), 'the orphaned effort must be gone');
+
+    cleanup(tmpDir);
+  });
+
+  test('B7: stale model plus its effort — both stripped', () => {
+    const tmpDir = makeTmpDir('codex-sync-b7-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    writeCodexAgentToml(
+      agentsDir,
+      'gsd-stale-agent',
+      'name = "gsd-stale-agent"\nmodel = "opus"\nmodel_reasoning_effort = "medium"\n' +
+        "developer_instructions = '''\nWork.\n'''\n",
+    );
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1);
+    assert.equal(result.changes.length, 2, 'both the model and the coupled effort must be reported');
+    const fields = result.changes.map(c => c.field).sort();
+    assert.deepEqual(fields, ['model', 'model_reasoning_effort']);
+    const updated = fs.readFileSync(path.join(agentsDir, 'gsd-stale-agent.toml'), 'utf8');
+    assert.ok(!updated.includes('model = "opus"'));
+    assert.ok(!updated.includes('model_reasoning_effort'));
+
+    cleanup(tmpDir);
+  });
+
+  test('B8: posture-clean .toml — synced:0, no write (mtime unchanged)', () => {
+    const tmpDir = makeTmpDir('codex-sync-b8-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    writeCodexAgentToml(
+      agentsDir,
+      'gsd-clean',
+      'name = "gsd-clean"\ndeveloper_instructions = \'\'\'\nWork.\n\'\'\'\n',
+    );
+    const filePath = path.join(agentsDir, 'gsd-clean.toml');
+    const mtimeBefore = fs.statSync(filePath).mtimeMs;
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 0);
+    assert.equal(fs.statSync(filePath).mtimeMs, mtimeBefore, 'a posture-clean file must never be written');
+
+    cleanup(tmpDir);
+  });
+
+  test('B9 (boundary): dry-run is the default — changes reported, file byte-identical after', () => {
+    const tmpDir = makeTmpDir('codex-sync-b9-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const content = 'name = "gsd-planner"\nmodel = "sonnet"\ndeveloper_instructions = \'\'\'\nPlan.\n\'\'\'\n';
+    writeCodexAgentToml(agentsDir, 'gsd-planner', content);
+
+    const { cmdEffortSync } = require('../gsd-core/bin/lib/commands.cjs');
+    const result = captureOutput(() =>
+      cmdEffortSync(tmpDir, false, { configDir: tmpDir, runtime: 'codex' }) // no dryRun key — must default true
+    );
+
+    assert.equal(result.dry_run, true);
+    assert.equal(result.synced, 1, 'the pending strip must still be reported');
+    assert.equal(fs.readFileSync(path.join(agentsDir, 'gsd-planner.toml'), 'utf8'), content, 'dry-run must not write');
+
+    cleanup(tmpDir);
+  });
+
+  test('B10: --no-dry-run writes; reports identically to the dry run', () => {
+    const content = 'name = "gsd-planner"\nmodel = "sonnet"\ndeveloper_instructions = \'\'\'\nPlan.\n\'\'\'\n';
+
+    const dryTmpDir = makeTmpDir('codex-sync-b10-dry-');
+    writeCodexAgentToml(makeAgentsDir(dryTmpDir), 'gsd-planner', content);
+    const dryResult = syncCodex(dryTmpDir, true);
+
+    const applyTmpDir = makeTmpDir('codex-sync-b10-apply-');
+    const applyAgentsDir = makeAgentsDir(applyTmpDir);
+    writeCodexAgentToml(applyAgentsDir, 'gsd-planner', content);
+    const applyResult = syncCodex(applyTmpDir, false);
+
+    assert.equal(dryResult.synced, applyResult.synced);
+    assert.deepEqual(dryResult.changes, applyResult.changes, 'the report must match the dry run exactly');
+    assert.equal(dryResult.dry_run, true);
+    assert.equal(applyResult.dry_run, false);
+    assert.ok(!fs.readFileSync(path.join(applyAgentsDir, 'gsd-planner.toml'), 'utf8').includes('model = "sonnet"'));
+
+    cleanup(dryTmpDir);
+    cleanup(applyTmpDir);
+  });
+
+  test('B11 (negative proof): unterminated block — skipped and reported, file byte-identical after', () => {
+    const tmpDir = makeTmpDir('codex-sync-b11-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const content = 'name = "gsd-broken"\nmodel = "sonnet"\ndeveloper_instructions = \'\'\'\nThis block never closes.\n';
+    writeCodexAgentToml(agentsDir, 'gsd-broken', content);
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 0, 'an unparseable document must never be synced');
+    assert.equal(result.skipped, 1);
+    assert.equal(result.refused.length, 1);
+    assert.equal(result.refused[0].agent, 'gsd-broken');
+    assert.equal(result.refused[0].reason, PARSE_REASON.UNTERMINATED_BLOCK);
+    assert.equal(
+      fs.readFileSync(path.join(agentsDir, 'gsd-broken.toml'), 'utf8'),
+      content,
+      'a refused file must never be partially rewritten',
+    );
+
+    cleanup(tmpDir);
+  });
+
+  test('B12 (negative proof): symlinked .toml — skipped, target byte-identical after', (t) => {
+    const tmpDir = makeTmpDir('codex-sync-b12-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const targetPath = path.join(tmpDir, 'outside-target.toml');
+    const targetContent = 'model = "sonnet"\n';
+    fs.writeFileSync(targetPath, targetContent);
+    const symlinkPath = path.join(agentsDir, 'gsd-linked.toml');
+    try {
+      fs.symlinkSync(targetPath, symlinkPath, 'file');
+    } catch (error) {
+      if (error && ['EPERM', 'EACCES', 'ENOTSUP'].includes(error.code)) {
+        t.skip('symlink creation is not available on this platform');
+        cleanup(tmpDir);
+        return;
+      }
+      throw error;
+    }
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 0);
+    assert.ok(
+      !result.changes.some(c => c.agent === 'gsd-linked'),
+      'a symlinked agent must never be reported as synced',
+    );
+    assert.equal(fs.readFileSync(targetPath, 'utf8'), targetContent, 'the symlink target must never be written through');
+
+    cleanup(tmpDir);
+  });
+
+  test('B13: agents dir absent — reports not-found, as the claude path does', () => {
+    const tmpDir = makeTmpDir('codex-sync-b13-');
+    // agentsDir intentionally not created
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 0);
+    assert.equal(result.reason, 'agents directory not found');
+
+    cleanup(tmpDir);
+  });
+
+  test('B14 (hostile, headline data-loss case): model = inside developer_instructions — file byte-identical after a non-dry-run sync', () => {
+    const tmpDir = makeTmpDir('codex-sync-b14-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const fixtureContent = fs.readFileSync(path.join(FIXTURES_DIR, 'model-in-developer-instructions.toml'), 'utf8');
+    writeCodexAgentToml(agentsDir, 'gsd-planner', fixtureContent);
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 0, 'the prose model= inside the block must never be treated as a pin');
+    assert.equal(
+      fs.readFileSync(path.join(agentsDir, 'gsd-planner.toml'), 'utf8'),
+      fixtureContent,
+      'the agent prompt must survive a non-dry-run sync untouched',
+    );
+
+    cleanup(tmpDir);
+  });
+
+  test('B15 (cross-platform): CRLF file, stale pin — pin stripped, remaining line endings still CRLF', () => {
+    const tmpDir = makeTmpDir('codex-sync-b15-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const lfContent = 'name = "gsd-scribe"\nmodel = "sonnet"\ndeveloper_instructions = \'\'\'\nWrite a changelog entry.\n\'\'\'\n';
+    const crlfContent = lfContent.replace(/\n/g, '\r\n');
+    writeCodexAgentToml(agentsDir, 'gsd-scribe', crlfContent);
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1);
+    const updated = fs.readFileSync(path.join(agentsDir, 'gsd-scribe.toml'), 'utf8');
+    assert.ok(!updated.includes('model = "sonnet"'));
+    assert.equal(
+      updated,
+      'name = "gsd-scribe"\r\ndeveloper_instructions = \'\'\'\r\nWrite a changelog entry.\r\n\'\'\'\r\n',
+      'every remaining line ending must still be CRLF',
+    );
+
+    cleanup(tmpDir);
+  });
+
+  test('B16 (cross-platform): BOM file, stale pin — pin stripped, BOM preserved', () => {
+    const tmpDir = makeTmpDir('codex-sync-b16-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const content = String.fromCharCode(0xfeff) +
+      'name = "gsd-archivist"\nmodel = "sonnet"\ndeveloper_instructions = \'\'\'\nArchive.\n\'\'\'\n';
+    writeCodexAgentToml(agentsDir, 'gsd-archivist', content);
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1);
+    const updatedRaw = fs.readFileSync(path.join(agentsDir, 'gsd-archivist.toml'));
+    assert.equal(updatedRaw[0], 0xef, 'BOM byte 1 (EF) must survive');
+    assert.equal(updatedRaw[1], 0xbb, 'BOM byte 2 (BB) must survive');
+    assert.equal(updatedRaw[2], 0xbf, 'BOM byte 3 (BF) must survive');
+    assert.ok(!updatedRaw.toString('utf8').includes('model = "sonnet"'));
+
+    cleanup(tmpDir);
+  });
+
+  test('B17 (boundary): file with no trailing newline — preserved', () => {
+    const tmpDir = makeTmpDir('codex-sync-b17-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const content = 'name = "gsd-bare"\nmodel = "sonnet"'; // deliberately no trailing \n
+    writeCodexAgentToml(agentsDir, 'gsd-bare', content);
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1);
+    const updated = fs.readFileSync(path.join(agentsDir, 'gsd-bare.toml'), 'utf8');
+    assert.equal(updated, 'name = "gsd-bare"', 'the file must still have no trailing newline');
+
+    cleanup(tmpDir);
+  });
+
+  test('B18 (negative proof): hand-added approval_policy survives a strip of the stale pin untouched', () => {
+    const tmpDir = makeTmpDir('codex-sync-b18-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    writeCodexAgentToml(
+      agentsDir,
+      'gsd-custom-agent',
+      'name = "gsd-custom-agent"\nmodel = "sonnet"\napproval_policy = "on-request"\n' +
+        "developer_instructions = '''\nFollow policy.\n'''\n",
+    );
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1);
+    const updated = fs.readFileSync(path.join(agentsDir, 'gsd-custom-agent.toml'), 'utf8');
+    assert.ok(updated.includes('approval_policy = "on-request"'), 'the hand-added key must survive verbatim');
+    assert.ok(!updated.includes('model = "sonnet"'));
+
+    cleanup(tmpDir);
+  });
+
+  test('B19 (negative proof): interleaved comments preserved verbatim', () => {
+    const tmpDir = makeTmpDir('codex-sync-b19-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    writeCodexAgentToml(
+      agentsDir,
+      'gsd-commented',
+      '# top comment\nname = "gsd-commented"\n# a note about the model below\nmodel = "sonnet"\n# trailing comment\n' +
+        "developer_instructions = '''\nWork.\n'''\n",
+    );
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1);
+    const updated = fs.readFileSync(path.join(agentsDir, 'gsd-commented.toml'), 'utf8');
+    assert.ok(updated.includes('# top comment'));
+    assert.ok(updated.includes('# a note about the model below'));
+    assert.ok(updated.includes('# trailing comment'));
+    assert.ok(!updated.includes('model = "sonnet"'));
+
+    cleanup(tmpDir);
+  });
+
+  test('B20 (filesystem failure, atomic-write proof): a mid-write failure is reported; the remaining agents still get processed; the target is left byte-identical, never partially rewritten', (t) => {
+    const tmpDir = makeTmpDir('codex-sync-b20-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    const alphaOriginal = 'name = "gsd-alpha"\nmodel = "sonnet"\ndeveloper_instructions = \'\'\'\nWork.\n\'\'\'\n';
+    writeCodexAgentToml(agentsDir, 'gsd-alpha', alphaOriginal);
+    writeCodexAgentToml(agentsDir, 'gsd-bravo', 'name = "gsd-bravo"\nmodel = "opus"\ndeveloper_instructions = \'\'\'\nWork.\n\'\'\'\n');
+    const failingPath = path.join(agentsDir, 'gsd-alpha.toml');
+
+    // Unlike the old version of this test — which mocked fs.writeFileSync to
+    // throw BEFORE any bytes ever reached disk, proving nothing about a
+    // mid-write failure — this injects the failure at the point a NON-ATOMIC
+    // implementation (`fs.writeFileSync(filePath, ...)` straight into the
+    // target, in place) would already have truncated the real file: 'w'-mode
+    // open+truncate happens before any content is written, so a crash between
+    // open and completion leaves a partial file. The mock actually performs a
+    // REAL (truncated) write to whatever path it's called with — including a
+    // hypothetical direct write to `failingPath` itself — before throwing, so
+    // an in-place implementation's target would end up holding these 4 bytes,
+    // not the original content. An atomic tmp+rename implementation instead
+    // sends this call to a SIBLING tmp path (never `failingPath` itself), so
+    // `failingPath` is never opened for write in the first place and survives
+    // untouched.
+    const realWriteFileSync = fs.writeFileSync;
+    t.mock.method(fs, 'writeFileSync', (target, data, ...args) => {
+      if (typeof target === 'string' && target.startsWith(failingPath)) {
+        realWriteFileSync.call(fs, target, String(data).slice(0, 4));
+        throw Object.assign(new Error('injected ENOSPC (mid-write)'), { code: 'ENOSPC' });
+      }
+      return realWriteFileSync.call(fs, target, data, ...args);
+    });
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 1, 'only the non-failing agent must be reported synced');
+    assert.equal(result.write_failures.length, 1);
+    assert.equal(result.write_failures[0].agent, 'gsd-alpha');
+    assert.ok(
+      !result.changes.some(c => c.agent === 'gsd-alpha'),
+      'a failed write must never be reported as a completed change',
+    );
+    assert.ok(
+      fs.readFileSync(path.join(agentsDir, 'gsd-bravo.toml'), 'utf8').indexOf('model = "opus"') === -1,
+      'the sibling agent must still be synced despite the other write failing',
+    );
+    // The load-bearing assertion (ADR-2313 "never partially rewritten"): the
+    // target must be BYTE-IDENTICAL to its pre-sync content, not merely
+    // "contains model = sonnet somewhere" — a truncated-to-4-bytes file would
+    // pass a substring check but fail this equality. Against the pre-fix
+    // in-place `fs.writeFileSync(filePath, renderCodexAgentToml(doc))`, this
+    // assertion FAILS: that call's target IS `failingPath`, so the mock's
+    // real truncated write lands directly on the file, leaving it as the
+    // 4-byte slice `'name'` instead of `alphaOriginal`.
+    assert.equal(
+      fs.readFileSync(failingPath, 'utf8'),
+      alphaOriginal,
+      'a mid-write failure must leave the original file byte-identical, never partially rewritten',
+    );
+    // The atomic write path cleans up its sibling tmp file on failure — no
+    // stray `.tmp.<pid>` left behind in the agents directory.
+    const leftovers = fs.readdirSync(agentsDir).filter(f => f !== 'gsd-alpha.toml' && f !== 'gsd-bravo.toml');
+    assert.deepEqual(leftovers, [], 'a failed write must not leave a stray tmp file behind');
+
+    cleanup(tmpDir);
+  });
+
+  test('B21 (independence): several agents, mixed states — per-agent results, deterministic order', () => {
+    const tmpDir = makeTmpDir('codex-sync-b21-');
+    const agentsDir = makeAgentsDir(tmpDir);
+    writeCodexAgentToml(agentsDir, 'gsd-alpha', 'name = "gsd-alpha"\ndeveloper_instructions = \'\'\'\nClean.\n\'\'\'\n');
+    writeCodexAgentToml(agentsDir, 'gsd-bravo', 'name = "gsd-bravo"\nmodel = "opus"\ndeveloper_instructions = \'\'\'\nWork.\n\'\'\'\n');
+    writeCodexAgentToml(agentsDir, 'gsd-charlie', 'name = "gsd-charlie"\nmodel_reasoning_effort = "medium"\ndeveloper_instructions = \'\'\'\nWork.\n\'\'\'\n');
+
+    const result = syncCodex(tmpDir, false);
+
+    assert.equal(result.synced, 2, 'gsd-bravo and gsd-charlie must both sync; gsd-alpha is clean');
+    assert.equal(result.skipped, 1);
+    assert.deepEqual(
+      result.changes.map(c => c.agent),
+      ['gsd-bravo', 'gsd-charlie'],
+      'agents must be processed in deterministic (sorted) order',
     );
 
     cleanup(tmpDir);
@@ -3767,6 +4541,7 @@ describe('#2279: map-codebase date stamp instructions overwrite existing dates',
     const content = fs.readFileSync(
       path.join(REPO_ROOT, 'gsd-core', 'workflows', 'map-codebase.md'), 'utf-8'
     );
+    // eslint-disable-next-line local/no-unbounded-quantifier -- parses maintainer-authored workflow markdown, bounded prose, not adversarial input
     const stampLines = content.match(/Set all date stamps[^\r\n]*/g) || [];
     assert.ok(stampLines.length >= 4,
       `must have ≥4 "Set all date stamps" instructions (4 spawn prompts + 1 sequential); got ${stampLines.length}`);

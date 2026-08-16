@@ -18,6 +18,22 @@ import {
 } from './installer-migration-authoring.cjs';
 import { platformWriteSync, retryRenameSync, posixNormalize } from './shell-command-projection.cjs';
 import { realClock, type Clock } from './clock.cjs';
+import { isInstallScopeId, type InstallScope } from './install-scope.cjs';
+// #2874 (ADR-58 cleanup phase): this file is the ~1200-line migration
+// plan/apply/rollback/lock/journal engine — almost none of it is on the
+// installRuntimeArtifacts call tree. Only `readInstallManifest` and
+// `classifyArtifact` are reached (via install-engine.cts's
+// _migrateLegacyOpencodeCommandDir and retired-artifact-cleanup.cts's
+// pruneRetiredRuntimeArtifacts), so only those two entry points — plus their
+// shared `readJsonIfPresent` helper and `classifyArtifact`'s `sha256File`
+// hashing helper — are routed through the injectable seam. Everything else
+// in this file (locking, journal, apply/rollback, migration discovery)
+// keeps using real `fs` directly: it is not reachable from
+// installRuntimeArtifacts, so routing it would grow this seam past what
+// AC2 actually requires. See install-fs-adapter.cts's module doc.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import installFsAdapter = require('./install-fs-adapter.cjs');
+const { installFs } = installFsAdapter;
 
 const MANIFEST_NAME = 'gsd-file-manifest.json';
 const INSTALL_STATE_NAME = 'gsd-install-state.json';
@@ -26,18 +42,31 @@ const DEFAULT_MIGRATIONS_DIR = path.join(__dirname, 'installer-migrations');
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const STRICT_JSON = Symbol('strict-json');
 
+// #2874: routed through installFs()'s openSync/readSync/closeSync trio
+// instead of importing `node:fs` directly, so classifyArtifact — reachable
+// from installRuntimeArtifacts — can be exercised against an injected
+// adapter. This function was briefly converted to a single
+// `installFs().readFileSync` call (buffering the whole file); that broke
+// tests/installer-migrations.test.cjs's "classifies large files without
+// loading the whole file through readFileSync", which monkeypatches real
+// fs.readFileSync to throw for the file under test and asserts hashing still
+// succeeds — an explicit, pre-existing contract that large files must be
+// streamed, not buffered. Restored to the original raw-fd streaming shape,
+// now going through the adapter instead of `node:fs` directly. This is the
+// ONLY call site of sha256File in this file (confirmed by inspection) — no
+// other caller is affected.
 function sha256File(filePath: string): string {
   const hash = crypto.createHash('sha256');
   const buffer = Buffer.allocUnsafe(1024 * 1024);
-  const fd = fs.openSync(filePath, 'r');
+  const fd = installFs().openSync(filePath, 'r');
   try {
     while (true) {
-      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      const bytesRead = installFs().readSync(fd, buffer, 0, buffer.length, null);
       if (bytesRead === 0) break;
       hash.update(buffer.subarray(0, bytesRead));
     }
   } finally {
-    fs.closeSync(fd);
+    installFs().closeSync(fd);
   }
   return hash.digest('hex');
 }
@@ -147,10 +176,14 @@ function copyPreservingSymlink(srcPath: string, destPath: string): void {
   fs.copyFileSync(srcPath, destPath);
 }
 
+// Shared by readInstallManifest (on the installRuntimeArtifacts call tree —
+// routed) and readInstallState/readJson (not on that call tree — the
+// ambient default resolves to real fs for those, unchanged). Routing once
+// here is safe for all three callers.
 function readJsonIfPresent(filePath: string, fallback: unknown): unknown {
-  if (!fs.existsSync(filePath)) return fallback;
+  if (!installFs().existsSync(filePath)) return fallback;
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return JSON.parse(installFs().readFileSync(filePath, 'utf8'));
   } catch (error) {
     if (fallback === STRICT_JSON) {
       throw new Error(`invalid installer migration state JSON: ${filePath}: ${(error as Error).message}`);
@@ -164,19 +197,115 @@ interface InstallManifest {
   timestamp: string | null;
   mode: string | null;
   files: Record<string, string>;
+  /**
+   * Schema version of the manifest DOCUMENT (#2872, ADR-2866 Phase 3) — NOT
+   * the GSD package version, which `version` above already carries. The two
+   * are deliberately separate fields: `version` holds `pkg.version` and is
+   * read by the golden-parity fixtures, so overloading it with a schema
+   * number would be the textbook Hyrum break (same key, new meaning).
+   *
+   *   `null` — no manifest at this configDir (or an unparseable one; see
+   *            `readJsonIfPresent`'s long-standing fallback).
+   *   `1`    — a manifest written before #2872: no `manifestVersion` key, and
+   *            therefore no recorded `runtime`/`scope`. **This is a correct
+   *            manifest, not a broken one** — read without error and without
+   *            requiring a reinstall.
+   *   `>= 2` — records `runtime` and `scope`.
+   *
+   * A value written by a NEWER GSD is reported verbatim rather than clamped
+   * or rejected: two GSD versions on one machine is a supported state, and an
+   * older reader must not crash on a newer writer. Consumers branch on
+   * `>= 2`, never `=== 2`.
+   */
+  manifestVersion: number | null;
+  /** Runtime that wrote this manifest, or `null` for a v1 manifest. Reported
+   *  verbatim up to `MAX_REPORTED_RUNTIME_LENGTH` chars, then truncated with
+   *  `…` — an unregistered runtime string is a fact about the file, and this
+   *  reader reports facts; callers decide what to do with one. Charset is
+   *  deliberately NOT gated (see `normalizeReportedRuntime`). */
+  runtime: string | null;
+  /** Install scope that wrote this manifest, or `null` for a v1 manifest (or
+   *  an unrecognized value). Validated through Install Scope Module's shared
+   *  membership predicate, never a second copy of the rule — so `'project'`
+   *  (the consent/lifecycle vocabulary) reads as `null` rather than being
+   *  silently mistaken for `'local'`. */
+  scope: InstallScope | null;
+}
+
+/** Lowest manifest schema version that records `runtime`/`scope` (#2872). */
+const MANIFEST_SCHEMA_VERSION = 2;
+
+/**
+ * Longest `runtime` string this reader will report. Real runtime ids are
+ * registry keys (`claude`, `antigravity`, `kimi-code` — 11 chars at the
+ * longest), so this loses nothing legitimate; it exists because the manifest
+ * is attacker-influenceable (a project-local one lives inside a repository a
+ * user may merely have cloned) and the value reaches a consumer that renders
+ * it. Same 64-char convention as `truncatePostureValue`
+ * (`agent-install-check.cts`), deliberately, so the subsystem caps reported
+ * values one way.
+ */
+const MAX_REPORTED_RUNTIME_LENGTH = 64;
+
+/**
+ * A manifest's `runtime` is reported as a FACT about the file — it is
+ * deliberately NOT validated against the capability registry, because an
+ * unregistered id is exactly the kind of mismatch the Installed Surface
+ * Resolver exists to surface (#2872 design row B8). It is, however, LENGTH
+ * bounded: "report the fact" never required "report unbounded bytes".
+ */
+function normalizeReportedRuntime(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  if (raw.trim() === '') return null;
+  return raw.length > MAX_REPORTED_RUNTIME_LENGTH
+    ? `${raw.slice(0, MAX_REPORTED_RUNTIME_LENGTH)}…`
+    : raw;
+}
+
+/**
+ * Normalize a raw `manifestVersion`. Only a finite integer >= 1 is a version
+ * claim; everything else (absent, `"2"`, `0`, `-1`, `2.5`, `NaN`, `Infinity`)
+ * reads as `1` — a pre-#2872 manifest. Liberal in what it accepts, but the
+ * normalization is a stated value rather than a silent guess: a caller can
+ * always tell v1 (`1`) from "no manifest at all" (`null`).
+ */
+function normalizeManifestVersion(raw: unknown): number {
+  if (typeof raw !== 'number') return 1;
+  if (!Number.isInteger(raw)) return 1;
+  if (raw < 1) return 1;
+  return raw;
 }
 
 function readInstallManifest(configDir: string): InstallManifest {
   const manifest = readJsonIfPresent(path.join(configDir, MANIFEST_NAME), null);
-  if (!manifest || typeof manifest !== 'object') {
-    return { version: null, timestamp: null, mode: null, files: {} };
+  // `typeof [] === 'object'` in JS, so a bare `typeof !== 'object'` guard lets
+  // a top-level JSON array (valid JSON, but not the manifest's documented
+  // object shape) fall through to the field reads below — `m.manifestVersion`
+  // reads `undefined` off an array, which `normalizeManifestVersion` then
+  // reports as `1` (a v1 manifest), misclassifying "not an object" as
+  // "installed". `Array.isArray` closes that gap explicitly rather than
+  // relying on the object-shape checks below to catch it incidentally.
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return {
+      version: null,
+      timestamp: null,
+      mode: null,
+      files: {},
+      manifestVersion: null,
+      runtime: null,
+      scope: null,
+    };
   }
   const m = manifest as Record<string, unknown>;
+  const rawRuntime = m.runtime;
   return {
     version: typeof m.version === 'string' ? m.version : null,
     timestamp: typeof m.timestamp === 'string' ? m.timestamp : null,
     mode: typeof m.mode === 'string' ? m.mode : null,
     files: m.files && typeof m.files === 'object' ? m.files as Record<string, string> : {},
+    manifestVersion: normalizeManifestVersion(m.manifestVersion),
+    runtime: normalizeReportedRuntime(rawRuntime),
+    scope: isInstallScopeId(m.scope) ? m.scope : null,
   };
 }
 
@@ -261,7 +390,7 @@ function classifyArtifact(configDir: string, relPath: string, manifest: InstallM
   const normalized = normalizeRelPath(relPath);
   const originalHash = manifest.files[normalized] || null;
   const fullPath = path.join(configDir, normalized);
-  if (!fs.existsSync(fullPath)) {
+  if (!installFs().existsSync(fullPath)) {
     return { classification: originalHash ? 'managed-missing' : 'missing', originalHash, currentHash: null };
   }
   const currentHash = sha256File(fullPath);
@@ -1092,6 +1221,7 @@ export = {
   classifyArtifact,
   discoverInstallerMigrations,
   evaluateRemoveEmptyDir,
+  MANIFEST_SCHEMA_VERSION,
   migrationChecksum,
   planInstallerMigrations,
   readInstallManifest,

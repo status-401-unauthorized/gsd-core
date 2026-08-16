@@ -38,7 +38,7 @@ try {
   else process.env.GSD_TEST_MODE = savedTestMode;
 }
 
-const { install, mergeClaudePermissions, GSD_CLAUDE_ALLOW_PERMISSIONS, GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS, GSD_CLAUDE_DENY_PERMISSIONS, rewriteLegacyManagedNodeHookCommands, resolveNodeRunner } = installExports || {};
+const { install, mergeClaudePermissions, GSD_CLAUDE_ALLOW_PERMISSIONS, GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS, GSD_CLAUDE_DENY_PERMISSIONS, rewriteLegacyManagedNodeHookCommands, resolveNodeRunner, copyWithPathReplacement } = installExports || {};
 
 const {
   installRuntimeArtifacts,
@@ -1357,3 +1357,262 @@ describe('#1924: preserveUserArtifacts helper exists in install.js', () => {
 });
   });
 }
+
+// ─── #3333 — copyWithPathReplacement TOCTOU: source vanishes mid-copy ────────
+//
+// copyWithPathReplacement enumerates srcDir via readdirSync, then later reads
+// (or copies) each listed entry. A filesystem is not transactional: the file
+// readdirSync named can be deleted by a concurrent process before the loop
+// reaches it, throwing an unhandled ENOENT and crashing the whole install.
+// This is not hypothetical — tests/planning-prompt-drift.test.cjs writes a
+// throwaway fixture directly into the real, shared gsd-core/workflows/ and
+// deletes it in t.after(); a concurrently-running install path that lists
+// that directory can observe the fixture in its readdirSync snapshot but hit
+// ENOENT reading it once the writer's cleanup fires. Confirmed crash from a
+// real remote gsd-test run:
+//   Error: ENOENT: no such file or directory, open
+//   '/work/gsd-core/workflows/zzz-e5-drift-fixture.md'
+//       at Object.readFileSync (node:fs:441:20)
+//       at copyWithPathReplacement (/work/bin/install.js:7888:24)
+
+describe('#3333 regression: copyWithPathReplacement tolerates a source file vanishing mid-copy (TOCTOU)', () => {
+  test('a .md file deleted between readdirSync and read is skipped, siblings still copied, no crash', (t) => {
+    assert.strictEqual(typeof copyWithPathReplacement, 'function',
+      'copyWithPathReplacement must be exported from bin/install.js');
+
+    const srcDir = createTempDir('gsd-3333-src-');
+    const destRoot = createTempDir('gsd-3333-dest-');
+    t.after(() => {
+      cleanup(srcDir);
+      cleanup(destRoot);
+    });
+
+    fs.writeFileSync(path.join(srcDir, 'alpha.md'), '# alpha\n');
+    fs.writeFileSync(path.join(srcDir, 'vanish.md'), '# vanish\n');
+    fs.writeFileSync(path.join(srcDir, 'beta.md'), '# beta\n');
+
+    const vanishPath = path.join(srcDir, 'vanish.md');
+
+    // Deterministically inject the race at its true origin point: readdirSync
+    // (called inside copyWithPathReplacement) returns the snapshot that still
+    // includes 'vanish.md', but the file is removed from disk immediately
+    // after that snapshot is taken and before the entry loop reaches it — the
+    // same shape as a concurrent test suite's t.after() cleanup firing mid-copy.
+    const origReaddirSync = fs.readdirSync;
+    fs.readdirSync = function (dir, opts) {
+      const result = origReaddirSync.call(fs, dir, opts);
+      if (dir === srcDir) {
+        try { fs.unlinkSync(vanishPath); } catch { /* already gone */ }
+      }
+      return result;
+    };
+    t.after(() => { fs.readdirSync = origReaddirSync; });
+
+    const destDir = path.join(destRoot, 'out');
+
+    assert.doesNotThrow(() => {
+      copyWithPathReplacement(srcDir, destDir, '~/.claude/', 'claude', false, false, destRoot);
+    }, 'copyWithPathReplacement must not throw when a listed source file vanishes before it is read (#3333)');
+
+    assert.ok(fs.existsSync(path.join(destDir, 'alpha.md')),
+      'alpha.md (unaffected sibling before the vanished entry) must still be copied');
+    assert.strictEqual(fs.readFileSync(path.join(destDir, 'alpha.md'), 'utf8'), '# alpha\n');
+
+    assert.ok(fs.existsSync(path.join(destDir, 'beta.md')),
+      'beta.md (unaffected sibling after the vanished entry) must still be copied');
+    assert.strictEqual(fs.readFileSync(path.join(destDir, 'beta.md'), 'utf8'), '# beta\n');
+
+    assert.ok(!fs.existsSync(path.join(destDir, 'vanish.md')),
+      'vanish.md destination must not exist — the vanished source must be skipped, not partially written');
+  });
+});
+
+// ─── #3329 — /gsd-update never migrates stale .sh hook commands ───────────────
+//
+// /gsd-update re-invokes the installer (workflows/update.md), but
+// applySettingsJsonHooks registers the four `.sh` managed hooks only-if-absent:
+// an already-registered entry keeps whatever command shape an older installer
+// emitted. On Windows+Claude that left the pre-#580/#3393 bash-runner-prefixed
+// commands (`bash "<script>.sh"` / `"<git>/bash.exe" "<script>.sh"`) in place
+// forever — each hook fire spawns a nested bash grandchild. The fix adds
+// reconcileManagedShellHookCommands, wired into applySettingsJsonHooks, which
+// rewrites existing managed `.sh` entries to the command this install would
+// generate today — gated on shellHookOmitsBashRunner so it never fires where
+// the bash runner is correct, and scoped to exact managed basenames so
+// user-authored hooks are untouched.
+
+describe('#3329 regression: stale managed .sh hook commands are reconciled on install/update', () => {
+  const { reconcileManagedShellHookCommands } = installExports || {};
+
+  const GLOBAL_EXPECTED = {
+    'gsd-validate-commit.sh': '"C:/Users/u/.claude/hooks/gsd-validate-commit.sh"',
+    'gsd-graphify-update.sh': '"C:/Users/u/.claude/hooks/gsd-graphify-update.sh"',
+    'gsd-session-state.sh': '"C:/Users/u/.claude/hooks/gsd-session-state.sh"',
+    'gsd-phase-boundary.sh': '"C:/Users/u/.claude/hooks/gsd-phase-boundary.sh"',
+  };
+
+  const LOCAL_EXPECTED = {
+    'gsd-validate-commit.sh': '"$CLAUDE_PROJECT_DIR"/.claude/hooks/gsd-validate-commit.sh',
+    'gsd-graphify-update.sh': '"$CLAUDE_PROJECT_DIR"/.claude/hooks/gsd-graphify-update.sh',
+    'gsd-session-state.sh': '"$CLAUDE_PROJECT_DIR"/.claude/hooks/gsd-session-state.sh',
+    'gsd-phase-boundary.sh': '"$CLAUDE_PROJECT_DIR"/.claude/hooks/gsd-phase-boundary.sh',
+  };
+
+  function settingsWith(entriesByEvent) {
+    const hooks = {};
+    for (const [event, commands] of Object.entries(entriesByEvent)) {
+      hooks[event] = commands.map(command => ({
+        hooks: [{ type: 'command', command }],
+      }));
+    }
+    return { hooks };
+  }
+
+  function allCommands(settings) {
+    const out = [];
+    for (const entries of Object.values(settings.hooks)) {
+      for (const entry of entries) {
+        for (const h of entry.hooks || []) out.push(h.command);
+      }
+    }
+    return out;
+  }
+
+  test('reconcileManagedShellHookCommands is exported from bin/install.js', () => {
+    assert.strictEqual(typeof reconcileManagedShellHookCommands, 'function',
+      'reconcileManagedShellHookCommands must be exported from bin/install.js (#3329)');
+  });
+
+  test('win32+claude: bare `bash`-prefixed global entries are rewritten to the bare script path', () => {
+    // Exact stale shapes reported in #3329 (global install, ~/.claude/settings.json).
+    const settings = settingsWith({
+      SessionStart: ['bash "C:/Users/u/.claude/hooks/gsd-session-state.sh"'],
+      PreToolUse: ['bash "C:/Users/u/.claude/hooks/gsd-validate-commit.sh"'],
+      PostToolUse: ['"C:/Program Files/Git/bin/bash.exe" "C:/Users/u/.claude/hooks/gsd-graphify-update.sh"'],
+    });
+
+    const changed = reconcileManagedShellHookCommands(settings, GLOBAL_EXPECTED, {
+      platform: 'win32',
+      runtime: 'claude',
+    });
+
+    assert.strictEqual(changed, true, 'stale entries must be reported as changed');
+    assert.deepStrictEqual(allCommands(settings), [
+      '"C:/Users/u/.claude/hooks/gsd-session-state.sh"',
+      '"C:/Users/u/.claude/hooks/gsd-validate-commit.sh"',
+      '"C:/Users/u/.claude/hooks/gsd-graphify-update.sh"',
+    ], 'all three stale shapes must be rewritten to the shellHookOmitsBashRunner form');
+  });
+
+  test('win32+claude: local anchored-prefix entries are rewritten (buildLocalShellHookCommand shape)', () => {
+    const settings = settingsWith({
+      PreToolUse: ['bash "$CLAUDE_PROJECT_DIR"/.claude/hooks/gsd-validate-commit.sh'],
+      PostToolUse: ['"C:/Program Files/Git/bin/bash.exe" "$CLAUDE_PROJECT_DIR"/.claude/hooks/gsd-phase-boundary.sh'],
+    });
+
+    const changed = reconcileManagedShellHookCommands(settings, LOCAL_EXPECTED, {
+      platform: 'win32',
+      runtime: 'claude',
+    });
+
+    assert.strictEqual(changed, true);
+    assert.deepStrictEqual(allCommands(settings), [
+      '"$CLAUDE_PROJECT_DIR"/.claude/hooks/gsd-validate-commit.sh',
+      '"$CLAUDE_PROJECT_DIR"/.claude/hooks/gsd-phase-boundary.sh',
+    ], 'local-install .sh entries must reconcile to the anchored bare script path');
+  });
+
+  test('idempotent: already-current entries are left untouched and report no change', () => {
+    const settings = settingsWith({
+      SessionStart: ['"C:/Users/u/.claude/hooks/gsd-session-state.sh"'],
+    });
+
+    const changed = reconcileManagedShellHookCommands(settings, GLOBAL_EXPECTED, {
+      platform: 'win32',
+      runtime: 'claude',
+    });
+
+    assert.strictEqual(changed, false, 'no-op when nothing is stale');
+    assert.strictEqual(
+      settings.hooks.SessionStart[0].hooks[0].command,
+      '"C:/Users/u/.claude/hooks/gsd-session-state.sh"',
+    );
+  });
+
+  test('over-fire guard: non-Windows platforms are untouched even when commands are stale', () => {
+    const original = 'bash "/home/u/.claude/hooks/gsd-session-state.sh"';
+    const settings = settingsWith({ SessionStart: [original] });
+
+    const changed = reconcileManagedShellHookCommands(settings, {
+      'gsd-session-state.sh': 'bash "/home/u/.claude/hooks/gsd-session-state.sh"',
+    }, { platform: 'linux', runtime: 'claude' });
+
+    assert.strictEqual(changed, false, 'linux must not reconcile (bash runner is correct there)');
+    assert.strictEqual(settings.hooks.SessionStart[0].hooks[0].command, original);
+  });
+
+  test('over-fire guard: win32 non-claude runtimes are untouched', () => {
+    const original = 'bash "C:/Users/u/.claude/hooks/gsd-session-state.sh"';
+    const settings = settingsWith({ SessionStart: [original] });
+
+    const changed = reconcileManagedShellHookCommands(settings, GLOBAL_EXPECTED, {
+      platform: 'win32',
+      runtime: 'qwen',
+    });
+
+    assert.strictEqual(changed, false, 'win32+qwen keeps the bash runner by design');
+    assert.strictEqual(settings.hooks.SessionStart[0].hooks[0].command, original);
+  });
+
+  test('scope guard: non-managed and user-authored hooks are never rewritten', () => {
+    const entries = [
+      'bash "/home/u/hooks/my-own-hook.sh"',                       // user hook, foreign basename
+      'node "C:/Users/u/.claude/hooks/gsd-check-update.js"',       // .js hook — owned by the #2979 rewriter
+      'FOO=1 bash "C:/Users/u/.claude/hooks/gsd-session-state.sh"', // 3-token wrapper, not the managed shape
+      'bash "C:/Users/u/.claude/hooks/gsd-session-state.sh" --flag', // extra args after the script
+    ];
+    const settings = settingsWith({ SessionStart: entries.slice() });
+
+    const changed = reconcileManagedShellHookCommands(settings, GLOBAL_EXPECTED, {
+      platform: 'win32',
+      runtime: 'claude',
+    });
+
+    assert.strictEqual(changed, false, 'no managed 2-token entry present — nothing to rewrite');
+    assert.deepStrictEqual(allCommands(settings), entries, 'every entry must be byte-identical');
+  });
+
+  test('scope guard: args-form launcher entries are skipped (#976 parity)', () => {
+    const settings = {
+      hooks: {
+        SessionStart: [{
+          hooks: [{
+            type: 'command',
+            command: '/usr/local/bin/node-launcher',
+            args: ['C:/Users/u/.claude/hooks/gsd-session-state.sh'],
+          }],
+        }],
+      },
+    };
+
+    const changed = reconcileManagedShellHookCommands(settings, GLOBAL_EXPECTED, {
+      platform: 'win32',
+      runtime: 'claude',
+    });
+
+    assert.strictEqual(changed, false, 'args-form entries are intentional wrappers');
+    assert.strictEqual(settings.hooks.SessionStart[0].hooks[0].command, '/usr/local/bin/node-launcher');
+  });
+
+  test('null expected commands are never written (bash-runner-unavailable installs stay intact)', () => {
+    const original = 'bash "C:/Users/u/.claude/hooks/gsd-session-state.sh"';
+    const settings = settingsWith({ SessionStart: [original] });
+
+    const changed = reconcileManagedShellHookCommands(settings, {
+      'gsd-session-state.sh': null,
+    }, { platform: 'win32', runtime: 'claude' });
+
+    assert.strictEqual(changed, false, 'a null expected command must disable rewriting for that hook');
+    assert.strictEqual(settings.hooks.SessionStart[0].hooks[0].command, original);
+  });
+});

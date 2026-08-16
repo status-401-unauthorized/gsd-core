@@ -20,11 +20,10 @@ const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
 
 const { createTempDir, cleanup, runGsdTools, TOOLS_PATH } = require('./helpers.cjs');
 const processSeam = require('./helpers/process-seam.cjs');
-const { runNode, runGit, runHook, OUTCOME } = processSeam;
+const { runNode, runGit, runHook, OUTCOME, toSeamResult } = processSeam;
 
 // ---- fixture sources -------------------------------------------------
 
@@ -265,6 +264,24 @@ describe('process-seam', () => {
     }
   });
 
+  test('toSeamResult classifies a raced status+ETIMEDOUT as EXITED, not TIMED_OUT', () => {
+    // Synthetic reproduction of the exact-bound race: spawnSync's timer
+    // fired (error.code === 'ETIMEDOUT') just as the child finished on its
+    // own (status: 0). Evidence (a real status) must outrank the attached
+    // error — the old discrimination order checked error.code first and
+    // reported TIMED_OUT with exitCode: 0, an incoherent shape.
+    const result = toSeamResult({
+      status: 0,
+      error: { code: 'ETIMEDOUT' },
+      signal: null,
+      stdout: '',
+      stderr: '',
+    });
+    assert.equal(result.outcome, OUTCOME.EXITED);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.exitCode, 0);
+  });
+
   test('child overrunning the bound is TIMED_OUT', () => {
     const fixture = writeFixture(tmpDir, 'sleeper.cjs', FIXTURE_SLEEPER);
     const result = runNode([fixture, '5000'], { timeoutMs: 200 });
@@ -443,8 +460,8 @@ describe('runHook interpreter option', () => {
   // node-only container may not have bash on PATH.
   function isBashAvailable() {
     if (process.platform === 'win32') return false;
-    const probeResult = spawnSync('bash', ['-c', 'exit 0']);
-    return !probeResult.error;
+    const probeResult = runHook('-c', ['exit 0'], { interpreter: 'bash' });
+    return probeResult.outcome !== OUTCOME.SPAWN_FAILED;
   }
 
   const bashAvailable = isBashAvailable();
@@ -774,6 +791,35 @@ describe('runGsdTools adapter (process-seam parity)', () => {
         assert.equal(typeof result.exitCode, 'number');
         assert.equal(result.exitCode, 1);
       }
+    );
+  });
+});
+
+describe('#3271: hook fan-out timeout class', () => {
+  const {
+    PROBE_TIMEOUT_MS: PROBE,
+    HOOK_FANOUT_TIMEOUT_MS: HOOK_FANOUT,
+    INSTALL_TIMEOUT_MS: INSTALL,
+  } = require('./helpers/timeouts.cjs');
+
+  test('a hook fan-out is bounded above a bare probe and below a full install', () => {
+    // The ordering IS the claim: a hook that shells out several times is heavier
+    // than reading back a version string and lighter than running bin/install.js.
+    // CI recorded a Windows timeout at exactly the probe bound (PR #3285,
+    // windows-latest node 22 shard 2/3) while every other lane passed the same
+    // commit — the bound was sized for the wrong class.
+    assert.ok(PROBE < HOOK_FANOUT, `probe ${PROBE}ms must be under hook fan-out ${HOOK_FANOUT}ms`);
+    assert.ok(HOOK_FANOUT < INSTALL, `hook fan-out ${HOOK_FANOUT}ms must be under install ${INSTALL}ms`);
+  });
+
+  test('the fan-out bound clears the duration that actually timed out', () => {
+    // Observed: 15040ms, censored at the 15000ms probe bound, so the real need is
+    // unknown and above it. A bound that merely matched the observation would be
+    // the same defect again.
+    const OBSERVED_TIMEOUT_MS = 15040;
+    assert.ok(
+      HOOK_FANOUT >= OBSERVED_TIMEOUT_MS * 3,
+      `hook fan-out ${HOOK_FANOUT}ms must clear the censored ${OBSERVED_TIMEOUT_MS}ms observation with real margin`,
     );
   });
 });

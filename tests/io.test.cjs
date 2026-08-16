@@ -13,12 +13,18 @@
 
 const { test, describe, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
 
 const io = require('../gsd-core/bin/lib/io.cjs');
+const { runNode } = require('./helpers/process-seam.cjs');
+const { toLegacyResult } = require('./helpers/git-fixture.cjs');
+const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+
+function runScript(script) {
+  return toLegacyResult(runNode(['-e', script], { timeoutMs: PROBE_TIMEOUT_MS }));
+}
 
 // ─── ERROR_REASON constants ───────────────────────────────────────────────────
 
@@ -98,7 +104,7 @@ describe('output()', () => {
       const io = require(${JSON.stringify(ioPath)});
       io.output({ ok: true, value: 42 }, false);
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 0, `process exited non-zero: ${result.stderr}`);
     const parsed = JSON.parse(result.stdout);
     assert.deepStrictEqual(parsed, { ok: true, value: 42 });
@@ -109,7 +115,7 @@ describe('output()', () => {
       const io = require(${JSON.stringify(ioPath)});
       io.output({ ignored: true }, true, 'raw-text-output');
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 0, `process exited non-zero: ${result.stderr}`);
     assert.strictEqual(result.stdout, 'raw-text-output');
   });
@@ -119,7 +125,7 @@ describe('output()', () => {
       const io = require(${JSON.stringify(ioPath)});
       io.output({ fallback: true }, true);
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 0, `process exited non-zero: ${result.stderr}`);
     const parsed = JSON.parse(result.stdout);
     assert.deepStrictEqual(parsed, { fallback: true });
@@ -130,7 +136,7 @@ describe('output()', () => {
       const io = require(${JSON.stringify(ioPath)});
       io.output(null, false);
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 0, `process exited non-zero: ${result.stderr}`);
     assert.strictEqual(result.stdout, 'null');
   });
@@ -156,7 +162,7 @@ describe('output()', () => {
       const largeString = 'x'.repeat(60000);
       io.output({ large: largeString }, false);
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 0, `process exited non-zero: ${result.stderr}`);
 
     const stdout = result.stdout.trim();
@@ -187,7 +193,7 @@ describe('error()', () => {
       io.setJsonErrorMode(false);
       io.error('something went wrong');
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 1);
     assert.ok(result.stderr.includes('Error: something went wrong'), `stderr was: ${result.stderr}`);
     assert.strictEqual(result.stdout, '');
@@ -199,7 +205,7 @@ describe('error()', () => {
       io.setJsonErrorMode(false);
       io.error('no reason code expected');
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 1);
     // plain mode does NOT include the reason field
     assert.ok(!result.stderr.includes('"reason"'), `stderr unexpectedly contained reason: ${result.stderr}`);
@@ -211,7 +217,7 @@ describe('error()', () => {
       io.setJsonErrorMode(true);
       io.error('structured error', io.ERROR_REASON.SDK_FAIL_FAST);
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 1);
     assert.strictEqual(result.stdout, '');
     const payload = JSON.parse(result.stderr.trim());
@@ -226,7 +232,7 @@ describe('error()', () => {
       io.setJsonErrorMode(true);
       io.error('no reason given');
     `;
-    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+    const result = runScript(script);
     assert.strictEqual(result.status, 1);
     const payload = JSON.parse(result.stderr.trim());
     assert.strictEqual(payload.reason, 'unknown');
@@ -246,7 +252,7 @@ describe('error()', () => {
         io.setJsonErrorMode(true);
         io.error('test', io.ERROR_REASON.${key});
       `;
-      const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf-8' });
+      const result = runScript(script);
       assert.strictEqual(result.status, 1, `key=${key}`);
       const payload = JSON.parse(result.stderr.trim());
       assert.strictEqual(payload.reason, expected, `key=${key}`);
@@ -303,6 +309,45 @@ describe('reapStaleTempFiles (via io)', () => {
     // reap against a non-existent prefix — must not throw
     assert.doesNotThrow(() => {
       io.reapStaleTempFiles('gsd-io-nonexistent-prefix-xyz-', { maxAgeMs: 0 });
+    });
+  });
+
+  // #3314 — ADR-456 in-process reachability: t.mock.timers patches the
+  // process-global Date, so it controls `now` inside reapStaleTempFiles with
+  // no production code change needed. Both sides of the comparison (mocked
+  // "now" and the fs.utimesSync mtime) use second-aligned epoch values to
+  // avoid filesystem mtime sub-second-precision truncation on filesystems
+  // that round mtime to the nearest second.
+  describe('boundary: age exactly at maxAgeMs (condition is strictly-greater)', () => {
+    const MTIME_MS = 1_700_000_000_000; // second-aligned
+    const MAX_AGE_MS = 5000;
+
+    function plantFileAtAge(t, ageMs) {
+      fs.mkdirSync(io.GSD_TEMP_DIR, { recursive: true });
+      const p = path.join(io.GSD_TEMP_DIR, TEST_PREFIX + `boundary-${ageMs}.json`);
+      fs.writeFileSync(p, '{}');
+      fs.utimesSync(p, new Date(MTIME_MS), new Date(MTIME_MS));
+      t.mock.timers.enable(['Date']);
+      t.mock.timers.setTime(MTIME_MS + ageMs);
+      return p;
+    }
+
+    test('boundary: age exactly maxAgeMs-1 is kept', (t) => {
+      const p = plantFileAtAge(t, MAX_AGE_MS - 1);
+      io.reapStaleTempFiles(TEST_PREFIX, { maxAgeMs: MAX_AGE_MS });
+      assert.ok(fs.existsSync(p), 'file at maxAgeMs-1 must be kept');
+    });
+
+    test('boundary: age exactly maxAgeMs is kept (condition is strictly-greater)', (t) => {
+      const p = plantFileAtAge(t, MAX_AGE_MS);
+      io.reapStaleTempFiles(TEST_PREFIX, { maxAgeMs: MAX_AGE_MS });
+      assert.ok(fs.existsSync(p), 'file at exactly maxAgeMs must be kept — condition is strictly-greater, not >=');
+    });
+
+    test('boundary: age exactly maxAgeMs+1 is removed', (t) => {
+      const p = plantFileAtAge(t, MAX_AGE_MS + 1);
+      io.reapStaleTempFiles(TEST_PREFIX, { maxAgeMs: MAX_AGE_MS });
+      assert.ok(!fs.existsSync(p), 'file at maxAgeMs+1 must be removed');
     });
   });
 });

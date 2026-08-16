@@ -840,6 +840,7 @@ describe('Copilot agent conversion - real files', () => {
     assert.ok(toolsLine.includes("'execute'"), 'Bash mapped to execute');
     assert.ok(toolsLine.includes("'search'"), 'Grep/Glob deduplicated to search');
     // Input tools count > output tools count (deduplication occurred)
+    // eslint-disable-next-line local/no-unbounded-quantifier -- parses this repo's own agents/gsd-executor.md frontmatter, bounded, not adversarial input
     const inputTools = content.match(/^tools:\s*\[([^\]]+)\]/m)?.[1].split(',').length ?? 0;
     const outputTools = toolsLine.replace(/^tools:\s*\[/, '').replace(/\].*$/, '').split(',').length;
     assert.ok(inputTools === 0 || outputTools <= inputTools, 'deduplication reduced or preserved tool count');
@@ -1362,7 +1363,10 @@ const EXPECTED_AGENTS = listAgentFiles().length;
 const { PROBE_TIMEOUT_MS, INSTALL_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
 function runCopilotInstall(cwd) {
-  const env = { ...process.env };
+  // #3156: sandbox HOME — the installer writes <home>/.gsd/defaults.json via
+  // os.homedir() directly, which no env scrub can reach. See installSpawnEnv.
+  const { installSpawnEnv } = require('./helpers.cjs');
+  const env = installSpawnEnv();
   delete env.GSD_TEST_MODE;
   const r = runNode([INSTALL_PATH, '--copilot', '--local', '--no-sdk'], {
     cwd,
@@ -1374,7 +1378,10 @@ function runCopilotInstall(cwd) {
 }
 
 function runCopilotUninstall(cwd) {
-  const env = { ...process.env };
+  // #3156: sandbox HOME — the installer writes <home>/.gsd/defaults.json via
+  // os.homedir() directly, which no env scrub can reach. See installSpawnEnv.
+  const { installSpawnEnv } = require('./helpers.cjs');
+  const env = installSpawnEnv();
   delete env.GSD_TEST_MODE;
   const r = runNode([INSTALL_PATH, '--copilot', '--local', '--uninstall', '--no-sdk'], {
     cwd,
@@ -1673,7 +1680,10 @@ describe('E2E: Copilot uninstall verification', () => {
 // ─── E2E: Copilot global scope (#786) ──────────────────────────────────────────
 
 function runCopilotInstallGlobal(cwd, configDir) {
-  const env = { ...process.env };
+  // #3156: sandbox HOME — the installer writes <home>/.gsd/defaults.json via
+  // os.homedir() directly, which no env scrub can reach. See installSpawnEnv.
+  const { installSpawnEnv } = require('./helpers.cjs');
+  const env = installSpawnEnv();
   delete env.GSD_TEST_MODE;
   const r = runNode(
     [INSTALL_PATH, '--copilot', '--global', '--config-dir', configDir, '--no-sdk'],
@@ -1684,7 +1694,10 @@ function runCopilotInstallGlobal(cwd, configDir) {
 }
 
 function runCopilotUninstallGlobal(cwd, configDir) {
-  const env = { ...process.env };
+  // #3156: sandbox HOME — the installer writes <home>/.gsd/defaults.json via
+  // os.homedir() directly, which no env scrub can reach. See installSpawnEnv.
+  const { installSpawnEnv } = require('./helpers.cjs');
+  const env = installSpawnEnv();
   delete env.GSD_TEST_MODE;
   const r = runNode(
     [INSTALL_PATH, '--copilot', '--global', '--config-dir', configDir, '--uninstall', '--no-sdk'],
@@ -1734,7 +1747,10 @@ describe('E2E: Copilot global install (#786)', () => {
 // ─── Claude uninstall: user file preservation (#1423) ─────────────────────────
 
 function runClaudeInstall(cwd) {
-  const env = { ...process.env };
+  // #3156: sandbox HOME — the installer writes <home>/.gsd/defaults.json via
+  // os.homedir() directly, which no env scrub can reach. See installSpawnEnv.
+  const { installSpawnEnv } = require('./helpers.cjs');
+  const env = installSpawnEnv();
   delete env.GSD_TEST_MODE;
   const r = runNode([INSTALL_PATH, '--claude', '--local', '--no-sdk'], {
     cwd,
@@ -1746,7 +1762,10 @@ function runClaudeInstall(cwd) {
 }
 
 function runClaudeUninstall(cwd) {
-  const env = { ...process.env };
+  // #3156: sandbox HOME — the installer writes <home>/.gsd/defaults.json via
+  // os.homedir() directly, which no env scrub can reach. See installSpawnEnv.
+  const { installSpawnEnv } = require('./helpers.cjs');
+  const env = installSpawnEnv();
   delete env.GSD_TEST_MODE;
   const r = runNode([INSTALL_PATH, '--claude', '--local', '--uninstall', '--no-sdk'], {
     cwd,

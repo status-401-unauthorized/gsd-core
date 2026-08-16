@@ -16,6 +16,14 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+// #2874 (ADR-58 cleanup phase): route this module's fs calls through the
+// installRuntimeArtifacts call tree's injectable seam — see
+// install-fs-adapter.cts's module doc. Resolves to real `node:fs` (the
+// `fs` import above stays for type-only references, e.g. `fs.Dirent`)
+// unless the top-level installRuntimeArtifacts call injected a `deps.fs`.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import installFsAdapter = require('./install-fs-adapter.cjs');
+const { installFs, mkInstallTempDir } = installFsAdapter;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import installProfiles = require('./install-profiles.cjs');
 const {
@@ -30,6 +38,11 @@ const conversionExports = runtimeArtifactConversion as Record<string, unknown> &
   readGsdCommandNames?: () => string[];
 };
 import { posixNormalize } from './shell-command-projection.cjs';
+// #2870: `isGlobalScope` centralizes the `scope === 'global'` boolean
+// projection both kind-builder closures below need at the converters'
+// positional `isGlobal` boundary (see its doc comment in install-scope.cts
+// for why the projection is centralized rather than eliminated).
+import { isGlobalScope, scopeRank, validateScopeId, SCOPE_ORDER, type InstallScope } from './install-scope.cjs';
 
 // In .cts (CommonJS output) files, `require` is available as a global.
 const _require: NodeRequire = require;
@@ -119,22 +132,49 @@ interface Layout {
  * 3. Throw a descriptive error if neither succeeds.
  */
 function findInstallSourceRoot(runtimeConfigDir?: string): string {
-  // Step 1: marker check
+  // Step 1: marker check — reads `<runtimeConfigDir>/.gsd-source`, a path
+  // under the INSTALL DESTINATION, so this probe goes through the injected
+  // adapter (installFs()).
   if (runtimeConfigDir) {
     const markerPath = path.join(runtimeConfigDir, '.gsd-source');
-    if (fs.existsSync(markerPath)) {
+    if (installFs().existsSync(markerPath)) {
       try {
-        const src = fs.readFileSync(markerPath, 'utf8').trim();
-        if (src && fs.existsSync(src)) return src;
+        const src = installFs().readFileSync(markerPath, 'utf8').trim();
+        if (src && installFs().existsSync(src)) return src;
       } catch { /* fall through */ }
     }
   }
 
-  // Step 2: walk up from __dirname
+  // Step 2: walk up from __dirname to locate the GSD PACKAGE'S OWN source
+  // tree (commands/gsd/) — this resolves where the installer's own code is
+  // running FROM, not anything under the install destination, so it is
+  // deliberately NOT routed through the injected fs adapter (#2874): a fake
+  // "destination" adapter has no reason to know about the real package's own
+  // on-disk layout (an injected adapter's store starts empty and is never
+  // seeded with real repo paths), and routing it through would make this
+  // resolution unconditionally throw rather than gracefully staging nothing.
+  //
+  // Uses `fs.statSync` in a try/catch rather than `fs.existsSync` — this is
+  // LOAD-BEARING, not a style choice: tests/executed-plan.test.cjs's F2 cases
+  // poison every method on the ROUTED fs surface (including `existsSync`,
+  // since installFs()'s REAL_ADAPTER also calls it) to prove nothing on the
+  // installRuntimeArtifacts call tree reaches real fs. The F2 "nativePlugin
+  // runtime: pi" test calls this function (via findInstallSourceRoot()) AFTER
+  // installing that poison, specifically to resolve the pi nativePlugin
+  // source path against this repo's own real layout — an operation this
+  // function must still be able to perform even while `existsSync` is
+  // poisoned, because this Step 2 walk is real-fs-only by design and was
+  // never meant to be covered by that poison list. `statSync` is not on the
+  // poisoned surface, so this probe survives; switching back to `existsSync`
+  // makes that F2 test throw (verified: reverting this to `existsSync` trips
+  // the poison and breaks the pi nativePlugin case).
   let dir = __dirname;
   for (let i = 0; i < 6; i++) {
     const candidate = path.join(dir, 'commands', 'gsd');
-    if (fs.existsSync(candidate)) return candidate;
+    try {
+      fs.statSync(candidate);
+      return candidate;
+    } catch { /* not here — keep walking up */ }
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -152,26 +192,33 @@ function findInstallSourceRoot(runtimeConfigDir?: string): string {
  * 3. Throw a descriptive error if neither succeeds.
  */
 function findAgentsSourceRoot(runtimeConfigDir?: string): string {
-  // Step 1: marker check
+  // Step 1: marker check (destination-relative — routed through installFs()).
   if (runtimeConfigDir) {
     const markerPath = path.join(runtimeConfigDir, '.gsd-source');
-    if (fs.existsSync(markerPath)) {
+    if (installFs().existsSync(markerPath)) {
       try {
-        const src = fs.readFileSync(markerPath, 'utf8').trim();
-        if (src && fs.existsSync(src)) {
+        const src = installFs().readFileSync(markerPath, 'utf8').trim();
+        if (src && installFs().existsSync(src)) {
           // Marker points to commands/gsd; agents/ is a sibling of commands/
           const agentsCandidate = path.resolve(path.dirname(src), '..', 'agents');
-          if (fs.existsSync(agentsCandidate)) return agentsCandidate;
+          if (installFs().existsSync(agentsCandidate)) return agentsCandidate;
         }
       } catch { /* fall through */ }
     }
   }
 
-  // Step 2: walk up from __dirname
+  // Step 2: walk up from __dirname — locates THIS package's own agents/
+  // source tree, not the install destination. See findInstallSourceRoot's
+  // Step 2 comment (#2874) for why this stays unrouted, real-fs-only, and why
+  // it uses `statSync` rather than `existsSync` (load-bearing against F2's
+  // poison of the routed fs surface, not a style choice).
   let dir = __dirname;
   for (let i = 0; i < 6; i++) {
     const candidate = path.join(dir, 'agents');
-    if (fs.existsSync(candidate)) return candidate;
+    try {
+      fs.statSync(candidate);
+      return candidate;
+    } catch { /* not here — keep walking up */ }
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -272,6 +319,11 @@ function convertedAgentsKind(
       // choose global-home vs workspace-relative paths; converters that only take
       // (content) ignore the extra positional arg. Mirrors skillsKind's scope
       // threading (#1173).
+      // #2870: `scope` is this function's own parameter (default `'global'`,
+      // so it is never undefined here), sourced upstream from the Install
+      // Scope Module's resolved id. `isGlobalScope` projects it to the
+      // boolean `stageAgentsForRuntimeWithConverter`'s positional API
+      // requires — see its doc comment in install-scope.cts.
       const converter = conversionExports[converterName] as (content: string, isGlobal?: boolean) => string;
       // ADR-1235 §1: when agentCtx is provided (by createRuntimeArtifactInstallPlan
       // for descriptor-driven runtimes), thread it through so stageAgentsForRuntimeWithConverter
@@ -280,7 +332,7 @@ function convertedAgentsKind(
         findAgentsSourceRoot(configDir),
         resolved,
         converter,
-        scope === 'global',
+        isGlobalScope(scope),
         agentCtx,
       );
     },
@@ -308,28 +360,28 @@ function kimiAgentsKind(destSubpath: string, prefix: string, configDir: string):
         (content: string) => content,
       );
       const subagents: Array<{ path: string; content: string }> = [];
-      if (fs.existsSync(stagedAgents)) {
-        for (const entry of fs.readdirSync(stagedAgents, { withFileTypes: true })) {
+      if (installFs().existsSync(stagedAgents)) {
+        for (const entry of installFs().readdirSync(stagedAgents, { withFileTypes: true })) {
           if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
           const agentPath = path.join(stagedAgents, entry.name);
           subagents.push({
             path: posixNormalize(path.join('agents', entry.name)),
-            content: fs.readFileSync(agentPath, 'utf8'),
+            content: installFs().readFileSync(agentPath, 'utf8'),
           });
         }
       }
 
       const rootAgent = `---\nname: gsd\ndescription: Run GSD workflows in Kimi CLI.\ntools: Agent\n---\n\n# GSD for Kimi CLI\n\nCoordinate installed /skill:gsd-* workflows and route work to generated GSD subagents when a workflow requires an agent handoff.\n`;
       const artifacts = buildKimiAgentArtifacts({ rootAgent, subagents });
-      const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-kimi-agents-'));
+      const stageDir = mkInstallTempDir('gsd-kimi-agents-');
       installProfiles.STAGED_DIRS.add(stageDir);
-      fs.writeFileSync(path.join(stageDir, 'gsd.yaml'), artifacts.root.yaml);
-      fs.writeFileSync(path.join(stageDir, 'gsd.md'), artifacts.root.prompt);
+      installFs().writeFileSync(path.join(stageDir, 'gsd.yaml'), artifacts.root.yaml);
+      installFs().writeFileSync(path.join(stageDir, 'gsd.md'), artifacts.root.prompt);
       const subagentsDir = path.join(stageDir, 'subagents');
-      fs.mkdirSync(subagentsDir, { recursive: true });
+      installFs().mkdirSync(subagentsDir, { recursive: true });
       for (const artifact of artifacts.subagents) {
-        fs.writeFileSync(path.join(subagentsDir, `${artifact.name}.yaml`), artifact.yaml);
-        fs.writeFileSync(path.join(subagentsDir, `${artifact.name}.md`), artifact.prompt);
+        installFs().writeFileSync(path.join(subagentsDir, `${artifact.name}.yaml`), artifact.yaml);
+        installFs().writeFileSync(path.join(subagentsDir, `${artifact.name}.md`), artifact.prompt);
       }
       return stageDir;
     },
@@ -380,7 +432,21 @@ function skillsKind(
       const cmdNames = conversionExports.readGsdCommandNames
         ? conversionExports.readGsdCommandNames()
         : [];
-      const isGlobal = scope === 'global';
+      // #2870: same judgment as convertedAgentsKind above — `scope` is this
+      // function's own parameter (default `'global'`, so it is never
+      // undefined here); `isGlobalScope` projects it to the boolean
+      // `realConverter`'s positional `isGlobal` arg requires.
+      const isGlobal = isGlobalScope(scope);
+      // #2873 (4b): spec-root reachability is applied LATER in the pipeline —
+      // see `rewriteStagedSkillBodies` in runtime-artifact-conversion.cts, not
+      // here. This stage() closure runs BEFORE the staged directory's generic
+      // path-prefix rewrite pass (`applyRuntimeContentRewritesInPlace`'s
+      // `case 'claude'`), which unconditionally rewrites any bare (non-`@`)
+      // `~/.claude/` substring to the undocumented `$HOME/.claude/` form and
+      // only restores the `@`-prefixed form. Emitting the imperative
+      // tilde-path prose here would get silently mangled by that later pass;
+      // it must run AFTER it instead, once the `@`-include is in its final
+      // rewritten shape.
       const wrappedConverter = (content: string, skillName: string): string =>
         realConverter(content, skillName, runtime, cmdNames, isGlobal);
       return stageSkillsForRuntimeAsSkills(findInstallSourceRoot(configDir), resolved, wrappedConverter, prefix, nested, capabilityRegistry);
@@ -540,7 +606,11 @@ function dispatchKindEntry(entry: ArtifactKindDescriptor, runtime: string, confi
       );
   }
 
-  if (scope === 'global' && typeof entry.home === 'string' && entry.home !== '') {
+  // scope is guaranteed 'local' | 'global' here: resolveRuntimeArtifactLayoutFromRegistry
+  // (the only caller of dispatchKindEntry) throws TypeError before this point if scope is
+  // anything else (see the `scope !== 'local' && scope !== 'global'` guard above its
+  // dispatchKindEntry call), so isGlobalScope's throw-on-invalid-input never fires here.
+  if (isGlobalScope(scope) && typeof entry.home === 'string' && entry.home !== '') {
     result.home = path.join(os.homedir(), entry.home);
   }
 
@@ -592,5 +662,287 @@ function resolveRuntimeArtifactLayoutFromRegistry(
   return { runtime, configDir, scope, kinds };
 }
 
+// ---------------------------------------------------------------------------
+// resolveTriggerSurface (#2871 Phase 2)
+// ---------------------------------------------------------------------------
+//
+// Widens this module from PLACEMENT (resolveRuntimeArtifactLayout, above —
+// untouched, still 7 callers) to TRIGGER resolution: "what does a user type"
+// rather than "where does a file land". A new function, not a widened
+// signature — see .gsd/phase/feat-2871-trigger-resolution/40-design.md.
+//
+// Only `commands` and `skills` are trigger-bearing. `agents` / `kimi-agents`
+// are a SEPARATE dispatch interface point (subagent invocation via
+// `subagent_type` / named dispatch, never a `/gsd-<name>` a user types) — see
+// 40-design.md's "agents are not trigger-bearing" correction to ADR-2866.
+// Excluding them here is deliberate, not an oversight: including `agents`
+// would misreport windsurf (whose global scope emits agents only) as fully
+// shadowing its local `/gsd-*` surface, when in fact nothing shadows it.
+
+/** The trigger-bearing subset of ArtifactKindName — mirrors
+ *  VALID_TRIGGER_PRECEDENCE_KINDS in capability-validator.cjs (kept as two
+ *  literal-typed surfaces rather than importing a runtime Set into a type
+ *  position; tests assert the two vocabularies parity-match via
+ *  DEFAULT_TRIGGER_PRECEDENCE). */
+type TriggerKindName = 'commands' | 'skills';
+
+/** 'direct': the host itself registers this trigger. 'via-router': only the
+ *  owning router is registered by the host; this trigger is reachable
+ *  because the router's body was rewritten to `Read` it (#69 nested-skill
+ *  bundles — install-profiles.cts:714-723). See 40-design.md's "Nested-router
+ *  children" section for why a boolean cannot carry this distinction.
+ *
+ *  Not `export`ed: matches this file's existing house style (`Layout`,
+ *  `ArtifactKind`, etc. are internal types too) — `export =` at the bottom
+ *  of this module is its sole export surface, and mixing it with named type
+ *  exports is unnecessary since the only external consumer of these shapes
+ *  is a plain-JS test file. */
+type TriggerRegistration = 'direct' | 'via-router';
+
+interface TriggerShadower {
+  kind: TriggerKindName;
+  scope: InstallScope;
+}
+
+interface TriggerSurface {
+  /** What the user types, e.g. `gsd-plan-phase`. Always `${prefix}${stem}` —
+   *  unaffected by the destPath branch below (see `destPath`). */
+  trigger: string;
+  kind: TriggerKindName;
+  scope: InstallScope;
+  /** Where the artifact is staged, mirroring `_copyStaged`'s actual write
+   *  (`install-engine.cts:404-493`) INCLUDING its `namespacedByDir` branch
+   *  (~L464-466): a `commands` kind whose `destSubpath` basename equals
+   *  `prefix` minus its trailing hyphen is written bare (no prefix on the
+   *  filename) because the directory itself is the namespace. */
+  destPath: string;
+  registration: TriggerRegistration;
+  /** The owning router's trigger string, only when `registration ===
+   *  'via-router'`; `null` otherwise (including for the router's own entry —
+   *  a router has no router of its own). */
+  routerTrigger: string | null;
+  /** The winning sibling entry for this SAME trigger, or `null` when this
+   *  entry is itself unshadowed (including when it is the only candidate).
+   *  Reported as a fact, never a defect — see 40-design.md's "Not-corruption"
+   *  section: same-kind shadowing across scopes is the healthy, expected
+   *  state for every both-scope runtime. */
+  shadowedBy: TriggerShadower | null;
+}
+
+interface TriggerSurfaceOpts {
+  /** Source command/skill stems present for this call, shared across every
+   *  trigger-bearing kind entry — mirrors ResolvedProfile's flat stem
+   *  membership at staging time (install-profiles.cts). */
+  stems: string[];
+  /** Subset of `stems` that are namespace routers (nested-router runtimes
+   *  only, #69). Absent or empty ⇒ no nested-router distinction is made —
+   *  every stem resolves `registration: 'direct'`, matching the caller's own
+   *  choice not to supply router membership. */
+  routerStems?: string[];
+  /** Concrete stem -> owning router stem(s); mirrors
+   *  buildNamespaceBundleMap's childToRouters shape. Only consulted for a
+   *  stem that is NOT itself in `routerStems`, on a `nesting: 'nested'` kind
+   *  entry. The first named router is used. */
+  childToRouters?: Record<string, string[]>;
+  /** Registry override — the SAME seam resolveRuntimeArtifactLayoutFromRegistry
+   *  already exposes. Lets a synthetic descriptor be exercised without
+   *  touching the real capability-registry. */
+  registry?: TriggerRegistryLike;
+}
+
+interface RuntimeDescriptorForTriggers {
+  artifactLayout?: ArtifactLayoutDescriptor;
+  /** Ordered kind precedence, highest priority first (#2871 Phase 2). Absent
+   *  ⇒ capability-validator.cjs's DEFAULT_TRIGGER_PRECEDENCE applies — see
+   *  `getDefaultTriggerPrecedence` below. */
+  triggerPrecedence?: string[];
+}
+
+interface TriggerRegistryLike {
+  runtimes: Record<string, { runtime?: RuntimeDescriptorForTriggers }>;
+}
+
+function getTriggerRegistry(): TriggerRegistryLike {
+  return _require('./capability-registry.cjs') as TriggerRegistryLike;
+}
+
+/**
+ * capability-validator.cjs is a COMMITTED plain .cjs (not built from a .cts
+ * source — see its own header comment), so it is required the same way
+ * capability-registry.cjs is above: a lazy `_require` rather than a static
+ * ES import. DEFAULT_TRIGGER_PRECEDENCE is the single source of truth for
+ * "what applies when a descriptor omits triggerPrecedence"; this module
+ * reads it rather than re-declaring `['skills', 'commands']` as a second
+ * literal that could silently drift from the validator's own default.
+ */
+function getDefaultTriggerPrecedence(): string[] {
+  const capValidator = _require('./capability-validator.cjs') as { DEFAULT_TRIGGER_PRECEDENCE: string[] };
+  return capValidator.DEFAULT_TRIGGER_PRECEDENCE;
+}
+
+/**
+ * True when a `commands` kind entry is namespaced by its destination
+ * directory rather than by a filename prefix — i.e. `destSubpath`'s basename
+ * equals `prefix` with its trailing hyphen stripped (e.g. `commands/gsd` +
+ * `gsd-`). When true, `_copyStaged` (`install-engine.cts`) and `surface.cts`
+ * both write the bare stem filename (no prefix) because the directory itself
+ * already carries the namespace; `resolveTriggerSurface` mirrors that in its
+ * own `destPath` computation. Single source of truth for the three sites
+ * that used to compute this independently (#2871 Phase 2 review finding) —
+ * a new caller MUST reuse this rather than re-deriving the rule.
+ */
+function isNamespacedByDir(kind: string, destSubpath: string, prefix: string): boolean {
+  const destLast = path.posix.basename(posixNormalize(destSubpath));
+  const prefixStem = prefix ? prefix.replace(/-$/, '') : '';
+  return kind === 'commands' && destLast === prefixStem;
+}
+
+/**
+ * Compose the destination filename `_copyStaged` (install-engine.cts) writes
+ * for a `commands` kind entry, given `isNamespacedByDir`'s result, the
+ * kind's prefix, and the file's `.md`-stripped stem. Single source of truth
+ * alongside `isNamespacedByDir` for the FILENAME COMPOSITION itself (#2871
+ * Phase 2 review finding — the boolean was single-sourced first, but the
+ * `${stem}.md` / `${prefix}${stem}.md` string-building around it stayed
+ * duplicated between `_copyStaged` and `resolveTriggerSurface`'s `destPath`
+ * prediction below, so a divergence in the write convention would not have
+ * failed anything).
+ *
+ * Byte-identical to `_copyStaged`'s prior separate branches: when
+ * `namespacedByDir` is true this returns `${stem}.md`. `_copyStaged` always
+ * derives `stem` as `entry.name.slice(0, -3)` for an `entry.name` that has
+ * already been filtered to end in `.md`, so `${stem}.md` is always exactly
+ * `entry.name` again — `_copyStaged` can pass this helper's result in place
+ * of the `entry.name` it used to write directly, with no behavior change.
+ */
+function composeCommandFilename(namespacedByDir: boolean, prefix: string, stem: string): string {
+  return namespacedByDir ? `${stem}.md` : `${prefix}${stem}.md`;
+}
+
+/**
+ * True when candidate `a` should win over the current best `b` for the same
+ * trigger. Scope rank first (Phase 1's `install-scope.cts#scopeRank` —
+ * global outranks local; NOT re-derived here), then the runtime's
+ * `triggerPrecedence` kind ordering (lower index = higher priority). A kind
+ * absent from `precedenceRank` (should not happen — every entry's kind is
+ * validated against the same closed vocabulary the precedence list draws
+ * from) sorts last rather than throwing, so a malformed precedence value
+ * degrades to "leaves the incumbent standing" instead of corrupting the
+ * whole resolution.
+ */
+function isHigherPriority(a: TriggerSurface, b: TriggerSurface, precedenceRank: Map<string, number>): boolean {
+  const rankA = scopeRank(a.scope);
+  const rankB = scopeRank(b.scope);
+  if (rankA !== rankB) return rankA > rankB;
+  const pa = precedenceRank.get(a.kind) ?? Number.POSITIVE_INFINITY;
+  const pb = precedenceRank.get(b.kind) ?? Number.POSITIVE_INFINITY;
+  return pa < pb;
+}
+
+/**
+ * Resolve the `/gsd-<name>`-style trigger surface for a runtime: what the
+ * user types, at which scope, whether it wins or is shadowed, and (for
+ * nested-router runtimes) whether the host registers it directly or only
+ * reaches it through a router. Pure — no filesystem, no mutation of `scopes`
+ * or `opts`, and safe against a caller mutating the returned array/objects
+ * (a fresh array/objects are built on every call; nothing is cached or
+ * shared across calls beyond the read-only registry module).
+ *
+ * Only `commands` and `skills` kind entries are considered — see the
+ * module-level comment above. `resolveRuntimeArtifactLayout` is untouched by
+ * this function; they are independent readers of the same descriptor.
+ *
+ * @throws {TypeError} for an unknown runtime — same contract (and message
+ *   shape) as `resolveRuntimeArtifactLayoutFromRegistry`.
+ * @throws {TypeError} for an unrecognized entry in `scopes` — reuses
+ *   `install-scope.cts`'s shared `validateScopeId`, the same validator
+ *   `scopeRank`/`resolveScope`/`isGlobalScope` already throw through, so this
+ *   sibling of theirs cannot silently fail open on a bad scope (#2871 Phase 2
+ *   review finding). `scopes: []` is untouched — an empty array has no
+ *   entries to validate and still resolves to `[]`.
+ */
+function resolveTriggerSurface(runtime: string, scopes: InstallScope[], opts: TriggerSurfaceOpts): TriggerSurface[] {
+  const registry = opts.registry ?? getTriggerRegistry();
+  const runtimeDescriptor = registry.runtimes[runtime]?.runtime;
+  const layout = runtimeDescriptor?.artifactLayout;
+  if (!layout) {
+    throw new TypeError(`Unknown runtime: '${runtime}' — add to runtime-artifact-layout.cjs table`);
+  }
+
+  for (const scope of scopes) {
+    validateScopeId(scope, 'resolveTriggerSurface');
+  }
+
+  const scopeSet = new Set(scopes);
+  const stems = opts.stems ?? [];
+  const routerStemSet = new Set(opts.routerStems ?? []);
+  const childToRouters = opts.childToRouters ?? {};
+  const precedence = runtimeDescriptor?.triggerPrecedence ?? getDefaultTriggerPrecedence();
+  const precedenceRank = new Map(precedence.map((kind, index) => [kind, index]));
+
+  const surfaces: TriggerSurface[] = [];
+
+  for (const scope of SCOPE_ORDER) {
+    if (!scopeSet.has(scope)) continue;
+    const entries = layout[scope] ?? [];
+    for (const entry of entries) {
+      if (entry.kind !== 'commands' && entry.kind !== 'skills') continue; // excludes agents/kimi-agents
+      const kind = entry.kind;
+      const destSubpath = posixNormalize(entry.destSubpath);
+      const namespacedByDir = isNamespacedByDir(kind, entry.destSubpath, entry.prefix);
+      const nested = entry.nesting === 'nested';
+
+      for (const stem of stems) {
+        const trigger = `${entry.prefix}${stem}`;
+        let destPath: string;
+        if (kind === 'skills') {
+          destPath = `${destSubpath}/${entry.prefix}${stem}`;
+        } else {
+          destPath = `${destSubpath}/${composeCommandFilename(namespacedByDir, entry.prefix, stem)}`;
+        }
+
+        let registration: TriggerRegistration = 'direct';
+        let routerTrigger: string | null = null;
+        if (nested && routerStemSet.size > 0 && !routerStemSet.has(stem)) {
+          const owningRouters = childToRouters[stem];
+          const routerStem = owningRouters && owningRouters.length > 0 ? owningRouters[0] : undefined;
+          if (routerStem !== undefined && routerStemSet.has(routerStem)) {
+            registration = 'via-router';
+            routerTrigger = `${entry.prefix}${routerStem}`;
+          }
+        }
+
+        surfaces.push({ trigger, kind, scope, destPath, registration, routerTrigger, shadowedBy: null });
+      }
+    }
+  }
+
+  // Winner computation, per trigger string, across every scope/kind candidate.
+  const groups = new Map<string, TriggerSurface[]>();
+  for (const surface of surfaces) {
+    const group = groups.get(surface.trigger);
+    if (group) {
+      group.push(surface);
+    } else {
+      groups.set(surface.trigger, [surface]);
+    }
+  }
+  for (const group of groups.values()) {
+    if (group.length <= 1) continue; // sole candidate: unshadowed by construction
+    let winner = group[0];
+    for (let i = 1; i < group.length; i++) {
+      const candidate = group[i];
+      if (isHigherPriority(candidate, winner, precedenceRank)) winner = candidate;
+    }
+    for (const surface of group) {
+      if (surface !== winner) {
+        surface.shadowedBy = { kind: winner.kind, scope: winner.scope };
+      }
+    }
+  }
+
+  return surfaces;
+}
+
 // getInstallExports removed in ADR-1508 / #1511 Phase 2 (last upward .cts→install.js dep).
-export = { resolveRuntimeArtifactLayout, resolveRuntimeArtifactLayoutFromRegistry, findInstallSourceRoot };
+export = { resolveRuntimeArtifactLayout, resolveRuntimeArtifactLayoutFromRegistry, findInstallSourceRoot, resolveTriggerSurface, isNamespacedByDir, composeCommandFilename };

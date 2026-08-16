@@ -141,11 +141,28 @@ interface GenericAgentsRootDescriptor {
   skillsHome?: ConfigHomeDescriptor;
 }
 
-type ConfigHomeDescriptor =
+/**
+ * #2103: a runtime with NO file-projected config directory at all (e.g.
+ * vscode — Marketplace/VSIX extension, `installSurface: 'none'`). There is
+ * no directory to resolve, so this descriptor kind is deliberately excluded
+ * from `resolveConfigHomeFromDescriptor`'s directory-resolving switch (see
+ * that function's 'none' case, which throws rather than silently falling
+ * through). Callers that need a nullable result (e.g. `getGlobalSkillsBase`)
+ * must check `configHome.kind === 'none'` themselves before resolving.
+ */
+interface NoneDescriptor {
+  kind: 'none';
+  name: string;
+  env: string[];
+  skillsHome?: ConfigHomeDescriptor;
+}
+
+export type ConfigHomeDescriptor =
   | DotHomeDescriptor
   | DotHomeNestedDescriptor
   | XdgDescriptor
-  | GenericAgentsRootDescriptor;
+  | GenericAgentsRootDescriptor
+  | NoneDescriptor;
 
 interface RuntimeArtifactKindDescriptor {
   kind: string;
@@ -175,6 +192,57 @@ function getRegistry(): { runtimes: Record<string, { runtime?: RuntimeDescriptor
   return require('./capability-registry.cjs') as {
     runtimes: Record<string, { runtime?: RuntimeDescriptor }>;
   };
+}
+
+/**
+ * Legacy runtime ids that have a genuine, dedicated resolution branch
+ * elsewhere in this module but no capability-registry descriptor (#3024
+ * review BLOCKER, finding 1).
+ *
+ * `isRegisteredRuntimeId`'s real contract is "does this id resolve to a
+ * real, runtime-specific path?", not "is it a key in the registry map".
+ *
+ * On this fork, `grok` is a first-class registry runtime
+ * (`capabilities/grok/capability.json` → `~/.grok` / `GROK_HOME`). It must
+ * not appear here: install/sync-skills parity tests fail if a registry id
+ * is re-listed. A hardcoded `getGlobalConfigDir('grok')` fallback remains
+ * below only for the case where the generated registry is missing (early
+ * local Grok experiments also honored `GROK_AGENTS_HOME` → `~/.agents`).
+ *
+ * This set is enumerated by hand. Add an id only after confirming
+ * `getGlobalConfigDir` has a real dedicated branch for it AND it is not
+ * already a registry key. Empty is valid when every dedicated branch is
+ * also a registry runtime.
+ */
+export const LEGACY_NON_REGISTRY_RUNTIME_IDS: ReadonlySet<string> = new Set();
+
+/**
+ * True when `runtime` is a real runtime id with a genuine, runtime-specific
+ * resolution path — either a registered id in the capability registry
+ * (`capability-registry.cjs`'s `runtimes` object) or one of the small,
+ * explicitly named `LEGACY_NON_REGISTRY_RUNTIME_IDS` set (currently empty
+ * on this fork; `grok` is a registry runtime) that resolves via a dedicated
+ * hardcoded branch instead of a registry descriptor.
+ *
+ * Guarded with an own-property lookup — never a bare index — so a
+ * prototype-chain id (`__proto__`, `constructor`, `prototype`, `toString`,
+ * …) can never resolve to an inherited value and be mistaken for a real
+ * entry. Without this, `getGlobalSkillsBase`/`getGlobalConfigDir`'s bare
+ * `runtimes[runtime]` lookups fall through the prototype chain for those
+ * ids, find no usable descriptor, and silently resolve to claude's
+ * fallback path instead of failing loudly (#3024).
+ *
+ * Single shared validator for every `--skills-root` entry point
+ * (`gsd-tools query skills-root`'s `routeSkillsRoot`, `install.js
+ * --skills-root`) so the two surfaces can never diverge on which runtime
+ * ids they accept.
+ */
+export function isRegisteredRuntimeId(runtime: unknown): boolean {
+  if (typeof runtime !== 'string') return false;
+  const trimmed = runtime.trim();
+  if (!trimmed) return false;
+  if (Object.prototype.hasOwnProperty.call(getRegistry().runtimes, trimmed)) return true;
+  return LEGACY_NON_REGISTRY_RUNTIME_IDS.has(trimmed);
 }
 
 /**
@@ -271,6 +339,20 @@ export function resolveConfigHomeFromDescriptor(
       }
       // fallback: first probe candidate
       return expandTilde(configHome.probe[0], home);
+    }
+
+    case 'none': {
+      // #2103: no file-projected config directory exists for this runtime
+      // (e.g. vscode). Previously this kind had no matching case, so the
+      // switch fell through and implicitly returned `undefined` — which
+      // then crashed a downstream `path.join(undefined, ...)` with a
+      // cryptic `TypeError [ERR_INVALID_ARG_TYPE]` far from the real cause.
+      // Throwing here makes the failure mode explicit; callers that need a
+      // nullable result (getGlobalSkillsBase) check `configHome.kind` and
+      // short-circuit BEFORE ever reaching this function.
+      throw new Error(
+        `Runtime "${configHome.name}" has no config-home directory (configHome.kind === "none")`,
+      );
     }
   }
 }
@@ -393,6 +475,76 @@ export function resolveKimiGlobalDir(opts: ResolveKimiOpts = {}): string {
 }
 
 /**
+ * Kimi CLI's own native config.toml home. Hoisted out of resolveKimiHooksTomlDir
+ * so it is ENUMERABLE, not merely resolvable.
+ *
+ * #2665 round 3: a config-location var that lives only inside a function body is
+ * invisible to every consumer that needs the SET rather than the path — the test
+ * scrub list and the hermeticity guard both derive from descriptors, and this one
+ * reached neither. `kimi` is the sharp case precisely because it owns TWO config
+ * homes: KIMI_CONFIG_DIR (registry-visible, already covered) and KIMI_SHARE_DIR
+ * (this one), so a derivation keyed only on the registry looks complete and is not.
+ */
+export const KIMI_HOOKS_TOML_DESCRIPTOR: DotHomeDescriptor = {
+  kind: 'dot-home',
+  name: '.kimi',
+  env: ['KIMI_SHARE_DIR'],
+};
+
+/**
+ * Kimi Code's native config.toml home — the `kimi-code` counterpart of the
+ * descriptor above, hoisted for exactly the same reason.
+ *
+ * #2755 landed kimi-code hooks support on `next` while this PR was open, and
+ * declared this descriptor as an inline object literal inside
+ * resolveKimiHooksTomlDir's body — the same resolvable-but-not-enumerable shape
+ * round 3 hoisted KIMI_SHARE_DIR out of. Hoisting it puts `KIMI_CODE_HOME` into
+ * the derived scrub set and the hermeticity guard's watch roots in the SAME
+ * commit, which is the property NON_REGISTRY_CONFIG_HOME_DESCRIPTORS exists to
+ * guarantee. Each product's env var stays scoped to that product (#2755).
+ */
+export const KIMI_CODE_HOOKS_TOML_DESCRIPTOR: DotHomeDescriptor = {
+  kind: 'dot-home',
+  name: '.kimi-code',
+  env: ['KIMI_CODE_HOME'],
+};
+
+/**
+ * Config-home descriptors resolved OUTSIDE the capability registry.
+ *
+ * Anything added here is picked up by every derived consumer in the same commit —
+ * which is the property that makes the derivation structurally incapable of being
+ * narrower than the surface it guards. Adding a hardcoded resolver WITHOUT adding
+ * its descriptor here is the defect this array exists to make hard.
+ */
+export const NON_REGISTRY_CONFIG_HOME_DESCRIPTORS: ConfigHomeDescriptor[] = [
+  KIMI_HOOKS_TOML_DESCRIPTOR,
+  KIMI_CODE_HOOKS_TOML_DESCRIPTOR,
+];
+
+/**
+ * GSD's OWN location vars — a second family, not runtime configHomes.
+ *
+ * #2665 round 3: the registry describes where each *third-party runtime* keeps its
+ * config. It says nothing about where GSD keeps its own user-owned state, and that
+ * is a separate env-first surface:
+ *
+ *   GSD_HOME       — `process.env['GSD_HOME'] || os.homedir()`, the root of
+ *                    `$GSD_HOME/.gsd/` (consent.json, defaults.json, capability
+ *                    overlays). Read env-first by capability-loader, capability-consent,
+ *                    capability-state, capability-writer, config-loader, install-profiles
+ *                    and bin/install.js. A WRITE surface.
+ *   GSD_AGENTS_DIR — `if (process.env['GSD_AGENTS_DIR']) return it`, priority 1 in
+ *                    getAgentsDir. Misdirects a READ rather than a write, hence lower
+ *                    severity — but it is env-first and unconditional, so it belongs
+ *                    to the same class.
+ *
+ * Deliberately NOT folded into the descriptor array above: these do not resolve
+ * through resolveConfigHomeFromDescriptor and have no `kind`/`name` shape.
+ */
+export const GSD_LOCATION_ENV_KEYS: readonly string[] = ['GSD_HOME', 'GSD_AGENTS_DIR'];
+
+/**
  * Resolve the directory holding the Kimi product's OWN native config.toml —
  * the file that product itself reads for providers/models/hooks/etc, and the
  * one GSD writes its `[[hooks]]` block, hooks bundle and CommonJS marker into.
@@ -429,8 +581,8 @@ export function resolveKimiHooksTomlDir(opts: ResolveKimiHooksTomlOpts = {}): st
   // value originates from argv, and an index would resolve inherited keys
   // (`constructor`, `__proto__`) to something that is not a descriptor.
   const descriptor: DotHomeDescriptor = opts.runtime === 'kimi-code'
-    ? { kind: 'dot-home', name: '.kimi-code', env: ['KIMI_CODE_HOME'] }
-    : { kind: 'dot-home', name: '.kimi', env: ['KIMI_SHARE_DIR'] };
+    ? KIMI_CODE_HOOKS_TOML_DESCRIPTOR
+    : KIMI_HOOKS_TOML_DESCRIPTOR;
   return resolveConfigHomeFromDescriptor(descriptor, { env, home });
 }
 
@@ -487,6 +639,16 @@ export function resolveSkillsBaseFromDescriptor(
 export function getGlobalSkillsBase(runtime: string): string | null {
   const runtimeEntry = getRegistry().runtimes[runtime];
   const descriptor = runtimeEntry?.runtime;
+  // #2103: a runtime with `configHome.kind === 'none'` (e.g. vscode —
+  // Marketplace/VSIX extension, installSurface:'none') has no file-projected
+  // config directory at all, and therefore no skills root. Short-circuit to
+  // null BEFORE falling through to getGlobalConfigDir below, which would
+  // otherwise throw resolving a 'none' configHome (see
+  // resolveConfigHomeFromDescriptor's 'none' case). null is the correct
+  // answer here, not a crash — the `=== null` guard at every call site
+  // (bin/install.js --skills-root, gsd-tools routeSkillsRoot) already
+  // handles it as "this runtime does not use a skills directory".
+  if (descriptor?.configHome?.kind === 'none') return null;
   const globalSkillsKind = descriptor?.artifactLayout?.global?.find((entry) => entry.kind === 'skills');
   // ADR-1239 upgrade 3 (#2088): honor a skills-kind `home` override (e.g. Codex
   // → $HOME/.agents/skills, independent of $CODEX_HOME) so the reported skills

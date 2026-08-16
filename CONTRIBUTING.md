@@ -147,12 +147,21 @@ If you target the wrong branch by accident, the `PR Target Validator`
 workflow will post a comment with the one-line fix (click "Edit" by the PR
 title and change the base branch — no need to recreate the PR).
 
-**Why this matters:** Under the old single-branch model, every PR required
-rebasing onto `main` because branch protection required "up-to-date before
-merging" and `main` moved on every merge. With `next` as the integration
-branch and that flag disabled on `next`, concurrent PRs can merge in any
-order as long as they don't conflict on the same lines. The rebase
-treadmill is gone for the 95% case.
+**Why this matters:** Under the old single-branch model, every PR rebased onto
+`main`, which moved on every merge. `next` moves far less often — only when
+another PR to `next` lands — so in practice you rebase much less.
+
+**But `next` does still require "up-to-date before merging".** Branch
+protection has `required_status_checks.strict = true`; check it yourself with
+`gh api repos/open-gsd/gsd-core/branches/next/protection --jq '.required_status_checks.strict'`.
+If another PR lands while yours is open, yours goes `BEHIND` and must be
+rebased before it can merge.
+
+Budget for that, because the rebase is not free here: **it changes your HEAD
+sha, which invalidates the sha-bound pass marker the push gate reads**, so a
+rebase means re-running the full remote verification and another CI cycle
+before the gate clears again. Rebase *last* — immediately before you push for
+review — rather than paying for a verification you are about to discard.
 
 ---
 
@@ -180,10 +189,13 @@ Contributor requirements (summary):
 - **No draft PRs** — draft PRs are automatically closed. Only open a PR when it is complete, tested, and ready for review. If your work is not finished, keep it on your local branch until it is.
 - **Use the correct PR template** — there are separate templates for [Fix](.github/PULL_REQUEST_TEMPLATE/fix.md), [Enhancement](.github/PULL_REQUEST_TEMPLATE/enhancement.md), and [Feature](.github/PULL_REQUEST_TEMPLATE/feature.md). Using the wrong template or using the default template for a feature is a rejection reason.
 - **Link with a closing keyword** — use `Closes #123`, `Fixes #123`, or `Resolves #123` in the PR body. The CI check will fail and the PR will be auto-closed if no valid issue reference is found.
+  - **Test-only and docs-only follow-up PRs may reference without closing.** If your PR is documentation or regression coverage only — say, a repo-wide guard for a fix that already shipped — and there is no open issue for it to close, use a non-closing reference instead: `Refs #123`. `Ref`, `Refs`, `References`, `Relates to`, `Related to`, and `Follow-up to` are all accepted in that position. Do **not** write a closing keyword against an already-closed issue to satisfy the check; on merge it closes nothing, and it trains readers to treat closing keywords as decorative.
+  - **Qualifying diff shape:** every changed file must be under `tests/`, under `docs/`, or a root-level `*.md` (`README.md`, `CONTRIBUTING.md`, …). This mirrors the doc-only classification the push gate already uses, and it is deliberately root-only — markdown under a subdirectory (`gsd-core/workflows/*.md`, `agents/*.md`, `commands/**/*.md`) is runtime-loaded text, not documentation, so it still requires a closing keyword. `CHANGELOG.md` is excluded too: edit it through a `.changeset/` fragment, never directly.
+  - This weaker form is accepted **only** for that diff shape. A PR touching anything else still needs a closing keyword, and a PR with no issue reference at all still fails. On a very large PR (more than 100 changed files) the check cannot confirm the diff shape and falls back to requiring a closing keyword.
 - **One concern per PR** — bug fixes, enhancements, and features must be separate PRs
 - **No drive-by formatting** — don't reformat code unrelated to your change
 - **Don't bundle test-fixture updates into `docs:` or unrelated commits** — when a production change makes an existing test assertion stale, the test correction MUST land as its own `test:` (or `fix:`) commit, not bundled into a `docs:` commit that also updates the explanation. The release-sdk hotfix cherry-pick filter routes by commit-subject prefix (`fix:`, `chore:`, `test:`); a test-fixture correction packed under a `docs:` prefix is invisible to the picker and ships a half-state to the hotfix branch — production code changed, test assertion stale. v1.42.3 hit this exact mode (#3621). The fix is upstream: keep the test-fixture commit separate.
-- **CI must pass** — all configured matrix jobs must be green. Node 22 remains the compatibility floor; Node 24 is the primary target; Node 26 compatibility must be preserved for code and tests even when a Node 26 CI lane is not yet available.
+- **CI must pass** — all configured matrix jobs must be green. Node 24 is the compatibility floor and primary target; Node 26 compatibility must be preserved for code and tests even when a Node 26 CI lane is not yet available.
 - **Scope matches the approved issue** — if your PR does more than what the issue describes, the extra changes will be asked to be removed or moved to a new issue
 
 ## CHANGELOG Entries — Drop a Fragment
@@ -468,6 +480,30 @@ const r = runNode([BUILD_SCRIPT], { timeoutMs: BUILD_TIMEOUT_MS });
 throwIfFailed(r, 'build-hooks.js (before install tests)');
 ```
 
+#### When you want the legacy shape without a throw: `toLegacyResult`
+
+Some call sites never wanted a throw in the first place — they already branch on exit status as
+data, reading `.status`/`.stdout`/`.stderr` off the result themselves. Those still need the seam's
+`exitCode` renamed to the legacy `status` field their assertions expect. Use `toLegacyResult`
+instead of hand-rolling the three-line mapping — ~8 test files did exactly that independently
+before this export existed (#3147):
+
+```javascript
+const { toLegacyResult } = require('./helpers/git-fixture.cjs');
+
+function runLint(args = []) {
+  const r = runNode([LINT_SCRIPT, ...args], { timeoutMs: PROBE_TIMEOUT_MS });
+  return toLegacyResult(r); // { status, stdout, stderr }
+}
+```
+
+It is a bare mapping and nothing more. If your call site needs an extra field beyond that shape (a
+parsed-JSON body, a fixture-specific path alongside the result), compose it rather than extending
+the helper: `{ ...toLegacyResult(result), extra }`. And if your site's return shape genuinely
+diverges from `{ status, stdout, stderr }` — e.g. it substitutes a parsed report object for raw
+`stdout` — leave it as its own local mapping; forcing every result-reshaping helper onto one shared
+function is the same drift `toLegacyResult` exists to prevent, just in the other direction.
+
 #### The lint rule that enforces it
 
 `local/no-unbounded-spawn` (`eslint-rules/no-unbounded-spawn.cjs`) fails any `spawnSync`,
@@ -501,10 +537,16 @@ escape only ever raises the ceiling for a call that already resolves to a numeri
 never waives the requirement for a bound. A marked call with no `timeout` at all still reports
 `unboundedSpawn`.
 
-`eslint-rules/no-unbounded-spawn.allowlist.json` grandfathers files that predate the rule. It only
-ratchets **down**: once a file is clean, the rule reports its allowlist line as stale and you delete
-it. Never add an entry, and never reach for `eslint-disable` on this rule — a test asserts that no
-such comment exists.
+There is no allowlist. `eslint-rules/no-unbounded-spawn.allowlist.json` grandfathered files that
+predated the rule; the epic that introduced it (#3064) migrated every site across four waves and
+deleted the file in its terminal wave (#3148), so `local/no-unbounded-spawn` now runs with **no
+exemption surface** across `tests/**`. There is no file to add an entry to — fix the timeout at
+the call site instead. The only sanctioned escapes are an explicit `timeout` on a raw spawn (for a
+call shape the process seam cannot express, e.g. a `shell: true` invocation for `npm.cmd` on
+Windows, or `stdio` redirection to a real fd) and the `// allow-spawn-timeout-ceiling: <reason>`
+marker above for a bound over the 600000 ms ceiling. Never reach for `eslint-disable` on this rule
+— with the allowlist gone, that is the only remaining way to silence it, and a test asserts that no
+such comment exists anywhere under `tests/`.
 
 ### Test Structure
 
@@ -569,6 +611,8 @@ const content = `
 Happy-path tests are not enough for code that accepts user input, reads project files, writes to disk, shells out, generates artifacts, or builds prompts. New tests for those areas must include adversarial inputs and negative proof that unsafe behavior did not happen.
 
 See [`TEST-EXAMPLES.md`](TEST-EXAMPLES.md) for concrete demo tests that show these requirements in practice.
+
+**Standing rule for error/fallback branches:** feeding an adversarial input is not sufficient on its own — if the code degrades permissively instead of throwing, the test must assert the *specific* degraded verdict, not just that the call survived. See [`TESTING-STANDARDS.md` — "Standing rule: assert the degraded verdict"](TESTING-STANDARDS.md#standing-rule-assert-the-degraded-verdict-not-just-did-not-throw).
 
 Use this matrix when it applies to the changed surface:
 
@@ -751,19 +795,49 @@ Some tests legitimately read source files. There are six recognized categories:
 | `structural-implementation-guard` | A feature's interception or wiring point is not reachable end-to-end via `runGsdTools`. Used temporarily until a behavioral path exists. |
 | `pending-migration-to-typed-ir` | **Tracked for correction, not exempted.** Test was identified by the lint as carrying a raw-text-matching pattern that contradicts the rule above. Each annotated file MUST cite the open migration issue (e.g. `// allow-test-rule: pending-migration-to-typed-ir [#NNNN]`) so the tracking is auditable. New tests cannot use this category — they must refactor production to expose typed IR. The annotation is removed when the test is corrected. |
 
-Annotate with a standalone `//` comment before the file's opening block comment:
+**Suppression is site-scoped, not file-wide.** A marker suppresses only the violation it sits next
+to. Put it immediately above the flagged line — or trailing on that line — with nothing but blank
+lines and other comment lines in between, and no more than **8 lines** above it
+(`MAX_MARKER_LOOKAHEAD_LINES` in `eslint-rules/no-source-grep.cjs`). A single line of real code
+between the marker and the call ends the window, even when the two are physically close.
 
 ```javascript
-// allow-test-rule: architectural-invariant
-// state.cjs locking must use Atomics.wait(), not a spin-loop. Behavioral tests
-// cannot observe which sleep primitive was chosen — only source inspection can.
-
-/**
- * Regression tests for locking bugs #1909...
- */
+test('locking uses Atomics.wait, not a spin-loop', () => {
+  // allow-test-rule: architectural-invariant (#1909)
+  // state.cjs locking must use Atomics.wait(). Behavioral tests cannot observe
+  // which sleep primitive was chosen — only source inspection can.
+  const src = fs.readFileSync(STATE_PATH, 'utf8');
+  assert.ok(src.includes('Atomics.wait'));
+});
 ```
 
-The annotation **must** be a standalone `// allow-test-rule:` line, not inside a `/** */` block comment — the CI linter scans for the pattern `// allow-test-rule:`.
+A violation is a **read + search pair**, and a marker adjacent to *either* half suppresses it — so
+annotating the `readFileSync` directly (the intuitive placement) works just as well as annotating
+the `.includes()`.
+
+> **A marker parked at the top of the file no longer suppresses anything below it.** Before #3508
+> suppression was file-wide, so one justified exemption silently absolved every other source-grep
+> in that file — including ones added later by someone else. If you are copying the old
+> file-header placement from an existing test, it is almost certainly inert: the file's `require`
+> block sits between it and the code, and real code closes the window.
+
+The annotation **must** be a standalone `// allow-test-rule:` line — the marker text must be the
+first thing on its comment line (a leading JSDoc `*` is fine), not buried mid-sentence in prose.
+The reason **must** cite a tracking issue (`#NNN`) or an `https://` URL, per
+[ADR-456](docs/adr/456-test-rigor-architecture.md); `scripts/lint-allow-test-rule-refs.cjs` fails
+the build on an uncited one.
+
+That gate reports two separate numbers, and they mean different things:
+
+| Number | Meaning | Gated? |
+|---|---|---|
+| **Effective exemptions** | markers that actually suppress a violation the rule detects | tightly ratcheted — it may only go down |
+| **Unverified markers** | marker-bearing files where the rule detects nothing to suppress | tracked with a loose ceiling; growth fails, shrinkage never does |
+
+A marker landing in the *unverified* bucket does **not** mean it is vestigial and safe to delete —
+it usually means the rule cannot yet see the read (identifier indirection, a dynamic path, a `.sh`
+file). Shrinking that pool is a rule-coverage job backed by measurement, not a delete-the-markers
+job.
 
 ### Prohibited: Raw Text Matching on Test Outputs (file content, stdout, stderr)
 
@@ -827,17 +901,16 @@ For everything else, if a test reaches for `.includes()` / `.startsWith()` / `as
 
 ### Node.js Version Compatibility
 
-**Node 22 is the minimum supported version.** Node 24 is the primary CI target. Node 26 is the forward-compatibility target: do not add tests or production code that depend on deprecated behavior likely to fail there.
+**Node 24 is the minimum supported version.** Node 24 is also the primary CI target. Node 26 is the forward-compatibility target: do not add tests or production code that depend on deprecated behavior likely to fail there.
 
 | Version | Status |
 |---------|--------|
-| **Node 22** | Minimum required — Active LTS until October 2026, Maintenance LTS until April 2027 |
-| **Node 24** | Primary CI target — current Active LTS, all tests must pass |
+| **Node 24** | Minimum required and primary CI target — Active LTS, all tests must pass |
 | Node 26 | Forward-compatible target — avoid deprecated APIs and exact runtime-error prose |
 
 Do not use:
 - Deprecated APIs
-- APIs not available in Node 22
+- APIs not available in Node 24
 
 Safe to use:
 - `node:test` — stable since Node 18, fully featured in 24
@@ -888,13 +961,18 @@ This gives maintainers a faster, higher-confidence signal than CI-only validatio
 
 ### Pre-PR Seam Checks (Manifest/Alias Routing)
 
-If you touched any of the command-manifest or generated alias files, run:
+If you touched `src/command-aliases.cts` or any of the eight `src/*-command-router.cts`
+sources it feeds, run:
 
 ```bash
 npm run check:alias-drift
 ```
 
-This verifies generated alias artifacts are in sync with manifest source-of-truth.
+This verifies the built alias artifacts under `gsd-core/bin/lib/` agree with their
+source of truth — each family's `*_SUBCOMMANDS` list must match the `subcommand`
+values derived from its `*_COMMAND_ALIASES` table, in order, and each router must
+reference its own list. The surface is enumerated once in
+`scripts/lib/alias-drift-families.cjs`.
 
 ### Editing shipped content (gsd-core/workflows, references, templates, contexts, agents/, commands/gsd/)
 
@@ -963,60 +1041,83 @@ npm run regen:derived
 
 Optional local pre-commit hook entry (Git-native):
 
+`.githooks/pre-commit` is **committed** — you do not write it, you only point git at
+it. It runs `check:alias-drift` when you stage one of the tracked sources that check
+reads, and stays silent otherwise.
+
 ```bash
 # one-time setup
-mkdir -p .githooks
-cat > .githooks/pre-commit <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if git diff --cached --name-only | grep -Eq "^sdk/src/query/command-manifest\.|^sdk/src/query/command-aliases\.generated\.ts$|^gsd-core/bin/lib/command-aliases\.generated\.cjs$|^sdk/scripts/gen-command-aliases\.ts$"; then
-  npm run check:alias-drift
-fi
-EOF
-chmod +x .githooks/pre-commit
 git config core.hooksPath .githooks
 ```
 
+This is opt-in and stays that way: nothing in `npm install` sets `core.hooksPath` for
+you, so a fresh clone acquires no hooks. To stop using them, `git config --unset
+core.hooksPath`.
+
+Do not paste a copy of the hook body into your own `.githooks/pre-commit`. Bash cannot
+`require()` a CommonJS module, so the hook does carry the watched paths as literals —
+but `tests/precommit-alias-drift-hook.test.cjs` runs the real hook against every source
+derived from `scripts/lib/alias-drift-families.cjs` and fails in **both** directions: if
+the hook stops watching a source the checker reads, and if it keeps watching a router the
+checker dropped. A copy in your own tree has no such test behind it, and a hand-maintained
+copy is exactly what silently rotted the previous version of this recipe (#2725) — every
+path in it named the retired `sdk/` tree or a gitignored build output, so the guard
+matched nothing for months.
+
 Optional local pre-push hook to block a private author-email pattern:
+
+`.githooks/pre-push` is committed too, and is covered by the same
+`core.hooksPath` opt-in above. It is a no-op until you set the regex, so enabling
+hooks does not enable this check:
 
 ```bash
 # set locally in your shell profile (example)
-export GSD_BLOCKED_AUTHOR_REGEX='@example-corp\\.com$'
-
-cat > .githooks/pre-push <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-zero_sha='0000000000000000000000000000000000000000'
-blocked_regex="${GSD_BLOCKED_AUTHOR_REGEX:-}"
-[[ -z "$blocked_regex" ]] && exit 0
-violations=()
-
-while read -r local_ref local_sha remote_ref remote_sha; do
-  [[ "$local_sha" == "$zero_sha" ]] && continue
-  if [[ "$remote_sha" == "$zero_sha" ]]; then
-    commits=$(git rev-list "$local_sha" --not --remotes)
-  else
-    commits=$(git rev-list "$remote_sha..$local_sha")
-  fi
-  while read -r commit; do
-    [[ -z "$commit" ]] && continue
-    email=$(git show -s --format='%ae' "$commit" | tr '[:upper:]' '[:lower:]')
-    if printf '%s' "$email" | grep -Eq "$blocked_regex"; then
-      violations+=("$commit <$email>")
-    fi
-  done <<< "$commits"
-done
-
-if [[ ${#violations[@]} -gt 0 ]]; then
-  echo "Push blocked: commit author email matched local blocked regex ($blocked_regex)." >&2
-  printf '  - %s\n' "${violations[@]}" >&2
-  exit 1
-fi
-EOF
-chmod +x .githooks/pre-push
+export GSD_BLOCKED_AUTHOR_REGEX='@example-corp\.com$'
 ```
+
+With that exported, a push carrying a commit whose author email matches is blocked,
+and the hook names the offending commits. Unset the variable to disable it.
+
+### Every `commit` invocation in shipped content must declare `--files`
+
+`tests/commit-files-pathspec.test.cjs` scans every `.md` under `gsd-core/workflows/`,
+`gsd-core/references/`, `agents/`, `commands/`, `skills/` and `docs/` for invocations of
+the `commit` seam, and fails if any of them reaches the runtime without a `--files`
+scope. An unscoped invocation lands on the blanket-stage default and sweeps the whole
+`.planning/` index into a commit whose message names one artifact — that is [#2269](https://github.com/open-gsd/gsd-core/issues/2269),
+and `cmdCommit` is a CRITICAL-blast-radius seam, so the guard is repo-wide rather than
+keyed to the three sites that were reported.
+
+The scan decides what is an invocation by **command shape**, not by the markup around
+it — a fenced block, an indented block, a `cd … &&` prefix and a bare line are all
+scanned alike, because 96 of the live invocations sit inside fences and exempting them
+would blind the guard to every site the issue was filed about. Two consequences you may
+hit while editing shipped content, and the failure output names both:
+
+**A prose mention that runs into its sentence is flagged.** Nothing distinguishes
+`gsd_run query commit` followed by ordinary words from an invocation with arguments
+without guessing at English, so the scan does not try. Write the command reference in
+backticks — the repo's own convention — and it is correctly read as a mention.
+
+**A deliberate wrong-example must declare itself.** An example that *shows* the unscoped
+form is byte-identical to a regression, so no property of the surrounding markup can
+stand in for your intent. Declare it on the invocation's own line, in shell-comment
+position:
+
+```
+gsd_run query commit "docs: message"   # gsd-scan-ignore: #2269 counter-example for the docs
+```
+
+That block is a live example of itself: the invocation above really is unscoped, and it
+is the declaration — not the fence around it — that keeps the scan quiet.
+
+The reason **must** name a tracking issue (`#NNN`) or an `http(s)://` URL, exactly as
+[ADR-456](docs/adr/456-test-rigor-architecture.md) requires of the sibling
+`allow-test-rule:` marker — an exemption with no ledger never gets revisited. A marker
+with a free-text reason is reported as a malformed declaration rather than as an unscoped
+commit, so you are told which of the two problems you actually have. A marker that
+survives shell tokenization as an *argument* declares nothing: it reached argv, which
+means the runtime executed the line.
 
 ### CI Test Quality Checks
 
