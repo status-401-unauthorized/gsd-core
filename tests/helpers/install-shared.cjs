@@ -80,6 +80,11 @@ const RUNTIME_META = {
   trae:         { localDir: '.trae',             globalSuffix: '.trae' },
   windsurf:     { localDir: '.windsurf',          globalSuffix: path.join('.codeium', 'windsurf') },
   zcode:        { localDir: '.zcode',             globalSuffix: '.zcode' },
+  // Fork-only first-class runtime (capabilities/grok → ~/.grok). Required so
+  // runMinimalInstall('--grok --global') can resolve a real global home after
+  // #3547 refused to guess. Excluded from MANIFEST_FAMILIES below — there is
+  // no tests/fixtures/install-tree/grok.json golden.
+  grok:         { localDir: '.grok',              globalSuffix: '.grok' },
 };
 
 /**
@@ -103,7 +108,9 @@ const RUNTIME_META = {
  * legitimately differ whenever a PR adds or removes a runtime.
  */
 const MANIFEST_FAMILIES = [
-  ...Object.keys(RUNTIME_META).map((runtime) => ({ name: runtime, runtime, scope: 'global' })),
+  ...Object.keys(RUNTIME_META)
+    .filter((runtime) => runtime !== 'grok')
+    .map((runtime) => ({ name: runtime, runtime, scope: 'global' })),
   { name: 'claude-local', runtime: 'claude', scope: 'local' },
 ];
 
@@ -569,6 +576,7 @@ function runMinimalInstall({ runtime, scope, extraArgs = [], installScript = INS
       // could ever be exercised. pi's local config dir is `.pi`
       // (capabilities/pi/capability.json runtime.localConfigDir).
       pi: '.pi',
+      grok: '.grok',
     };
     let configDir;
     let cwd = process.cwd();
