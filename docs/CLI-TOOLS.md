@@ -578,6 +578,102 @@ Pass `--json` to receive the typed IR directly (useful in scripts and test asser
 
 ---
 
+## Planning Snapshot Commands
+
+### `planning inspect`
+
+Emits a read-only, schema-versioned snapshot of everything `.planning/` knows,
+as one JSON document. It exists so a downstream tool — a harness UI, a
+mission-control view, a dashboard — can consume planning state without parsing
+`ROADMAP.md` / `REQUIREMENTS.md` / `*-PLAN.md` / `*-SUMMARY.md` a second time
+and drifting from gsd-core's own answers.
+
+```bash
+gsd-tools query planning inspect
+gsd-tools query planning.inspect     # dotted canonical form — identical output
+```
+
+**Takes no arguments.** A stray positional or an unrecognized flag is a
+fail-loud usage error, not a silently-ignored one: a caller who believed
+`--phase 3` was scoping the query would otherwise receive a whole-project
+snapshot presented as a scoped one.
+
+`planning inspect` writes nothing, anywhere. It is safe to run against a
+project mid-workflow.
+
+#### The schema contract
+
+```json
+{ "schema_version": 1, "...": "..." }
+```
+
+`schema_version` is the contract. **A consumer must reject any value other than
+the one it was written against** rather than best-effort-parsing a shape it does
+not know. Every top-level key is always present; a key is never omitted to
+signal absence, because omission is itself something callers come to depend on.
+
+| Key | What it carries |
+|-----|-----------------|
+| `schema_version` | Always `1` today |
+| `generated_from` | Resolved `cwd` and `.planning/` root (`null` when there is no planning root) |
+| `milestone` | `version`, `name`, and the `scope` of that answer |
+| `active` | `phase`, `plan`, and `status` — three distinct STATE.md facts, each scoped separately |
+| `phases[]` | Per phase: completion, verification, roadmap acceptance, UAT, plan and task rows |
+| `orphan_phase_dirs[]` | Directories under `phases/` that the current milestone window does not declare |
+| `requirements[]` | Requirement rows with mapped-phase traceability |
+| `progress` | `accepted_phases` and `completed_plans`, as independent fractions |
+| `diagnostics[]` | Coded reasons for every non-answer above |
+
+#### Three kinds of evidence, never folded together
+
+Each phase reports `verification`, `roadmap_acceptance`, and `uat` **side by
+side**. They are not combined into a single verdict, because they answer
+different questions and can legitimately disagree — a phase can pass
+verification while UAT items remain open.
+
+`roadmap_acceptance.checkbox` is reported with `authoritative: false`. A ticked
+ROADMAP checkbox is a human annotation with no machine authority: completion is
+derived from disk state (a passing `*-VERIFICATION.md`), and a stale tick never
+overrides it. See [Milestone window scope](#milestone-window-scope-roadmap-analyze).
+
+#### Unknown is a real answer; nothing is inferred
+
+Where the evidence is absent, or where two sources disagree, the value is `null`
+or `"unknown"` and a coded entry in `diagnostics[]` says why. It is never
+reconciled, guessed, or filled from a plausible default.
+
+The most common case is task-scoped file provenance. A `<task>` block declares
+the files it plans to touch, but `SUMMARY.md`'s `## Files Created/Modified`
+section describes the **whole plan**, not an individual task. Spreading that
+plan-level list across the plan's tasks would be inference, so instead:
+
+| `provenance` | Meaning |
+|---|---|
+| `task_scoped` | The summary attributed files to this specific task (via a deviation block naming `Found during: Task N`) |
+| `plan_scoped` | A summary exists, but only carries a plan-level file list — this task's changed files are unknown |
+| `absent` | No summary exists yet |
+
+When a task's planned and changed file sets both exist and disagree,
+`agreement` is `"conflicting"` and **both lists are emitted verbatim**.
+
+#### Percentages are withheld rather than guessed
+
+`progress.accepted_phases` and `progress.completed_plans` are independent
+fractions, each `{completed, total, percent, scope}`. `percent` is `null`
+whenever `scope` is anything other than `complete` — the same rule the roadmap
+and progress surfaces follow, for the same reason. See
+[A non-`COMPLETE` scope withholds the percentage entirely](#a-non-complete-scope-withholds-the-percentage-entirely-3217).
+
+`0` is a real answer under a `complete` scope and is never withheld.
+
+#### Large payloads
+
+Output over ~50 KB is written to a temp file and returned as
+`@file:<path>`, which `gsd-tools` resolves transparently before writing to
+stdout — the same channel `init` uses. Callers see JSON either way.
+
+---
+
 ## Template Commands
 
 Template selection and filling.
@@ -680,7 +776,10 @@ if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
 
 ```bash
 # Archive milestone
-node gsd-tools.cjs milestone complete <version> [--name <name>] [--no-archive-phases] [--force] [--dry-run]
+node gsd-tools.cjs milestone complete <version> [--name <name>] [--no-archive-phases] [--force] [--dry-run] [--archive-quick]
+
+# Archive .planning/quick/* into milestones/<version>-quick/ WITHOUT the milestone complete close-out (#2142)
+node gsd-tools.cjs milestone archive-quick <version> [--dry-run]
 
 # Mark requirements as complete
 node gsd-tools.cjs requirements mark-complete <ids>
@@ -694,12 +793,26 @@ node gsd-tools.cjs requirements mark-complete <ids>
 | `<version>` | Milestone version label to archive (e.g. `v1.0`). |
 | `--name <name>` | Display name for the MILESTONES.md entry. Defaults to `<version>`. |
 | `--no-archive-phases` | Leave phase directories in place instead of moving them into `.planning/milestones/<version>-phases/`. |
+| `--archive-quick` | Opt-in (default OFF, #2142): also move every directory under `.planning/quick/` into `.planning/milestones/<version>-quick/`, (re)write that archive directory's `README.md` index, and clear STATE.md's `### Quick Tasks Completed` table rows. See "`milestone archive-quick`" below for the narrower standalone form and the full behavior. |
 | `--force` | Override the unstarted-phase guard (see below). |
-| `--dry-run` | Print the archive plan (roadmap, requirements, phases to move) without mutating anything. |
+| `--dry-run` | Print the archive plan (roadmap, requirements, phases, and — when `--archive-quick` is also passed — quick-task dirs to move) without mutating anything. |
 
 **Unstarted-phase guard.** Before archiving, the command scans the ROADMAP scoped for `<version>` and refuses if any `### Phase N:` heading in that slice has no matching phase directory on disk (`disk_status: no_directory`). Phase 0 (pre-milestone) and Phase 999 (backlog) sentinels are excluded. The guard runs whenever `--force` is absent, independent of `STATE.md`'s `milestone:` field — if that field is present but does not match `<version>`, a WARNING naming both values is emitted to stderr and the scan still runs (#2946). Pass `--force` to override.
 
 **Sentinel directories are never archived.** The phase-directory move performed when `--no-archive-phases` is absent is now filtered through the same canonical sentinel predicate as `phases list` and `phases clear`: `999.*` (backlog) and `0-*` (pre-milestone) directories are left in place rather than moved into `.planning/milestones/<version>-phases/`. Previously this path was scoped only by the milestone window, with no sentinel filter, so a sentinel directory sitting inside the window could be archived along with the milestone's real phases.
+
+**`milestone archive-quick` (#2142 escalation)**
+
+A narrower sibling of `milestone complete --archive-quick`, for callers that need to sweep `.planning/quick/*` WITHOUT the full milestone close-out — chiefly `gsd-core/workflows/cleanup.md`, which runs against milestones that are typically already completed.
+
+| Flag | Description |
+|------|-------------|
+| `<version>` | Milestone version label to archive quick-task directories under (e.g. `v1.0`). Same validation as `milestone complete`'s `<version>` — letters/digits/`.`/`-`/`_` only, no path separators or `..`. |
+| `--dry-run` | List what would move (`would_archive`) without mutating anything. |
+
+It moves every directory under `.planning/quick/` into `.planning/milestones/<version>-quick/`, (re)writes that archive directory's `README.md` index, and clears STATE.md's `### Quick Tasks Completed` table rows — the same move/index/reset logic `milestone complete --archive-quick` uses. Unlike `milestone complete`, it never archives `ROADMAP.md`/`REQUIREMENTS.md`, never writes a `MILESTONES.md` entry, and runs neither the unstarted-phase guard nor the milestone-window refusal — so, unlike `milestone complete --archive-quick`, it can be safely re-run against an already-completed milestone. JSON result: `{ version, archived, entries, archive_dir, state_updated, warnings }`.
+
+`milestone archive-quick` is a second subcommand of `milestone` (alongside `complete`) — it is not a separate top-level command.
 
 ---
 
@@ -771,6 +884,8 @@ node gsd-tools.cjs verify-path-exists <path>
 
 # Append a row to STATE.md's "Quick Tasks Completed" table (schema-backed; #2133)
 node gsd-tools.cjs quick-tasks-append --task "<description>"
+# See "Milestone Commands" below for `milestone archive-quick` (#2142) — sweeps .planning/quick/* into
+# milestones/<version>-quick/ and clears this table, without a full `milestone complete`.
 
 # Aggregate all SUMMARY.md data
 node gsd-tools.cjs history-digest

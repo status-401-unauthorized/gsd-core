@@ -76,6 +76,8 @@ if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
 
 **Auto-detection:** If `.planning/` is gitignored, `commit_docs` is automatically `false` regardless of config.json. This prevents git errors when users have `.planning/` in `.gitignore`.
 
+**Per-phase override:** `phase_commit_docs.<phase-id>` (e.g. `phase_commit_docs.03`) overrides `commit_docs` for one phase only, and wins over both the explicit config value and gitignore auto-detection — see `docs/CONFIGURATION.md#per-phase-override-phase_commit_docs` for the full precedence chain and examples.
+
 **Commit via CLI (handles checks automatically):**
 
 ```bash
@@ -276,6 +278,7 @@ Set via `workflow.*` namespace in config.json (e.g., `"workflow": { "research": 
 | `workflow.inline_plan_threshold` | number | `2` | `0`–`10` | Plans with ≤N tasks execute inline instead of spawning a subagent |
 | `workflow.code_review` | boolean | `true` | `true`, `false` | Enable built-in code review step in the ship workflow |
 | `workflow.code_review_depth` | string | `"standard"` | `"quick"`, `"standard"`, `"deep"` | Depth level for code review analysis in the ship workflow |
+| `workflow.code_review_depth_overrides` | array | `[]` | Array of `{paths, depth}` rule objects | Ordered path-scoped depth rules for `/gsd:code-review` (#2554). Each rule's `paths` are matched against the review's changed-file set by whole-segment directory-path prefix (`src/auth` matches `src/auth/token.ts`, never `src/authfoo/x.ts`); matching is case-sensitive. Glob syntax (`*`, `?`) is a configuration error. One matched file escalates the entire review — depth is not applied per file. Resolution order: `--depth=` flag → strongest matching rule → `workflow.code_review_depth` → `standard`. A malformed rule halts the review with a typed error rather than falling back silently. |
 | `workflow._auto_chain_active` | boolean | `false` | `true`, `false` | Internal: tracks whether autonomous chaining is active |
 | `workflow.security_enforcement` | boolean | `true` | `true`, `false` | Enable threat-model-anchored security verification via `/gsd:secure-phase`. When `false`, security checks are skipped entirely |
 | `workflow.security_asvs_level` | number | `1` | `1`, `2`, `3` | OWASP ASVS verification level. Level 1 = opportunistic, Level 2 = standard, Level 3 = comprehensive. Scales both planner threat-disposition rigor (which threats must be mitigated vs. accepted) and auditor verification depth (grep-level → boundary-placement check → full data-flow trace). See `gsd-core/references/security-asvs-levels.md`. |
@@ -380,7 +383,7 @@ These can be set at top level or nested under `planning.*` (e.g., `"planning": {
 
 Several config fields affect each other or trigger special behavior:
 
-1. **`commit_docs` auto-detection** -- When no explicit value is set in config.json and `.planning/` is in `.gitignore`, `commit_docs` automatically resolves to `false`. An explicit `true` or `false` in config always overrides auto-detection.
+1. **`commit_docs` resolution chain** -- Four tiers, highest wins: (1) `phase_commit_docs.<phase-id>` for the phase being committed, (2) an explicit `commit_docs` (or `planning.commit_docs`) value in config.json, (3) `.gitignore` auto-detection (`.planning/` in `.gitignore` resolves to `false`), (4) the manifest default (`true`). Precedence: per-phase → explicit config → gitignore auto-detect → default.
 
 2. **`branching_strategy` controls branch templates** -- The `phase_branch_template` and `milestone_branch_template` fields are only used when `branching_strategy` is set to `"phase"` or `"milestone"` respectively. When `branching_strategy` is `"none"`, all template fields are ignored.
 

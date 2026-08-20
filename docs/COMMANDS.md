@@ -500,6 +500,8 @@ The marker never overwrites the artifact's own `status:` field for the eight fro
 
 > **Sentinel directories stay put.** Moving phase directories into the archive (the default, unless `--no-archive-phases` is passed) now excludes `999.*` (backlog) and `0-*` (pre-milestone) directories via the same sentinel predicate the unstarted-phase guard already uses. Previously the archive move was scoped only by the milestone window, so a sentinel directory sitting inside that window could be archived along with the milestone's own phases.
 
+> **Quick-task archival (opt-in, default OFF, #2142).** Unlike phase archival above, quick-task archival does not run unless you say yes — doing nothing leaves `.planning/quick/` untouched. If `.planning/quick/` contains at least one directory, the workflow asks: `Archive completed quick tasks into this milestone too?` with options `Yes — archive quick tasks into v[X.Y]` / `Skip`. Choosing "Yes" passes `--archive-quick` to the underlying `gsd-tools milestone complete` call, which moves every directory under `.planning/quick/` into `.planning/milestones/v[X.Y]-quick/`, (re)writes that directory's `README.md` index (built by scanning the archive directory, not STATE.md), and clears the data rows of STATE.md's `### Quick Tasks Completed` table while preserving its header and column variant. **Known limit:** there is no on-disk record of which milestone a quick task belongs to, so archival buckets **all** remaining `.planning/quick/*` into the one milestone being completed — a task predating an earlier, unarchived milestone lands in the current bucket regardless. See [Archiving quick tasks](how-to/handle-quick-and-fast-tasks.md#archiving-quick-tasks) for the full walkthrough, including the retroactive path.
+
 ---
 
 ### `/gsd-milestone-summary`
@@ -647,6 +649,31 @@ node gsd-tools.cjs phase uat-passed 3                        # Evaluate UAT for 
 node gsd-tools.cjs phase uat-passed 3 --require-verification # Also require VERIFICATION.md
 node gsd-tools.cjs phase uat-passed 3 --raw                  # Machine-readable JSON output
 ```
+
+---
+
+### `planning inspect`
+
+Emit a read-only, schema-versioned JSON snapshot of the whole planning state —
+milestone identity, active phase/plan/status, per-phase verification, roadmap
+acceptance and UAT evidence (kept separate), requirement rows with mapped-phase
+traceability, plan and task rows with planned/changed file provenance, and
+independent `accepted_phases` / `completed_plans` fractions.
+
+For downstream tools that need planning state without re-parsing GSD's Markdown.
+Mutates nothing. Takes no arguments — a stray positional or unknown flag is a
+fail-loud usage error rather than a silently-ignored one.
+
+```bash
+node gsd-tools.cjs query planning inspect       # schema-v1 snapshot
+node gsd-tools.cjs query planning.inspect       # dotted canonical form, identical
+node gsd-tools.cjs query planning inspect --cwd /path/to/project
+```
+
+Check `schema_version` before reading any other field, and branch on each value's
+`scope` — `complete` with an empty value is a real answer, `unreadable` is not.
+Full field reference: [CLI Tools](CLI-TOOLS.md#planning-inspect). Integration
+walkthrough: [Consume the planning snapshot](how-to/consume-the-planning-snapshot.md).
 
 ---
 
@@ -1052,9 +1079,11 @@ covers only orphan worktrees, with the stale-worktree case moving to the new
 
 ### `/gsd-cleanup`
 
-Archive accumulated phase directories from completed milestones and prune local branches whose upstream has been deleted.
+Archive accumulated phase directories from completed milestones, prune local branches whose upstream has been deleted, and — when applicable — retroactively archive quick tasks (#2142).
 
 **Behaviour:** Presents a dry-run summary of phase directories to archive (moved from `.planning/phases/` into `.planning/milestones/v{X.Y}-phases/`) and local branches whose upstream is gone (pruned via `git fetch --prune`). Requires confirmation before writing any changes. The currently checked-out branch is never pruned.
+
+**Retroactive quick-task archival (opt-in, #2142).** When `.planning/quick/` contains at least one directory, `/gsd-cleanup` additionally offers to sweep it: `Archive ALL {N} quick-task directories into v{X.Y} — {Milestone Name}? This buckets every remaining quick task into this ONE milestone; there is no way to split them per-milestone.` with options `Yes — archive quick tasks into v{X.Y}` / `Skip`. The target is the single most recent completed milestone (from `MILESTONES.md`) that does not yet have a `v{X.Y}-quick` archive directory. If `.planning/quick/` is empty, this step is not offered at all. Confirming calls the narrower `gsd-tools milestone archive-quick <version>` command — the same move/README-index/table-reset logic `/gsd-complete-milestone`'s `--archive-quick` uses, but without touching `ROADMAP.md`, `REQUIREMENTS.md`, `MILESTONES.md`, or milestone-completion guards, since `/gsd-cleanup` typically targets a milestone that is already closed. See [Archiving quick tasks](how-to/handle-quick-and-fast-tasks.md#archiving-quick-tasks) for the full walkthrough and the silent/failure cases.
 
 ```bash
 /gsd-cleanup
@@ -1165,6 +1194,64 @@ Extract reusable patterns, anti-patterns, and architectural decisions from compl
 /gsd-extract-learnings 3                    # Extract learnings from phase 3
 /gsd-extract-learnings --all                # Extract from all completed phases
 ```
+
+---
+
+### `gsd-tools check verify-command-paths`
+
+Deterministic resolvability probe over a phase's `<automated>` verify commands (#2401). Run
+automatically by `/gsd-plan-phase` before the plan-check pass and handed to `gsd-plan-checker`;
+runnable by hand to see what the checker saw.
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `N` | **Yes** | Phase number whose `-PLAN.md` files are probed |
+
+| Flag | Description |
+|------|-------------|
+| `--raw` | Emit the JSON payload with no surrounding prose |
+
+**Prerequisites:** none — an unresolvable phase degrades to a JSON payload with `readError` set
+rather than failing.
+**Produces:** JSON on stdout. Nothing is written to disk.
+
+**It never executes command text.** PLAN.md is LLM-authored, so the probe only resolves paths
+and stats directories; a `package.json` it finds is read for script *names* only.
+
+It grounds exactly two forms — a leading `cd <literal>` chain and `npm --prefix <literal>` —
+and refuses to guess at anything else. `pushd`, `make -C`, `yarn --cwd`, `pnpm -C`, and
+`cargo --manifest-path` are not recognized today and report `unresolvable`.
+
+Each row of `commands` carries `command`, `plan`, `task`, `status`, `severity`, `reason`,
+`form`, `rawTarget`, `target`, `manifest`, `script`, `sentinel`, and `base`. There is
+deliberately **no** `suggestion` field — the probe reports what failed to resolve and leaves
+the replacement to the planner.
+
+| `status` | Meaning |
+|---|---|
+| `ok` | Target resolved (a `reason` may still carry an advisory — see below) |
+| `broken` | Target does not resolve, or holds no required manifest — **blocker** |
+| `unresolvable` | The path could not be grounded (variable, glob, substitution, `~`) — warning |
+| `pending_creation` | An earlier task in this phase creates the target — not a finding |
+| `not_applicable` | No `cd`/`--prefix` to resolve, or a Nyquist `MISSING …` sentinel |
+
+| `reason` | `severity` | What it means |
+|---|---|---|
+| `missing_dir` | `blocker` | The resolved directory does not exist, or is not a directory |
+| `no_manifest` | `blocker` | The directory exists but holds no `package.json` / `Makefile` the command needs |
+| `dynamic_path` | `warning` | The path contains `$`, a backtick, `*`, `?`, or `~` — refused, not guessed |
+| `outside_root` | `warning` | A bare ancestor climb (`cd ../..`); the base differs under worktree execution |
+| `script_missing` | `warning` | `npm run <script>` names a script the manifest does not define — this phase may add it |
+| `manifest_unreadable` | `warning` | `package.json` is oversized, unparseable, or not a JSON object |
+| `null` | `none` | Nothing to report |
+
+A non-empty `readError` means the probe **could not look** — distinct from finding nothing.
+
+```bash
+gsd-tools check verify-command-paths 3 --raw    # probe phase 3's verify commands
+```
+
+See [Resolve verify-command path findings](how-to/resolve-verify-command-path-findings.md).
 
 ---
 
@@ -1500,7 +1587,7 @@ Review source files changed during a phase for bugs, security vulnerabilities, a
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `N` | **Yes** | Phase number whose changes to review (e.g., `2` or `02`) |
-| `--depth=quick\|standard\|deep` | No | Review depth level (overrides `workflow.code_review_depth` config). `quick`: pattern-matching only (~2 min). `standard`: per-file analysis with language-specific checks (~5–15 min, default). `deep`: cross-file analysis including import graphs and call chains (~15–30 min) |
+| `--depth=quick\|standard\|deep` | No | Review depth level. Overrides both `workflow.code_review_depth` and any matching `workflow.code_review_depth_overrides` path rule — the flag always wins. `quick`: pattern-matching only (~2 min). `standard`: per-file analysis with language-specific checks (~5–15 min, default). `deep`: cross-file analysis including import graphs and call chains (~15–30 min) |
 | `--files file1,file2,...` | No | Explicit comma-separated file list; skips SUMMARY/git scoping entirely |
 | `--fix` | No | Auto-fix issues after review — reads REVIEW.md, spawns fixer agent, commits each fix atomically |
 | `--fix --all` | No | Include Info findings in fix scope (default: Critical + Warning only) |
@@ -1609,6 +1696,8 @@ Reviewers reached through `--all` or `review.default_reviewers` behave different
 - Explicit flags (for example `--cursor`) override both `--all` and config defaults for that run.
 
 **Produces:** `{phase}-REVIEWS.md` — consumable by `/gsd-plan-phase --reviews`
+
+Its frontmatter records the model each reviewer resolved to, as `models:` (the model id, or `unknown`, with a `(reasoning=<level>)` suffix when GSD applied a reasoning effort to that lane) and `model_sources:` (how each value was determined — `pinned`, `served`, `requested`, `banner`, `transcript`, or `unknown`). See [Resolved model recording](CONFIGURATION.md#resolved-model-recording-2295).
 
 ```bash
 # set project default reviewers for no-flag /gsd-review runs

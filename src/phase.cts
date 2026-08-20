@@ -82,10 +82,15 @@ const { readVerificationStatus } = verificationMod;
 import planDependencyGraphMod = require('./plan-dependency-graph.cjs');
 const { computeHaltPropagation, buildSummaryFileIndex, isSummaryFileHalted, isSummaryFileBlocked } = planDependencyGraphMod;
 
-const { planningDir, withPlanningLock, listAvailableWorkstreams, getActiveWorkstream } =
-  planningWorkspace;
+const {
+  planningDir, withPlanningLock, listAvailableWorkstreams,
+  peekActiveWorkstream, diagnoseUnresolvedActiveWorkstream, describeUnresolvedWorkstreamReason,
+} = planningWorkspace;
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- milestone-lock.cjs is an export= CommonJS module
 import milestoneLockMod = require('./milestone-lock.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import planDocumentMod = require('./plan-document.cjs');
+const { parsePlanDocument, planIdFromFile } = planDocumentMod;
 const { extractFrontmatter } = frontmatterMod;
 const {
   readModifyWriteStateMd,
@@ -581,11 +586,6 @@ function cmdFindPhase(cwd: string, phase: string, raw: boolean): void {
   output(notFound, raw, '');
 }
 
-function extractObjective(content: string): string | null {
-  const m = content.match(/<objective>\s*\n?\s*(.+)/);
-  return m ? m[1].trim() : null;
-}
-
 interface RawPlan {
   id: string;
   declaredWave: number | null;
@@ -798,51 +798,14 @@ function cmdPhasePlanIndex(cwd: string, phase: string, raw: boolean): void {
   const rawPlans: RawPlan[] = [];
 
   for (const planFile of planFiles) {
-    const planId = planFile.replace('-PLAN.md', '').replace('PLAN.md', '');
+    const planId = planIdFromFile(planFile);
     const planPath = path.join(phaseDir, planFile);
     const content = fs.readFileSync(planPath, 'utf-8');
-    // Pass planPath so a truncated PLAN.md names the file in the #1882 diagnostic.
-    const fm = extractFrontmatter(content, planPath);
-
-    const xmlTasks = content.match(/<task[\s>]/gi) || [];
-    const mdTasks = content.match(/##\s*Task\s*\d+/gi) || [];
-    const taskCount = xmlTasks.length || mdTasks.length;
-
-    const parsedWave = parseInt(fm['wave'] as string, 10);
-    const declaredWave = Number.isNaN(parsedWave) ? null : parsedWave;
-
-    let dependsOn: string[] = [];
-    const fmDeps = fm['depends_on'];
-    if (Array.isArray(fmDeps)) {
-      dependsOn = fmDeps.map(String);
-    } else if (typeof fmDeps === 'string' && fmDeps.trim() !== '') {
-      dependsOn = [fmDeps];
-    }
-
-    let autonomous = true;
-    if (fm['autonomous'] !== undefined) {
-      // eslint-disable-next-line @typescript-eslint/no-base-to-string -- FrontmatterValue comparison
-      autonomous = fm['autonomous'] === 'true' || String(fm['autonomous']) === 'true';
-    }
-
-    let filesModified: string[] = [];
-    const fmFiles = fm['files_modified'] || fm['files-modified'];
-    if (fmFiles) {
-      // eslint-disable-next-line @typescript-eslint/no-base-to-string -- FrontmatterValue scalar-to-string
-      filesModified = Array.isArray(fmFiles) ? fmFiles.map(String) : [String(fmFiles)];
-    }
-
-    // #1689: optional per-plan specialist executor hint. Read verbatim here; the
-    // orchestrator resolves it against the active runtime's agent dir at dispatch
-    // time (execute-phase.md -> `gsd_run query resolve-agent`), falling back to
-    // gsd-executor when the field is unset or the named agent does not resolve.
-    let agentHint: string | null = null;
-    const fmAgentHint = fm['agent_hint'];
-    if (fmAgentHint !== undefined) {
-      // eslint-disable-next-line @typescript-eslint/no-base-to-string -- FrontmatterValue scalar-to-string
-      const hintStr = String(fmAgentHint).trim();
-      agentHint = hintStr !== '' ? hintStr : null;
-    }
+    // #2790: plan-body parsing is owned by the shared Plan Document Module, so
+    // this command and the read-only `planning.inspect` query cannot drift on
+    // what a plan document says. planPath is still passed so a truncated
+    // PLAN.md names the file in the #1882 diagnostic.
+    const planDoc = parsePlanDocument(content, planPath);
 
     const hasSummary = !unsummarizedPlanFiles.has(planFile);
 
@@ -858,13 +821,13 @@ function cmdPhasePlanIndex(cwd: string, phase: string, raw: boolean): void {
 
     rawPlans.push({
       id: planId,
-      declaredWave,
-      dependsOn,
-      autonomous,
-      objective: extractObjective(content) || (fm['objective'] as string | null) || null,
-      filesModified,
-      agentHint,
-      taskCount,
+      declaredWave: planDoc.declaredWave,
+      dependsOn: planDoc.dependsOn,
+      autonomous: planDoc.autonomous,
+      objective: planDoc.objective,
+      filesModified: planDoc.filesModified,
+      agentHint: planDoc.agentHint,
+      taskCount: planDoc.taskCount,
       hasSummary,
       halted,
     });
@@ -1724,6 +1687,14 @@ function updateRoadmapAfterPhaseRemoval(
   withPlanningLock(cwd, () => {
     let content = fs.readFileSync(roadmapPath, 'utf-8');
     const escaped = escapeRegex(targetPhase);
+    // #3572: ROADMAP headings and rows carry the normalized (zero-padded) form
+    // of a decimal id — `phase insert 1` writes `### Phase 01.1:` while the
+    // user's remove query is usually unpadded (`1.1`) — and integer headings
+    // legitimately appear both padded (`02`) and unpadded (`2`). A `0*` prefix
+    // makes the token padding-insensitive in both directions without widening
+    // to other ids: the token stays anchored between `Phase\s+`/line-start and
+    // `:`/whitespace/end, so `0*2` still never matches `Phase 12:`.
+    const padTolerant = `0*${escaped}`;
 
     // SECTION-DELETION (not a section-body edit) — removes the phase's ENTIRE
     // detail section INCLUDING its own heading line. Migrated onto deleteSection
@@ -1737,7 +1708,7 @@ function updateRoadmapAfterPhaseRemoval(
     // away everything after it — including a trailing `## Progress` heading and
     // its tracking table.
     const phaseHeadingRe = new RegExp(
-      `^Phase\\s+${escaped}${OPTIONAL_PHASE_TAG_SOURCE}\\s*:`,
+      `^Phase\\s+${padTolerant}${OPTIONAL_PHASE_TAG_SOURCE}\\s*:`,
       'i',
     );
     content = deleteSection(
@@ -1745,7 +1716,7 @@ function updateRoadmapAfterPhaseRemoval(
       (h) => h.level >= 2 && h.level <= 4 && phaseHeadingRe.test(h.text),
     );
     content = content.replace(
-      new RegExp(`\\n?-\\s*\\[[ x]\\]\\s*.*Phase\\s+${escaped}${OPTIONAL_PHASE_TAG_SOURCE}[:\\s][^\\n]*`, 'gi'),
+      new RegExp(`\\n?-\\s*\\[[ x]\\]\\s*.*Phase\\s+${padTolerant}${OPTIONAL_PHASE_TAG_SOURCE}[:\\s][^\\n]*`, 'gi'),
       '',
     );
     // ROW-DELETION (not a cell update) — removes the WHOLE Progress-table row
@@ -1776,7 +1747,7 @@ function updateRoadmapAfterPhaseRemoval(
       const matchRemovedProgressRow = (row: Record<string, string>): boolean => {
         const firstCellRaw = (Object.values(row)[0] ?? '').trim();
         if (isDecimal) {
-          return new RegExp(`^${escaped}\\.?(?:\\s|$)`, 'i').test(firstCellRaw);
+          return new RegExp(`^${padTolerant}\\.?(?:\\s|$)`, 'i').test(firstCellRaw);
         }
         const leadingMatch = firstCellRaw.match(/^0*(\d+)(\.\d+)?/);
         if (!leadingMatch || leadingMatch[2]) return false;
@@ -1919,6 +1890,34 @@ interface PhaseRemoveOptions {
   force?: boolean;
 }
 
+/**
+ * #3572: insert `fieldLine` at the start of STATE.md's BODY — immediately after
+ * the leading frontmatter block's closing `---` fence — so a body field never
+ * lands before the opening fence. The former whole-content prepend
+ * (`field + content`) put the line ABOVE the opening `---`, and
+ * syncStateFrontmatter then treated the scrambled fence structure as TWO
+ * frontmatter blocks, rebuilding a derived one on top of the original
+ * (milestone_name from a ROADMAP heading, total_phases counting the removed
+ * phase, a stray 'Total Phases: 0' between fences). A file with no leading
+ * frontmatter is all body: the field goes to content start, preserving the
+ * former behavior for that shape.
+ */
+function insertStateBodyFieldAtTop(content: string, fieldLine: string): string {
+  // Split AND join on bare '\n' so CRLF line endings stay attached to their
+  // own lines — each '\r' remains the tail of the line it terminated, where
+  // the trimmed fence compare still matches it. (#3572 review: splitting on
+  // '\n' but re-joining on a detected '\r\n' doubled every carriage return.)
+  const lines = content.split('\n');
+  if ((lines[0] ?? '').trim() === '---') {
+    const closeIdx = lines.findIndex((l: string, i: number) => i > 0 && l.trim() === '---');
+    if (closeIdx !== -1) {
+      lines.splice(closeIdx + 1, 0, '', fieldLine);
+      return lines.join('\n');
+    }
+  }
+  return fieldLine + '\n' + content;
+}
+
 function cmdPhaseRemove(
   cwd: string,
   targetPhase: string,
@@ -2034,15 +2033,21 @@ function cmdPhaseRemove(
         let modified = stateContent;
         const totalRaw = stateExtractField(modified, 'Total Phases');
         if (totalRaw) {
+          // #3572 review: clamp at 0 — a stale 'Total Phases: 0' (e.g. written by
+          // an earlier remove whose dir-count was 0) must not decrement to -1 on
+          // the next removal.
           modified =
-            stateReplaceField(modified, 'Total Phases', String(parseInt(totalRaw, 10) - 1)) ||
-            modified;
+            stateReplaceField(
+              modified,
+              'Total Phases',
+              String(Math.max(0, parseInt(totalRaw, 10) - 1)),
+            ) || modified;
         }
         const ofMatch = modified.match(/(\bof\s+)(\d+)(\s*(?:\(|phases?))/i);
         if (ofMatch) {
           modified = modified.replace(
             /(\bof\s+)(\d+)(\s*(?:\(|phases?))/i,
-            `$1${parseInt(ofMatch[2], 10) - 1}$3`,
+            `$1${Math.max(0, parseInt(ofMatch[2], 10) - 1)}$3`,
           );
         }
         // #2640: if neither body field was found, the transform is a no-op.
@@ -2066,15 +2071,22 @@ function cmdPhaseRemove(
           // just-deleted directory as still present and write a `Total Phases`
           // one too high. Identity is also what the comment above already
           // claims this filter does, and the block is gated on targetDir.
-          const remainingPhases = subdirs.filter((d) => d !== targetDir).length;
+          // (#3572 note: this body field counts DIRECTORIES on disk; the
+          // frontmatter progress.* block is rebuilt by syncStateFrontmatter
+          // from the post-removal ROADMAP — the two counts legitimately differ
+          // when phases exist in ROADMAP without directories.)
+          const remainingPhases = Math.max(0, subdirs.filter((d) => d !== targetDir).length);
           if (totalRaw) {
             modified =
               stateReplaceField(modified, 'Total Phases', String(remainingPhases)) || modified;
           } else {
-            // No 'Total Phases:' field in the body — append one so the no-op
-            // guard sees a diff. syncStateFrontmatter will then rebuild the
-            // frontmatter progress.* block from the real disk/ROADMAP count.
-            modified = `Total Phases: ${remainingPhases}\n` + modified;
+            // No 'Total Phases:' field in the body — insert one at the start of
+            // the BODY so the no-op guard sees a diff. #3572: the former
+            // whole-content prepend landed the line BEFORE the opening '---'
+            // fence and corrupted STATE.md into two frontmatter blocks.
+            // syncStateFrontmatter will still rebuild the frontmatter
+            // progress.* block from the real disk/ROADMAP count.
+            modified = insertStateBodyFieldAtTop(modified, `Total Phases: ${remainingPhases}`);
           }
         }
         return modified;
@@ -2159,12 +2171,33 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
   // init.progress got (resolution: GSD_WORKSTREAM env > stored active pointer; an
   // explicit --ws sets GSD_WORKSTREAM upstream and satisfies the check).
   const availableWorkstreams = listAvailableWorkstreams(cwd);
-  const resolvedWorkstream = process.env['GSD_WORKSTREAM'] || getActiveWorkstream(cwd);
+  // #3579 root-cause fix: this is a check, not a consuming read — use the
+  // non-mutating peek so an unresolvable pointer isn't self-healed (cleared)
+  // here and then found "absent" by diagnoseUnresolvedActiveWorkstream below,
+  // which would misreport a present-but-bad marker as no marker at all.
+  const resolvedWorkstream = process.env['GSD_WORKSTREAM'] || peekActiveWorkstream(cwd);
   if (availableWorkstreams.length > 0 && !resolvedWorkstream) {
+    // #3579: getActiveWorkstream now inherits a pointer-less session's read
+    // from the shared .planning/active-workstream marker, so reaching this
+    // branch with a marker actually present means the marker EXISTED but
+    // didn't resolve (invalid name, or its workstream dir is gone) — a
+    // materially different situation from "nothing was ever set" and one
+    // that deserves its own diagnostic instead of the generic message below.
+    const diagnosis = diagnoseUnresolvedActiveWorkstream(cwd);
+    if (diagnosis.present) {
+      error(
+        `phase.complete requires a workstream in workstream mode — the active-workstream marker names '${diagnosis.value}', but it did not resolve: ${describeUnresolvedWorkstreamReason(diagnosis.reason)}. Root STATE.md/ROADMAP.md (likely stale) would be written otherwise. ` +
+          `Pass --ws <name> or run ${formatGsdSlash('workstream set', resolveRuntime(cwd)) as string} to point it at an existing workstream. ` +
+          `Available workstreams: ${availableWorkstreams.join(', ')}`,
+        ERROR_REASON.WORKSTREAM_MODE_MARKER_UNRESOLVED,
+        { marker_value: diagnosis.value, marker_reason: diagnosis.reason },
+      );
+    }
     error(
       `phase.complete requires a workstream in workstream mode — no active workstream is set, so root STATE.md/ROADMAP.md (likely stale) would be written. ` +
         `Pass --ws <name> or run ${formatGsdSlash('workstream set', resolveRuntime(cwd)) as string} first. ` +
         `Available workstreams: ${availableWorkstreams.join(', ')}`,
+      ERROR_REASON.WORKSTREAM_MODE_NONE_ACTIVE,
     );
   }
 

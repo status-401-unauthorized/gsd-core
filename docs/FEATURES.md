@@ -182,6 +182,11 @@
   - [External-Job Capability](#155-external-job-capability)
   - [API-Coverage Gate](#156-api-coverage-gate)
   - [State Rebuild & Configurable Graph Path](#157-state-rebuild--configurable-graph-path)
+  - [Broken-Windows Ledger](#158-broken-windows-ledger)
+  - [Complexity-Triggered Refactor](#159-complexity-triggered-refactor)
+  - [Archive Quick Tasks at Milestone Close](#160-archive-quick-tasks-at-milestone-close)
+  - [Verify-Command Path Grounding](#161-verify-command-path-grounding)
+  - [Statusline STATE.md Freshness Marker](#162-statusline-statemd-freshness-marker)
 
 ---
 
@@ -1267,6 +1272,12 @@ Each reviewer is a **declared lane**: its binary, prompt and output channels, ti
 - Use `--all` for a full pre-merge sweep without changing project defaults.
 - For local model servers with small context windows, set `review.max_prompt_tokens_per_reviewer` to auto-trim prompts per reviewer — see [Prompt budgets for small-context reviewers](../docs/CONFIGURATION.md#prompt-budgets-for-small-context-reviewers) in CONFIGURATION.md.
 
+**Why record which model produced a review (#2295):** `reviewers:` in the frontmatter recorded which CLIs ran, but not which model each one resolved to. Without a pin, the model is whatever the CLI's own config or internal default happens to pick, so a "Codex vs Antigravity" comparison could quietly be a frontier model against a cheap-tier default with nothing in the record to say so — and a CLI update, or an unrelated config edit, could silently make past and future reviews incomparable.
+
+The fix records the model *and its provenance*. Provenance is what makes the value trustworthy: `pinned` (from `review.models.<slug>`) is certain, while `banner` and `transcript` are recovered from third-party CLI output this project does not own — a startup banner or an undocumented session log.
+
+That third-party dependence is a real trade-off, held honestly rather than papered over: the `banner` and `transcript` arms read formats GSD does not control, so they are best-effort by design and degrade to `unknown` rather than guessing or failing the run. A recorded `unknown` is a real answer — a wrong model name attributed to a review would be worse than none.
+
 ---
 
 ### 43. Backlog Parking Lot
@@ -2210,6 +2221,15 @@ Test suite that scans all agent, workflow, and command files for embedded inject
 |---------|------|---------|-------------|
 | `workflow.code_review` | boolean | `true` | Enable code review commands |
 | `workflow.code_review_depth` | string | `standard` | Default review depth: `quick`, `standard`, or `deep` |
+| `workflow.code_review_depth_overrides` | array | `[]` | Ordered `{ paths, depth }` rules that escalate depth for directories matched by path prefix against the changed-file set (#2554). See below. |
+
+**Path-scoped code review depth overrides**
+
+`workflow.code_review_depth_overrides` matches rules against the review's changed-file set by whole-segment directory-path prefix — `src/auth` matches `src/auth/token.ts` and `src/auth` itself, never `src/authfoo/x.ts` or `docs/src/auth/x.ts` — and is case-sensitive, following git.
+
+Escalation is **whole-review, not per-file**: depth is a single scalar handed to the reviewer agent, not a per-file setting, so the strongest matching tier across the whole rule set applies to every file in the review — a sensitive file is never reviewed shallowly because it shared a review with an unrelated one.
+
+v1 supports **directory-prefix matching only, not glob syntax**: no glob engine (`minimatch`, `picomatch`, `fast-glob`) exists in this project and none was added for this feature. A path containing `*` or `?` (e.g. `src/auth/**`) is a configuration error rather than a silent near-miss, because accepting it as sugar for a prefix would make unsupported patterns look armed when they match nothing. Every use case in the issue is expressible as a directory prefix. See [Scope code review depth by path](how-to/scope-code-review-depth-by-path.md) for the resolution order, error table, and a worked example.
 
 ---
 
@@ -3159,6 +3179,8 @@ explicit reviewer flags -> --all -> review.default_reviewers -> all detected rev
 
 When a requirement's prose matches **no** shape cue, the probe does not silently drop it (#1110): it emits a single `unclassified — review manually` candidate so the zero-cue requirement is surfaced for the author to resolve like any other (specify / dismiss-with-reason / defer) — a manual-review nudge, not a hard block.
 
+**Non-English projects: the probe reads English, the SPEC does not have to (#2773).** The shape cues are English word-boundary patterns, so a project running with [`response_language`](CONFIGURATION.md) set would otherwise have *every* requirement match nothing, classify to zero shapes, and land in `unclassified` — the taxonomy silently contributing nothing to exactly the kind of spec it exists to harden. `spec-phase` Step 5.5 therefore feeds the probe a faithful **English translation** of each requirement's `text`: that payload is engine input, never user-facing output, so it is translated while the SPEC itself stays in the original language, requirement ids are left untouched, and any acceptance criteria written back from the resolved edges return to `response_language`. Translation makes the classifier *applicable*; it does not make it omniscient. A requirement carrying no shape cue in **any** language still classifies to zero — that is the classifier's recorded recall gap (ADR-857 §98), not a translation failure — and the remedy there is the same one an English project uses: author an explicit `shapes` array on the requirement instead of relying on prose classification.
+
 The resolved edges populate a `## Edge Coverage` section in `SPEC.md`. Unresolved *applicable* edges trigger a soft gate (Resolve / Write-anyway-flagged / Keep-probing) rather than a hard block. Under `--auto`, the probe **never auto-dismisses** — it auto-covers where a defensible criterion exists, otherwise auto-backstops, and logs `[auto] edge coverage: C covered, B backstop, U unresolved`. The one exception is an `unclassified` candidate: `--auto` leaves it **`unresolved`** (surfaced as a flagged assumption), never auto-`backstop` — a missing shape is not evidence an edge exists, so minting a held-out edge obligation would be a false claim.
 
 The load-bearing wire is the `plan-phase` lift: `covered` and `backstop` edges become `must_haves.truths` the verifier can check, so the section is not merely documentation. A `backstop` edge is lifted as a **structured non-inferable marker** (`{ statement, verification: backstop }`, a flat scalar — not a prose note), which the **honest verifier** then consumes (see below) — closing the loop the edge-probe opened.
@@ -3384,3 +3406,93 @@ The load-bearing wire is the `plan-phase` lift into `must_haves.prohibitions`, s
 **Config:** `refactor.trigger_enabled` (master gate, default `false`), `refactor.complexity_threshold` (default `15`), `refactor.complexity_jump_delta` (default `5`), `refactor.trigger_strict` (default `false`). See [Configuration Reference](CONFIGURATION.md#refactor-trigger-settings).
 
 **Backward compatibility:** Off by default. When `refactor.trigger_enabled` is `false` the hook never runs and writes nothing; a project that never enables it is completely unaffected.
+
+---
+
+### 160. Archive Quick Tasks at Milestone Close
+
+**Command:** `/gsd-complete-milestone` (forward path), `/gsd-cleanup` (retroactive path), `gsd-tools milestone complete --archive-quick` / `gsd-tools milestone archive-quick <version>` (#2142)
+
+**Behavior:** `.planning/quick/` otherwise accumulates one directory per `/gsd-quick` task forever. `/gsd-complete-milestone` now offers a Yes/Skip prompt — when accepted, it moves every directory under `.planning/quick/` into `.planning/milestones/<version>-quick/`, (re)writes that archive directory's `README.md` (an index built by scanning the archive directory, one entry per task, linked to its `SUMMARY.md` when one exists), and clears the data rows of `STATE.md`'s `### Quick Tasks Completed` table while preserving its header and detected column variant. `/gsd-cleanup` offers the same archival retroactively, for milestones that were already closed before their quick tasks were swept, via the narrower `milestone archive-quick <version>` command — identical move/index/reset behavior, but without touching `ROADMAP.md`, `REQUIREMENTS.md`, `MILESTONES.md`, or milestone-completion guards, so it can be re-run safely against an already-completed milestone.
+
+**Why opt-in.** Phase-directory archival is default-ON (#1871) — omitting a phase directory from an archive would silently leave stale execution history in the way of the next milestone's roadmap. Quick tasks carry no such downstream conflict, so archival here defaults OFF: a user who never passes `--archive-quick` sees zero behavior change. This is a deliberate asymmetry with phase archival, not an oversight.
+
+**Why bucket-all, not per-milestone.** `.planning/quick/` is a flat directory with no on-disk record of which milestone a given task belongs to. Splitting tasks per milestone was considered and rejected — inferring provenance from dates (creation time vs. a milestone's shipped date) is a proxy, not a fact, and a wrong inference on a one-way `mv` is silently irreversible. Archival instead buckets everything currently in `.planning/quick/` into the one milestone being completed (or, on the retroactive path, the one milestone chosen), and says so in the confirmation prompt.
+
+**Why the index is built from disk, not from `STATE.md`'s table.** The `### Quick Tasks Completed` table is a running log a workflow step appends to — it demonstrably drifts from what's actually in `.planning/quick/` (the motivating case: 53 rows against 49 directories, ~22 rows pointing at directories that no longer existed, 18 directories with no row at all). Building the archive's `README.md` index by scanning the archive directory itself, rather than trusting the table, means the index can never inherit that drift; a re-run's index also naturally includes entries a prior run already archived, since it's re-derived from what's physically present.
+
+**Known limits:**
+- No per-milestone provenance — bucket-all is the only option (see above).
+- A `### Quick Tasks Completed` table whose columns match neither registered variant (with/without a Status column) is left untouched with a warning rather than reset, since clearing it would risk destroying rows under a schema GSD doesn't recognize.
+- A `STATE.md` with no `### Quick Tasks Completed` section at all is a normal, silent no-op for the reset step — the section is created lazily by `/gsd-quick`, not present in the project template.
+
+See [Archiving quick tasks](how-to/handle-quick-and-fast-tasks.md#archiving-quick-tasks) for the full walkthrough.
+
+---
+
+### 161. Verify-Command Path Grounding
+
+**Command:** `/gsd-plan-phase` (automatic), `gsd-tools check verify-command-paths <N>` (#2401)
+
+**Behavior:** A planner authoring a per-task `<automated>` verify command has no line of sight to whether the path it just wrote actually resolves, and `gsd-plan-checker` had no deterministic way to check — so it hand-reasoned the filesystem and, in the motivating case, prescribed two successively-wrong replacement paths (the second citing a `package.json` that did not exist). Two changes close that:
+
+1. **Prior-command inheritance.** The nearest prior phase's `<automated>` commands are surfaced to the planner as `prior_verify_commands`, **at every context window**. Cross-phase enrichment was previously gated on `context_window >= 500000`; at 200k the planner re-invented the command and got it wrong. This payload is a handful of one-liners, so it is never gated.
+2. **A deterministic probe.** `gsd-tools check verify-command-paths <N>` resolves each `<automated>` command's target directory and reports whether it exists and holds the manifest the command needs. `/gsd-plan-phase` runs it before the plan-check pass and hands the JSON to the checker, which acts on `severity` instead of guessing.
+
+**It never executes command text.** PLAN.md is model-authored, so running it from the checker would be arbitrary code execution — and would trigger the real lint/build as a side effect. The probe only resolves paths and stats directories; a `package.json` it finds is read for script names only.
+
+**Why a recognizer, not a shell parser.** Interpreting shell would mean maintaining a bad shell. Exactly two forms are grounded — a leading `cd <literal>` chain and `npm --prefix <literal>` — and any path carrying a variable, glob, substitution, or `~` returns `unresolvable`, which is a warning and never a blocker. The parser's incompleteness is the specification: it degrades to "cannot prove" rather than growing features. Refusing to guess is the fix, not a limitation of it.
+
+**It reports, it never prescribes.** The payload carries the target that failed and what was missing; there is deliberately no `suggestion` field. Choosing the replacement is the planner's job — and the planner now has the prior phase's proven command to reach for.
+
+**Not findings:** a target an earlier task in this phase creates (`pending_creation`), a command with no `cd`/`--prefix` at all, and the Nyquist `MISSING — Wave 0 …` sentinel, which Dimension 8 owns.
+
+**Known limits:**
+- Only `cd <literal>` and `npm --prefix <literal>` are recognized. `pushd`, `make -C`, `yarn --cwd`, `pnpm -C`, and `cargo --manifest-path` report `unresolvable`.
+- Verdicts are relative to the *checker's* project root. Under parallel worktree execution the executor's root differs, so a bare ancestor climb (`cd ../..`) is reported `outside_root` as a warning rather than asserted about.
+- `script_missing` is advisory only — this phase may be adding the script — so a genuinely mistyped npm script still reaches the executor.
+
+See [Resolve verify-command path findings](how-to/resolve-verify-command-path-findings.md) and [`gsd-tools check verify-command-paths`](COMMANDS.md#gsd-tools-check-verify-command-paths).
+
+---
+
+### 162. Statusline STATE.md Freshness Marker
+
+**Config key:** `statusline.show_state_freshness` (default `false`)
+
+**Purpose:** A solo developer returning to a project after time away reads "Phase 4, executing" in `STATE.md` and acts on it — without noticing the codebase has moved 40 commits since that line was written. `/gsd-health` reports this as `W024`, but only if the user thinks to run it. The statusline is the one surface seen continuously without asking (#2734).
+
+**Behavior:** Renders `state ~N commits back` inside the GSD-state segment when `STATE.md` carries a `state_head` stamp (#2573) and `HEAD` is at least `STATE_HEAD_ADVISORY_COMMITS` (20) commits past it. Both statusline formats carry it — the default renderer and the compact `statusline.state_format` one.
+
+**The threshold is 20, deliberately not 1.** With `commit_docs: true` (the default) the commit carrying a `STATE.md` sync advances `HEAD` by one, so a `> 0` threshold would render `state ~1 commits back` permanently on a project that is by construction fresh — alarm fatigue on the one always-visible surface.
+
+**It degrades to silence rather than to a wrong answer.** The marker is absent — never "fresh" — when the stamp is malformed, when the project root does not own its `.git` (an enclosing unrelated repo would otherwise answer), in a `planning.sub_repos` workspace (the outer `HEAD` never advances when code lands in children), when history was rewound past the stamp, and when git is unavailable or slow. A freshness claim the project cannot substantiate degrades to *unknown*.
+
+**Cost:** exactly one bounded `git rev-list` call per render, and only when enabled *and* a stamp is present — `rev-list --left-right --count` answers ancestry and distance together, and repo pinning is a filesystem check rather than a subprocess. Disabled (the default) it adds none.
+
+**A proxy, never a drift measurement.** The count includes commits that touched nothing `STATE.md` describes, and the stamp restamps on every state write — so a low count means "something wrote STATE recently", not "STATE is accurate". Rendered with a `~`; never gate on it.
+
+**Reference:** [Configuration](CONFIGURATION.md) · [Read the statusline freshness marker](how-to/read-the-statusline-freshness-marker.md) · [ADR-2164](adr/2164-statusline-scope-boundary.md)
+
+### 163. Read-Only Planning Snapshot (`planning inspect`)
+
+**Command:** `gsd-tools query planning inspect`
+
+**Purpose:** Give downstream consumers — harness UIs, mission-control surfaces, dashboards, bots — one schema-versioned JSON document describing everything `.planning/` knows, so nothing outside gsd-core has to parse `ROADMAP.md` / `REQUIREMENTS.md` / `*-PLAN.md` / `*-SUMMARY.md` a second time. gsd-core is the single source of `.planning/` truth; a second parser is a second answer.
+
+**Requirements:**
+- REQ-INSP-01: `PLANNING_INSPECT_SCHEMA_VERSION = 1` is emitted as `schema_version`. Consumers MUST reject any other value rather than best-effort-parse an unknown shape.
+- REQ-INSP-02: Read-only. The command mutates no planning state, and mutates nothing on disk, under any input.
+- REQ-INSP-03: Unknown or conflicting evidence serializes as `null` / `"unknown"` with a coded entry in `diagnostics[]` — never inferred, reconciled, or defaulted. Every key is always present; a key is never omitted to signal absence.
+- REQ-INSP-04: Argument errors fail loud (non-zero exit, typed `ERROR_REASON`); data gaps do not. v1 takes no arguments, and a stray positional or unknown flag is a usage error rather than a silently-ignored one.
+- REQ-INSP-05: Roadmap acceptance, verification status, and UAT items are reported side by side per phase and are never folded into a single verdict. A ROADMAP checkbox carries `authoritative: false` — completion is derived from disk state.
+- REQ-INSP-06: `accepted_phases` and `completed_plans` are independent fractions. `percent` is `null` whenever the scope is not `complete`, per the same rule the roadmap and progress surfaces follow.
+- REQ-INSP-07: Payloads over ~50 KB use the existing `@file:` spill channel, resolved transparently before stdout.
+
+**Why it does not simply serialize the internal snapshot.** `PlanningSnapshot` (the diagnostic-rule subject introduced by ADR-3180 §8.1) is deliberately additive and still growing — four fields at Phase 10, twenty-plus by Phase 12. Handing that shape to external consumers would freeze an internal contract by accident. `planning inspect` declares its own flat schema and maps into it, so a field added to `PlanningSnapshot` never changes what this command emits.
+
+**Composed, never re-derived.** Milestone identity and phase enumeration arrive via `buildPlanningSnapshot`; completion from `isPhaseComplete` (disk-strict); live-plan counting from `scanPhasePlans`; the percentage arithmetic from `clampPercent`; STATE fields from `stateFieldValue`; plan bodies from the Plan Document Module; requirement IDs from `parseRequirements`; UAT items from `parseUatItems`. Markdown structure is read through the Markdown Sectionizer and Markdown Table Model seams, so the Traceability table is resolved by column name against its registered schema rather than by a position-anchored regex.
+
+**Known limit — task-scoped file provenance.** A `<task>` declares the files it plans to touch, but `SUMMARY.md`'s `## Files Created/Modified` describes the whole plan. Spreading that list across a plan's tasks would be inference, so a task's `changed_files` is populated only where the summary attributes files to that specific task; otherwise it is `null` with `provenance: "plan_scoped"`. Closing this needs a change to the SUMMARY format, not to the reader.
+
+**Reference:** [CLI Tools](CLI-TOOLS.md#planning-inspect) · [Consume the planning snapshot](how-to/consume-the-planning-snapshot.md)

@@ -113,7 +113,7 @@ Extract from the imported content:
 
 <step name="plan_conflict_detection">
 
-Run conflict checks against the loaded project context. The report format, severity semantics, and safety-gate behavior are defined by `references/doc-conflict-engine.md` — read it and apply it here. Operation noun: `import`.
+Run conflict checks against the loaded project context. The report format, severity semantics, and safety-gate behavior are defined by `gsd-core/references/doc-conflict-engine.md` — read it and apply it here. Operation noun: `import`.
 
 ### BLOCKER checks (any one prevents import):
 
@@ -134,7 +134,7 @@ Run conflict checks against the loaded project context. The report format, sever
 - Plan uses a library not currently in the project tech stack → [INFO]
 - Plan adds a new phase to the ROADMAP.md structure → [INFO]
 
-Render the full Conflict Detection Report using the format in `references/doc-conflict-engine.md`.
+Render the full Conflict Detection Report using the format in `gsd-core/references/doc-conflict-engine.md`.
 
 **If any [BLOCKER] exists:** apply the safety gate from the reference — exit WITHOUT writing any files. No PLAN.md is written when blockers exist.
 
@@ -142,7 +142,7 @@ Render the full Conflict Detection Report using the format in `references/doc-co
 
 **Text mode (`workflow.text_mode: true` in config or `--text` flag):** Set `TEXT_MODE=true` if `--text` is present in `$ARGUMENTS` OR `text_mode` from init JSON is `true`. When TEXT_MODE is active, replace every `AskUserQuestion` call with a plain-text numbered list and ask the user to type their choice number. This is required for non-Claude runtimes (OpenAI Codex, Gemini CLI, etc.) where `AskUserQuestion` is not available.
 
-Ask via AskUserQuestion using the approve-revise-abort pattern (see `references/gate-prompts.md`):
+Ask via AskUserQuestion using the approve-revise-abort pattern (see `gsd-core/references/gate-prompts.md`):
 - question: "Review the warnings above. Proceed with import?"
 - header: "Approve?"
 - options: Approve | Abort
@@ -204,13 +204,22 @@ Delegate validation to gsd-plan-checker:
 
 Print: "Delegating to gsd-plan-checker (runs in a subagent — no output until it returns, ~1–5 min; expected, not a freeze)"
 
+```bash
+CHECKER_MODEL=$(gsd_run query resolve-model gsd-plan-checker --raw)
+```
+
 <!-- #2508 runtime-aware-dispatch -->
 
 > **Runtime-aware dispatch (#2508 Phase 4).** GSD workflows dispatch specialized subagents by role. Before dispatching on a built-in-only runtime (kimi-code — three built-ins only), resolve the role to a built-in via `gsd_run query resolve-dispatch-type --requested <role> --raw`. On named-dispatch runtimes (Claude/OpenCode/…) the role is returned unchanged; on kimi-code it maps to `coder`/`explore`/`plan` by role-suffix. The persona rides `${AGENT_SKILLS_<ROLE>}` (Phase 3) regardless. See @gsd-core/references/runtime-aware-dispatch.md.
 
+<!-- #2517 model-omit-on-inherit -->
+
+> **Model omission (#2517).** Omit the `model` parameter entirely when the value it would carry (`CHECKER_MODEL`) is `"inherit"` or empty. An empty value 404s on runtimes without native tier aliases — the default on non-Claude runtimes. Omitting it inherits the orchestrator's model. See @gsd-core/references/model-profile-resolution.md.
+
 ```
 Agent({
   subagent_type: "gsd-plan-checker",
+  model: "{CHECKER_MODEL}",
   prompt: "Validate: ${phase_dir}/{plan}-PLAN.md — check frontmatter completeness, task structure, and GSD conventions. Report any issues."
 })
 ```
@@ -256,7 +265,7 @@ Show: plan filename written, phase directory, validation result, next steps.
 ## Anti-Patterns
 
 Do NOT:
-- Violate the shared conflict-engine contract in `references/doc-conflict-engine.md` (no markdown tables, no new severity labels, no bypass of the BLOCKER gate)
+- Violate the shared conflict-engine contract in `gsd-core/references/doc-conflict-engine.md` (no markdown tables, no new severity labels, no bypass of the BLOCKER gate)
 - Write PLAN.md files as `PLAN-01.md` or `plan-01.md` — always use `{NN}-{MM}-PLAN.md`
 - Use `pbr:plan-checker` or `pbr:planner` — use `gsd-plan-checker` and `gsd-planner`
 - Write `.planning/.active-skill` — this is a PBR pattern with no GSD equivalent

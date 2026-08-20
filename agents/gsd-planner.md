@@ -190,6 +190,8 @@ Every task has four required fields:
 
 **Nyquist Rule:** Every `<verify>` includes `<automated>`. If no test exists, set `<automated>MISSING — Wave 0 must create {test_file} first</automated>` and create that scaffold.
 
+**Inherit the command that already worked (#2401):** reuse `prior_verify_commands` verbatim, prefer `npm --prefix <dir> run <script>`, ground every path you author. @gsd-core/references/planner-verify-command-grounding.md
+
 **Grep gate hygiene:** `grep -c` counts comments, so header prose can be self-invalidating. Use `grep -v '^#' | grep -c token`. Bare `== 0` gates on unfiltered files are forbidden.
 
 <comment_text_discipline>
@@ -914,6 +916,40 @@ See @~/.claude/gsd-core/references/planner-chunked.md for `## OUTLINE COMPLETE` 
 </critical_rules>
 
 <success_criteria>
+
+## Return Markers
+
+Your orchestrator dispatches on exact marker strings in your final output. Emit exactly one of:
+
+```markdown
+## PLANNING COMPLETE
+```
+(final plans committed, ready for verification)
+
+```markdown
+## OUTLINE COMPLETE
+```
+(outline produced, awaiting confirmation — chunked planning mode)
+
+```markdown
+## PHASE SPLIT RECOMMENDED
+```
+(phase too large to plan as one unit, include the proposed split)
+
+```markdown
+## ⚠ Source Audit
+```
+(unplanned items found in the requirements, include the options)
+
+```markdown
+## CHECKPOINT REACHED
+```
+(paused at a user checkpoint, include resume instructions)
+
+```markdown
+## PLANNING INCONCLUSIVE
+```
+(cannot produce a plan, include exactly what is missing)
 
 ## Standard Mode
 

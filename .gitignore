@@ -77,6 +77,7 @@ build/
 /gsd-core/bin/lib/host-integration-adapters/cline-sdk-binding.cjs
 /gsd-core/bin/lib/handshake-serialized.cjs
 /gsd-core/bin/lib/install-effort-resolver.cjs
+/gsd-core/bin/lib/install-model-override-resolver.cjs
 /gsd-core/bin/lib/install-engine.cjs
 /gsd-core/bin/lib/embedding-adapter.cjs
 /gsd-core/bin/lib/adapter-declarative.cjs
@@ -131,6 +132,7 @@ build/
 /gsd-core/bin/lib/config-types.cjs
 /gsd-core/bin/lib/cli-exit.cjs
 /gsd-core/bin/lib/code-review-flags.cjs
+/gsd-core/bin/lib/code-review-depth.cjs
 /gsd-core/bin/lib/context-utilization.cjs
 /gsd-core/bin/lib/artifacts.cjs
 /gsd-core/bin/lib/command-arg-projection.cjs
@@ -199,6 +201,9 @@ build/
 /gsd-core/bin/lib/planning-workspace.cjs
 /gsd-core/bin/lib/planning-scope.cjs
 /gsd-core/bin/lib/planning-snapshot.cjs
+/gsd-core/bin/lib/planning-inspect.cjs
+/gsd-core/bin/lib/planning-command-router.cjs
+/gsd-core/bin/lib/plan-document.cjs
 /gsd-core/bin/lib/pattern.cjs
 /gsd-core/bin/lib/text-lines.cjs
 /gsd-core/bin/lib/token-scanner.cjs
@@ -219,6 +224,7 @@ build/
 /gsd-core/bin/lib/runtime-artifact-layout.cjs
 /gsd-core/bin/lib/install-scope.cjs
 /gsd-core/bin/lib/install-fs-adapter.cjs
+/gsd-core/bin/lib/user-artifact-staging.cjs
 /gsd-core/bin/lib/installed-surface-resolver.cjs
 /gsd-core/bin/lib/install-shadow-report.cjs
 /gsd-core/bin/lib/runtime-config-adapter-registry.cjs
@@ -249,6 +255,7 @@ build/
 /gsd-core/bin/lib/gate-predicate-evaluator.cjs
 /gsd-core/bin/lib/docs.cjs
 /gsd-core/bin/lib/check-command-router.cjs
+/gsd-core/bin/lib/verify-command-grounding.cjs
 /gsd-core/bin/lib/frontmatter.cjs
 /gsd-core/bin/lib/learnings.cjs
 /gsd-core/bin/lib/gsd2-import.cjs

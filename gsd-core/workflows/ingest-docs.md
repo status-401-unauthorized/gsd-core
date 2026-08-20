@@ -56,6 +56,9 @@ _GSD_SHIM_NAME="gsd-tools.cjs"; _GSD_RUNTIME_ROOT="${RUNTIME_DIR:-$(git rev-pars
 RESPONSE_LANGUAGE=$(gsd_run query config-get response_language --default "" 2>/dev/null || echo "")
 INIT=$(gsd_run init ingest-docs)
 if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
+CLASSIFIER_MODEL=$(gsd_run query resolve-model gsd-doc-classifier --raw)
+SYNTHESIZER_MODEL=$(gsd_run query resolve-model gsd-doc-synthesizer --raw)
+ROADMAPPER_MODEL=$(gsd_run query resolve-model gsd-roadmapper --raw)
 ```
 
 **If `response_language` is set:** All user-facing questions, prompts, and explanations in this workflow MUST be presented in `{response_language}`. Technical terms, code, file paths, and subagent prompts stay in English — only user-facing output is translated.
@@ -68,7 +71,7 @@ Parse `project_exists`, `planning_exists`, `has_git`, `git_worktree_root`, `in_n
 - `planning_exists: true` → `MODE=merge`
 - `planning_exists: false` → `MODE=new`
 
-If user passed `--mode new` but `.planning/` already exists: display warning and require explicit confirm via `AskUserQuestion` (approve-revise-abort from `references/gate-prompts.md`) before overwriting.
+If user passed `--mode new` but `.planning/` already exists: display warning and require explicit confirm via `AskUserQuestion` (approve-revise-abort from `gsd-core/references/gate-prompts.md`) before overwriting.
 
 Git initialisation (Bug #3491 — never create a nested `.git` inside an existing worktree):
 
@@ -140,7 +143,7 @@ GSD > Discovered {N} docs, which exceeds the v1 cap of 50.
 
 Exit without proceeding.
 
-**Display discovered set** and request approval (see `references/gate-prompts.md` — `yes-no-pick` pattern works; or `approve-revise-abort`):
+**Display discovered set** and request approval (see `gsd-core/references/gate-prompts.md` — `yes-no-pick` pattern works; or `approve-revise-abort`):
 
 ```
 Discovered {N} documents:
@@ -174,12 +177,18 @@ mkdir -p .planning/intel/classifications/
 
 For each discovered doc, spawn `gsd-doc-classifier` in parallel. In Claude Code, issue all Task calls in a single message with multiple tool uses so the harness runs them concurrently. For Copilot / sequential runtimes, fall back to sequential dispatch.
 
+<!-- #2517 model-omit-on-inherit -->
+
+> **Model omission (#2517).** Omit the `model` parameter entirely when the value it would carry (`CLASSIFIER_MODEL`, `SYNTHESIZER_MODEL`, `ROADMAPPER_MODEL`) is `"inherit"` or empty. An empty value 404s on runtimes without native tier aliases — the default on non-Claude runtimes. Omitting it inherits the orchestrator's model. See @gsd-core/references/model-profile-resolution.md.
+
 Per-spawn prompt fields:
 - `FILEPATH` — absolute path to the doc
 - `OUTPUT_DIR` — `{intel_dir}/classifications` (absolute — from `init ingest-docs`; #2376: a spawned classifier's own cwd may differ from the orchestrator's)
 - `MANIFEST_TYPE` — the type from the manifest if present, else omit
 - `MANIFEST_PRECEDENCE` — the precedence integer from the manifest if present, else omit
 - `<required_reading>` — `agents/gsd-doc-classifier.md` (the agent definition itself)
+
+**Model on every classifier spawn (#3602):** `model="{CLASSIFIER_MODEL}"` is a parameter of each Task/Agent call — not a prompt field, never folded into the prompt text — so `dynamic_routing`/`model_profile` tiers apply instead of the caller's session model. Omit the parameter per the rule above when the value is `"inherit"` or empty.
 
 Collect the one-line confirmations from each classifier. If any classifier errors out, surface the error and abort without touching `.planning/` further.
 
@@ -196,6 +205,7 @@ Spawn `gsd-doc-synthesizer` once (runs in a subagent — no output until it retu
 ```
 Agent({
   subagent_type: "gsd-doc-synthesizer",
+  model: "{SYNTHESIZER_MODEL}",
   prompt: "
     CLASSIFICATIONS_DIR: {intel_dir}/classifications
     INTEL_DIR: {intel_dir}
@@ -225,7 +235,7 @@ The synthesizer writes:
 
 Read `.planning/INGEST-CONFLICTS.md`. Count entries in each bucket (the synthesizer always writes the three-bucket header; parse the `### BLOCKERS ({N})`, `### WARNINGS ({N})`, `### INFO ({N})` lines).
 
-Apply the safety semantics from `references/doc-conflict-engine.md`. Operation noun: `ingest`.
+Apply the safety semantics from `gsd-core/references/doc-conflict-engine.md`. Operation noun: `ingest`.
 
 **If BLOCKERS > 0:**
 
@@ -263,6 +273,7 @@ Delegate to `gsd-roadmapper` (runs in a subagent — no output until it returns,
 ```
 Agent({
   subagent_type: "gsd-roadmapper",
+  model: "{ROADMAPPER_MODEL}",
   prompt: "
     Mode: new-project-from-ingest
     Intel: {intel_dir}/SYNTHESIS.md (entry point)
@@ -340,7 +351,7 @@ Show:
 ## Anti-Patterns
 
 Do NOT:
-- Violate the shared conflict-engine contract in `references/doc-conflict-engine.md` (no markdown tables, no new severity labels, no bypass of the BLOCKER gate)
+- Violate the shared conflict-engine contract in `gsd-core/references/doc-conflict-engine.md` (no markdown tables, no new severity labels, no bypass of the BLOCKER gate)
 - Write PROJECT.md, REQUIREMENTS.md, ROADMAP.md, or STATE.md when BLOCKERs exist in the conflict report
 - Skip the 50-doc cap — larger sets must use `--manifest` to narrow the scope
 - Auto-resolve LOCKED-vs-LOCKED ADR contradictions — those are BLOCKERs in both modes

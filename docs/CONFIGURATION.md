@@ -47,6 +47,7 @@ GSD stores project settings in `.planning/config.json`. Created during `/gsd-new
     "use_worktrees": true,
     "code_review": true,
     "code_review_depth": "standard",
+    "code_review_depth_overrides": [],
     "plan_bounce": false,
     "plan_bounce_script": null,
     "plan_bounce_passes": 2,
@@ -186,7 +187,7 @@ project one is reported, since that is the file you are most likely able to fix.
 | `dynamic_routing.provider_escalation` | string[] | ordered model IDs | (none) | Opt-in fallback providers tried when a run dies on a quota / rate limit — see [provider escalation](#provider-escalation-on-quota-exceeded--added-in-v143). Added in v1.43 ([#2296](https://github.com/open-gsd/gsd-core/issues/2296)) |
 | `project_code` | string | any short string | (none) | Prefix for phase directory names (e.g., `"ABC"` produces `ABC-01-setup/`). Added in v1.31 |
 | `phase_id_convention` | enum | `"milestone-prefixed"`, `null` | `null` | Phase ID naming convention. `null` = legacy numeric IDs (`Phase 1`, `Phase 2`). `"milestone-prefixed"` = globally unique IDs that encode the enclosing milestone (`Phase 1-01`, `Phase 1-02`). Run `gsd-tools roadmap upgrade --convention milestone-prefixed` to migrate an existing ROADMAP.md. |
-| `response_language` | string | language code | (none) | Language for agent responses (e.g., `"pt"`, `"ko"`, `"ja"`). Propagates to all spawned agents for cross-phase language consistency. Added in v1.32. UAT checkpoint frames (`/gsd-verify-work`) render a localized banner/instruction for English, Spanish, French, German, Portuguese, Japanese, Chinese, Korean, Italian, Dutch, Polish, Russian, Ukrainian, Turkish, Hindi, Arabic, Vietnamese, and Indonesian (endonyms and ISO codes also accepted); any other value falls back to the English frame. |
+| `response_language` | string | language code | (none) | Language for agent responses (e.g., `"pt"`, `"ko"`, `"ja"`). Propagates to all spawned agents for cross-phase language consistency. Added in v1.32. UAT checkpoint frames (`/gsd-verify-work`) render a localized banner/instruction for English, Spanish, French, German, Portuguese, Japanese, Chinese, Korean, Italian, Dutch, Polish, Russian, Ukrainian, Turkish, Hindi, Arabic, Vietnamese, and Indonesian (endonyms and ISO codes also accepted); any other value falls back to the English frame. One deliberate exception: the `spec-phase` edge-completeness probe is fed an English translation of each requirement's text, because its shape cues are English-only — the SPEC itself stays in this language. See [Spec-Phase Edge-Completeness Probe](FEATURES.md#144-spec-phase-edge-completeness-probe). |
 | `context_window` | number | any integer | `200000` | Context window size in tokens. Set `1000000` for 1M-context models (e.g., `claude-fable-5`). Values `>= 500000` enable adaptive context enrichment (full-body reads of prior SUMMARY.md, deeper anti-pattern reads). Configured via `/gsd-config --advanced`. |
 | `context_profile` | string | `dev`, `research`, `review` | (none) | Execution context preset that applies a pre-configured bundle of mode, model, and workflow settings for the current type of work. Added in v1.34 |
 | `claude_md_path` | string | any file path | `./.claude/CLAUDE.md` | Custom output path for the generated CLAUDE.md file. Useful for monorepos or projects that need CLAUDE.md in a non-root location. Defaults to `./.claude/CLAUDE.md` — a valid project-scoped memory location that keeps GSD-generated content from polluting a hand-crafted repo-root `CLAUDE.md` ([#1098](https://github.com/open-gsd/gsd-core/issues/1098)). An existing file without GSD markers is never overwritten unless `--force` is passed. Default changed from `./CLAUDE.md` in v1.5. Added in v1.36 |
@@ -239,6 +240,25 @@ The key suffix is **not** always the lane slug. Each lane declares the config ke
 | `review.models.gemini` | string | `null` | Model id for Gemini review (injected into -m), e.g. `"gemini-2.5-pro"` |
 | `review.models.opencode` | string | `null` | Model id for OpenCode review (injected into --model), e.g. `"claude-sonnet-4"` |
 | `review.models.kimi-code` | string | `null` | Model id for Kimi Code review (injected into -m) |
+
+### Resolved model recording (#2295)
+
+Every `/gsd-review` run records the resolved model per reviewer in the `REVIEWS.md` frontmatter as `models:` and `model_sources:`, whether or not the lane was pinned via the keys above.
+
+| `model_sources` value | Meaning |
+|---|---|
+| `pinned` | `review.models.<slug>` (or an ADR-1517 reviewer-instance `--model`) that really reached the invocation |
+| `served` | An OpenAI-compatible server echoed the model it actually ran. Most authoritative |
+| `requested` | openai-http: discovered from `/v1/models`, or the lane's declared `fallbackModel`; the server did not echo one |
+| `banner` | The CLI's own startup banner named it. File-output lanes only (`codex` today) |
+| `transcript` | The lane handler's own on-disk session log named it (`agy`'s `transcript_full.jsonl`) |
+| `unknown` | Nothing recoverable |
+
+A `models:` value reads `unknown` if and only if its `model_sources:` entry is `unknown`.
+
+When GSD applies a reasoning effort to a lane, the recorded value carries it as a
+`(reasoning=<level>)` suffix (for example `gpt-5.6-sol (reasoning=high)`) — the level is GSD's
+own resolved effort, not the CLI's default.
 
 **Ownership.** These keys are owned by their reviewer-lane capabilities rather than the central
 config schema — `review.models.ollama` belongs to the `ollama` capability, `review.ollama_host`
@@ -335,7 +355,7 @@ All workflow toggles follow the **absent = enabled** pattern. If a key is missin
 | `workflow.nyquist_validation` | boolean | `true` | Test coverage mapping during plan-phase research |
 | `workflow.ui_phase` | boolean | `true` | Generate UI design contracts for frontend phases |
 | `workflow.ui_safety_gate` | boolean | `true` | Prompt to run /gsd-ui-phase for frontend phases during plan-phase |
-| `workflow.assumption_delta` | boolean | `true` | Advisory architecture checkpoint during planning. When a phase makes something **plural, optional, or chosen** that used to be **singular, required, or derived** (e.g. a second auth method, a required field becoming optional, a constant becoming a parameter), the planner is prompted to re-ask whether the primary key / identity model still names the right thing (promote the new general representation vs. add it alongside). Non-blocking; fires only on a detected signal. Bare "or" is intentionally excluded (prose false-positives). Inspect a phase with `gsd query assumption-delta scan <phase>`. Added in #1561 |
+| `workflow.assumption_delta` | boolean | `true` | Advisory architecture checkpoint during planning. When a phase makes something **plural, optional, or chosen** that used to be **singular, required, or derived** (e.g. a second auth method, a required field becoming optional, a constant becoming a parameter), the planner is prompted to re-ask whether the primary key / identity model still names the right thing (promote the new general representation vs. add it alongside). Non-blocking; fires only on a detected signal. Bare "or" is intentionally excluded (prose false-positives). Inspect a phase with `gsd_run query assumption-delta scan <phase>`. Added in #1561 |
 | `workflow.ui_review` | boolean | `true` | Run visual quality audit (`/gsd-ui-review`) after phase execution in autonomous mode. When `false`, the UI audit step is skipped. |
 | `workflow.node_repair` | boolean | `true` | Autonomous task repair on verification failure |
 | `workflow.node_repair_budget` | number | `2` | Max repair attempts per failed task |
@@ -350,6 +370,7 @@ All workflow toggles follow the **absent = enabled** pattern. If a key is missin
 | `workflow.worktree_skip_hooks` | boolean | `false` | When `true`, executor agents in worktree mode pass `--no-verify` (skipping pre-commit hooks) and post-wave hook validation runs against the merged result instead. Opt-in escape hatch for projects whose hooks cannot run in agent worktrees. Default `false` runs hooks on every commit (#2924). |
 | `workflow.code_review` | boolean | `true` | Enable `/gsd-code-review` and `/gsd-code-review --fix` commands. When `false`, the commands exit with a configuration gate message. Added in v1.34 |
 | `workflow.code_review_depth` | string | `standard` | Default review depth for `/gsd-code-review`: `quick` (pattern-matching only), `standard` (per-file analysis), or `deep` (cross-file with import graphs). Can be overridden per-run with `--depth=`. Added in v1.34 |
+| `workflow.code_review_depth_overrides` | array | `[]` | Ordered list of `{ paths: string[], depth }` rules that escalate `/gsd-code-review` depth for specific directories, e.g. `[{ "paths": ["src/auth"], "depth": "deep" }]`. Each rule's `paths` are matched against the review's changed-file set by whole-segment directory-path prefix (`src/auth` matches `src/auth/token.ts`, never `src/authfoo/x.ts` or `docs/src/auth/x.ts`); matching is case-sensitive, following git. Glob syntax (`*`, `?`) is a configuration error, not sugar for a prefix. One matched file escalates the entire review — depth is not applied per file. Resolution order: `--depth=` flag → strongest matching rule → `workflow.code_review_depth` → `standard`; a matching rule wins even when its tier is weaker than the global default. A malformed rule (bad `depth`, glob syntax, absolute path, `..` segment, empty path, non-array `overrides`, non-object rule, malformed `paths`) is a configuration error and the review halts rather than falling back silently. The resolved depth and the matching rule are printed in the review output. Added in #2554 |
 | `workflow.plan_bounce` | boolean | `false` | Run external validation script against generated plans. When enabled, the plan-phase orchestrator pipes each PLAN.md through the script specified by `plan_bounce_script` and blocks on non-zero exit. Added in v1.36 |
 | `workflow.plan_bounce_script` | string | (none) | Path to the external script invoked for plan bounce validation. Receives the PLAN.md path as its first argument. Required when `plan_bounce` is `true`. Added in v1.36 |
 | `workflow.plan_bounce_passes` | number | `2` | Number of sequential bounce passes to run. Each pass feeds the previous pass's output back into the validator. Higher values increase rigor at the cost of latency. Added in v1.36 |
@@ -505,6 +526,80 @@ If none match, the starting directory is returned unchanged. Explicit `--project
 
 If `.planning/` is in `.gitignore`, `commit_docs` is automatically `false` regardless of config.json. This prevents git errors.
 
+#### Caveat: `.gitignore` does not affect files git already tracks
+
+Adding `.planning/` to `.gitignore` stops git from picking up **new** files there. It has no effect
+on files already committed — git keeps tracking those, so `git add -A` keeps staging them even
+though `commit_docs` now resolves to `false`. Because GSD's default is `commit_docs: true`, most
+existing projects have already committed `.planning/`, which makes this the common case rather than
+the edge case.
+
+`/gsd-health` reports this contradiction as **`W029`**:
+
+```
+W029  .planning/ is gitignored but N file(s) are still tracked by git
+      Fix: git rm -r --cached .planning/ && git commit -m "chore: stop tracking planning docs"
+```
+
+The warning is advisory. GSD never untracks files for you — `--repair` deliberately will not act on
+`W029`, because removing files from the index is destructive and the timing is yours to choose.
+
+Once you run the `git rm -r --cached` above, `.planning/` is untracked, the ignore rule takes full
+effect, and the warning clears.
+
+Note: a file deliberately force-added under an otherwise-ignored `.planning/` (`git add -f
+.planning/keep.md`) triggers this same warning — there is no reliable way to distinguish an
+intentional force-add from the accidental case above, so `W029` is expected in that situation too.
+
+### Per-Phase Override (`phase_commit_docs`)
+
+`commit_docs` is a single project-wide switch by default, but a tech lead may want to commit one
+phase's artifacts (e.g. an architecture or ADR phase) while keeping execution phases local. Set a
+dynamic key of the form `phase_commit_docs.<phase-id>` to override `commit_docs` for that phase only:
+
+```bash
+gsd-tools config-set phase_commit_docs.03 true
+gsd-tools config-set phase_commit_docs.07 false
+```
+
+```json
+{
+  "commit_docs": false,
+  "phase_commit_docs": {
+    "03": true,
+    "07": false
+  }
+}
+```
+
+The `<phase-id>` segment accepts the same phase-number shapes GSD uses elsewhere (`3`, `03`,
+`12A`, `3.2` — a project-code prefix like `PROJ-03` is normalized to the bare phase number before
+lookup), so `phase_commit_docs.3` and `phase_commit_docs.03` refer to the same entry.
+
+**Resolution order** (highest wins) when `gsd-tools commit` / `query commit` resolves the phase from
+the committed `--files` paths:
+
+1. `phase_commit_docs.<phase-id>` for the phase being committed
+2. explicit `commit_docs` / `planning.commit_docs` in config.json
+3. `.gitignore` auto-detect (see [Auto-Detection](#auto-detection) above)
+4. the manifest default (`true`)
+
+A per-phase value must be a real boolean — `"true"` (string), `1`, or `null` are never coerced and
+fall through to the next tier. A value set for a different phase than the one being committed never
+applies (no cross-phase leak). A commit that names no phase-scoped file (e.g. a project-wide
+`ROADMAP.md`-only commit) has no phase to look up, so tier 1 is inapplicable and resolution starts
+at tier 2 — unchanged from pre-#3587 behavior.
+
+When tier 1 suppresses a commit, the skip envelope's `reason` is
+`skipped_commit_docs_phase_false` — distinct from the project-wide `skipped_commit_docs_false` —
+so a caller is never told "commit_docs is false" when the project setting is actually `true`.
+
+A commit spanning multiple phases resolves the override against the first phase in the `--files`
+list, so scope `--files` to one phase when using the override.
+
+See [Keep planning docs out of a shared repo](how-to/keep-planning-docs-private.md#per-phase-override)
+for a worked example.
+
 ---
 
 ## Hook Settings
@@ -518,12 +613,40 @@ If `.planning/` is in `.gitignore`, `commit_docs` is automatically `false` regar
 | `statusline.show_context_tokens` | boolean | `false` | Append the absolute token count (e.g. `(156k)`) after the context meter's percentage. Sums input, cache-creation, cache-read, and output tokens from the hook payload — a broader basis than the meter's percentage (which excludes output tokens), so the two figures can diverge slightly. Opt-in; the meter is unchanged when the flag is absent |
 | `statusline.state_format` | string | `"full"` | Format of the GSD-state segment. `"full"` (default) is the existing rendering with milestone name and progress bar. `"compact"` renders `<version> · P<phase>/<total> · <status>` (e.g. `v1.12 · P7/12 · executing`) — drops the milestone name and bar, and collapses narrative statuses to the canonical keyword set from `normalizeStateStatus()` (`paused` — the canonical stuck state — renders uppercase as `PAUSED`) |
 | `statusline.show_git` | boolean | `false` | Append a git segment after the directory: current branch plus compact work-state markers (`+staged` `~unstaged` `?untracked` `↑ahead` `↓behind`, or `✓` when clean and in sync). One `git status --porcelain=v2` call per render; the segment is absent outside a git repo or when git is unavailable |
+| `statusline.show_state_freshness` | boolean | `false` | Append `state ~N commits back` to the GSD-state segment when STATE.md carries a `state_head` stamp and the codebase has moved at least 20 commits past it (the same advisory threshold `/gsd-health`'s W024 uses). Exactly one `git rev-list` call per render, and only when enabled and a stamp is present; the marker is absent below the threshold, outside a git repo, when the project root does not own its `.git`, and in `planning.sub_repos` workspaces |
 
 The prompt injection guard hook (`gsd-prompt-guard.js`) is always active and cannot be disabled — it's a security feature, not a workflow toggle.
 
 ### Private Planning Setup
 
-When `planning.commit_docs` is `false` and `.planning/` is listed in `.gitignore`, GSD treats planning artefacts as local-only. `planning.search_gitignored: true` ensures broad searches still include the `.planning/` directory in this configuration. See [Configure private planning](how-to/configure-model-profiles.md) for setup steps.
+When `planning.commit_docs` is `false` and `.planning/` is listed in `.gitignore`, GSD treats planning artifacts as local-only. `planning.search_gitignored: true` ensures broad searches still include the `.planning/` directory in this configuration. See [Keep planning docs out of a shared repo](how-to/keep-planning-docs-private.md) for the full setup, including untracking files git is already tracking.
+
+### `commit_docs` Pre-Commit Guard (opt-in)
+
+`planning.commit_docs: false` only stops GSD's own `gsd-tools commit`/`gsd-tools state`
+write path from committing `.planning/`. It does **not** stop a plain `git add -A` +
+`git commit` run by hand, or by a script outside GSD's own tooling, from staging and
+committing `.planning/` anyway.
+
+`gsd-tools commit-docs-guard enable` closes that gap by writing a `.git/hooks/pre-commit`
+hook into the **current repository** that refuses any commit staging `.planning/` files
+while `commit_docs` resolves to `false`. Resolution goes through the same
+[per-phase precedence chain](#per-phase-override-phase_commit_docs) `gsd-tools commit`/`query commit`
+use — a `phase_commit_docs.<phase-id>` override for the staged phase is honored here too, so the
+hook cannot contradict them. It is entirely opt-in — no install path wires it
+automatically:
+
+```bash
+gsd-tools commit-docs-guard enable   # write the hook (refuses to clobber an existing pre-commit hook)
+gsd-tools commit-docs-guard disable  # remove it (refuses to remove a hook GSD didn't write)
+```
+
+The hook is identified by a stable `# gsd-core:commit-docs-guard` marker line, so `enable`/
+`disable` detect it by presence of that marker rather than by byte-for-byte content — editing
+the file afterward does not make it unrecognizable. `enable` refuses (rather than silently
+writing an inert file) when `core.hooksPath` is already configured, since a hook written to
+`.git/hooks/pre-commit` would never run in that case; wire the guard into the configured hooks
+path by hand instead. See [Keep planning docs out of a shared repo](how-to/keep-planning-docs-private.md#pre-commit-guard-hook-optional) for the full walkthrough, including the linked-worktree case.
 
 ---
 
@@ -1138,7 +1261,7 @@ Invalid flag tokens are sanitized and logged as warnings. Only recognized GSD fl
 | gsd-doc-writer | Opus | Sonnet | Haiku | Sonnet | Inherit |
 | gsd-doc-verifier | Sonnet | Sonnet | Haiku | Haiku | Inherit |
 
-> **All 33 shipped agents have explicit per-profile tier assignments** in the catalog (`sdk/shared/model-catalog.json`). The table above shows a representative subset of the most-used agents. For agents not listed here, `model_overrides` accepts any shipped agent name. The authoritative profile data is derived from `sdk/shared/model-catalog.json` via `gsd-core/bin/lib/model-catalog.cjs` and `sdk/src/model-catalog.ts`.
+> **All 33 shipped agents have explicit per-profile tier assignments** in the catalog (`gsd-core/bin/shared/model-catalog.json`). The table above shows a representative subset of the most-used agents. For agents not listed here, `model_overrides` accepts any shipped agent name. The authoritative profile data is derived from `gsd-core/bin/shared/model-catalog.json` via `src/model-catalog.cts`.
 
 ### Per-Agent Overrides
 
