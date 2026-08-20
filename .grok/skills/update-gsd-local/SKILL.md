@@ -102,6 +102,24 @@ and regenerate the registry — do not leave Grok omitted while peers declare th
   `tests/grok-upgrades.test.cjs` install cases fail. Keep grok **out** of
   `MANIFEST_FAMILIES` (no `tests/fixtures/install-tree/grok.json` golden).
 
+**#2875 / VALID_CONVERTER_NAMES adapt triggers (agents path + closed enum):**
+
+- `#2875` deleted `bin/install.js`'s `_DESCRIPTOR_AGENTS_RUNTIMES` allow-list
+  and the inline agents loop. **Do not restore that set** (including a grok
+  member) — `tests/declarative-reference-augment.test.cjs` fails on a live
+  `const _DESCRIPTOR_AGENTS_RUNTIMES =`. Grok is a skills runtime with a
+  non-empty `artifactLayout` (`convertClaudeCommandToGrokSkill` /
+  `convertClaudeAgentToGrokAgent`), so agents stay on the descriptor path
+  via `installRuntimeArtifacts`. Prefer origin/next's agents-materialization
+  comment over the pre-#2875 fork exclusion list.
+- `tests/capability-registry.test.cjs` asserts `VALID_CONVERTER_NAMES.size`
+  and a complete expected-name list. Upstream bumps the count when it adds
+  converters; this fork must keep `convertClaudeCommandToGrokSkill` and
+  `convertClaudeAgentToGrokAgent`. As of the v1.11.0 / #2875 merge the
+  closed set is **32** (17 command/skill/workflow + 15 agent). Re-count from
+  `gsd-core/bin/lib/capability-validator.cjs` after merge — do not keep the
+  stale 29 (ours) or 30 (theirs) literals.
+
 Non-merge feature commits on the fork (historically):
 
 ```text
@@ -115,6 +133,8 @@ chore(grok): track /update-gsd-local skill in-repo
 chore(grok): require nvm use before build in update-gsd-local
 chore(grok): document tsc incremental cache wipe in update-gsd-local
 fix(grok): declare RUNTIME_META.globalSuffix after #3547
+chore(grok): refresh update-gsd-local after origin/next (Node 24, #3547)
+chore(grok): document #2875 agents path + VALID_CONVERTER_NAMES in update-gsd-local
 ```
 
 Plus periodic `Merge origin/next into grok-build` commits.
@@ -198,12 +218,15 @@ For each conflicted file:
    (`origin/next`).
 2. Prefer **preserving intentional Grok fork behavior** unless upstream clearly
    supersedes it (see Step 4 criteria). Especially careful on:
-   - `bin/install.js` (runtime flags, help text, install loops)
+   - `bin/install.js` (runtime flags, help text; after `#2875` do **not**
+     re-add `_DESCRIPTOR_AGENTS_RUNTIMES`)
    - `src/runtime-*.cts` and generated `gsd-core/bin/lib/*.cjs`
    - `capabilities/grok/**` (ours; may be untracked on upstream)
    - capability registry generators / `capability-registry.cjs`
    - tests that list runtimes or assume grok is a `~/.agents` legacy id
    - `tests/helpers/install-shared.cjs` (`RUNTIME_META` / `MANIFEST_FAMILIES`)
+   - `tests/capability-registry.test.cjs` (`VALID_CONVERTER_NAMES` size +
+     expected names must include both Grok converters)
 3. For generated CJS under `gsd-core/bin/lib/`:
    - Prefer resolving **source** correctly, then regenerate — **not** hand-editing
      both forever.
