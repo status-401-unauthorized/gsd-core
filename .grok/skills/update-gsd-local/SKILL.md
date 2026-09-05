@@ -78,7 +78,7 @@ this list when analysis shows upstream absorbed them or when new fork commits la
 |-------|---------------|--------|
 | Grok as installable runtime | `capabilities/grok/capability.json`, `bin/install.js` (`--grok` / `--grok-build`), runtime lists | First-class Grok Build install target → `~/.grok` |
 | Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME`. Grok **is** a registry runtime — do **not** re-list it in `LEGACY_NON_REGISTRY_RUNTIME_IDS`. Adapt origin/next tests that still treat grok as a `#3024` `~/.agents` legacy id. |
-| Host-integration parity | `capabilities/grok/capability.json` → `runtime.hostIntegration` | Track upstream descriptor schema (`dispatch.*`, `effortSurface`, …) so negotiation does not fail closed; see Step 4 |
+| Host-integration parity | `capabilities/grok/capability.json` → `runtime.hostIntegration` | Track upstream descriptor schema (`dispatch.isolation`, `dispatch.maxConcurrency`, `effortSurface`, …) so negotiation does not fail closed; see Step 4 |
 | Claude → Grok converters | `src/runtime-artifact-conversion.cts` → `gsd-core/bin/lib/runtime-artifact-conversion.cjs` | `convertClaudeCommandToGrokSkill`, `convertClaudeAgentToGrokAgent`, tool-name rewrites (`Task`→`spawn_subagent`, etc.) |
 | Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts |
 | Model tiers | `gsd-core/bin/shared/model-catalog.json` | Grok Build / Composer model ids for GSD model profiles |
@@ -86,8 +86,9 @@ this list when analysis shows upstream absorbed them or when new fork commits la
 
 **Descriptor schema drift is an adapt trigger:** when upstream adds or renames
 fields on runtime `capability.json` / `hostIntegration` (e.g. `dispatch.isolation`
-from ADR-1239 / #2584), port the equivalent into `capabilities/grok/capability.json`
-and regenerate the registry — do not leave Grok omitted while peers declare the axis.
+from ADR-1239 / #2584, `dispatch.maxConcurrency` from #3673), port the equivalent
+into `capabilities/grok/capability.json` and regenerate the registry — do not
+leave Grok omitted while peers declare the axis.
 
 **#3024 / #3547 adapt triggers (homes + install harness):**
 
@@ -120,6 +121,20 @@ and regenerate the registry — do not leave Grok omitted while peers declare th
   `gsd-core/bin/lib/capability-validator.cjs` after merge — do not keep the
   stale 29 (ours) or 30 (theirs) literals.
 
+**#3673 / maxConcurrency adapt triggers (dispatch axis + shipped-runtime count):**
+
+- `#3673` requires every shipped runtime descriptor to declare
+  `runtime.hostIntegration.dispatch.maxConcurrency` (a sourced positive integer
+  or the `"undocumented"` sentinel — never absent). Omit fails closed to `1`
+  in negotiation and fails
+  `tests/host-integration-validator-parity.test.cjs`. Grok has no cited cap →
+  declare `"maxConcurrency": "undocumented"` (same as every non-claude peer).
+- That test also hardcodes `registry.runtimes.length === 19` (upstream). This
+  fork ships grok as a first-class registry runtime, so after
+  `gen:capability-registry` the count is **20** (19 upstream + grok). Re-adapt
+  the literal when origin/next restores “exactly 19”; do not drop grok from the
+  registry to satisfy the upstream count.
+
 Non-merge feature commits on the fork (historically):
 
 ```text
@@ -135,6 +150,7 @@ chore(grok): document tsc incremental cache wipe in update-gsd-local
 fix(grok): declare RUNTIME_META.globalSuffix after #3547
 chore(grok): refresh update-gsd-local after origin/next (Node 24, #3547)
 chore(grok): document #2875 agents path + VALID_CONVERTER_NAMES in update-gsd-local
+fix(grok): declare dispatch.maxConcurrency undocumented after origin/next
 ```
 
 Plus periodic `Merge origin/next into grok-build` commits.
@@ -219,14 +235,23 @@ For each conflicted file:
 2. Prefer **preserving intentional Grok fork behavior** unless upstream clearly
    supersedes it (see Step 4 criteria). Especially careful on:
    - `bin/install.js` (runtime flags, help text; after `#2875` do **not**
-     re-add `_DESCRIPTOR_AGENTS_RUNTIMES`)
-   - `src/runtime-*.cts` and generated `gsd-core/bin/lib/*.cjs`
+     re-add `_DESCRIPTOR_AGENTS_RUNTIMES`). Recurring help hunk: take
+     origin/next’s new flags (e.g. `--kimi-code`, `--no-legacy-cleanup`,
+     `--reclaim-kimi-legacy`) then re-insert `--grok`.
+   - `src/runtime-*.cts` and generated `gsd-core/bin/lib/*.cjs`. Recurring
+     `rewriteStagedSkillBodies` hunk: keep **both** `case 'grok'` (ours) and
+     any new peer case (e.g. `case 'zcode'` from #4002) — do not drop one
+     to resolve the other.
    - `capabilities/grok/**` (ours; may be untracked on upstream)
    - capability registry generators / `capability-registry.cjs`
    - tests that list runtimes or assume grok is a `~/.agents` legacy id
-   - `tests/helpers/install-shared.cjs` (`RUNTIME_META` / `MANIFEST_FAMILIES`)
+   - `tests/helpers/install-shared.cjs` (`RUNTIME_META` / `MANIFEST_FAMILIES`).
+     Recurring: origin/next deleted the unused `LOCAL_DIR_NAME` map — **drop
+     it**; grok lives only on `RUNTIME_META` (`localDir` / `globalSuffix`).
    - `tests/capability-registry.test.cjs` (`VALID_CONVERTER_NAMES` size +
      expected names must include both Grok converters)
+   - `tests/host-integration-validator-parity.test.cjs` (`dispatch.maxConcurrency`
+     required; `registry.runtimes.length` is **20** here = 19 upstream + grok)
 3. For generated CJS under `gsd-core/bin/lib/`:
    - Prefer resolving **source** correctly, then regenerate — **not** hand-editing
      both forever.
@@ -297,17 +322,22 @@ for (const id of ["grok","claude","cursor","codex"]) {
 '
 ```
 
-2. If peers gained new axes that Grok omits (`isolation`, `effortSurface`, …),
-   **adapt** — do not leave omitted when Grok can declare a true value.
-   Omitted optional fields often **fail closed** in negotiation (safe floor),
-   which silently disables features (e.g. worktree isolation for execute-phase).
-3. Known mapping for Grok Build (as of harness-worktree support):
+2. If peers gained new axes that Grok omits (`isolation`, `maxConcurrency`,
+   `effortSurface`, …), **adapt** — do not leave omitted when Grok can declare
+   a true value. Omitted optional fields often **fail closed** in negotiation
+   (safe floor), which silently disables features (e.g. worktree isolation for
+   execute-phase; `#3673` concurrency degrades to sequential `1`).
+3. Known mapping for Grok Build (as of harness-worktree + #3673):
    - Grok `spawn_subagent(..., isolation="worktree")` is a **host** isolation
      primitive → declare `"isolation": "harness-worktree"` on
      `runtime.hostIntegration.dispatch` (same class as Claude/Cursor; **not**
      `orchestrator-worktree`, which means GSD creates worktrees itself).
    - If Grok later drops native worktree isolation, set `"none"` or omit only
      with an explicit analysis note.
+   - `dispatch.maxConcurrency`: no sourced Grok cap → `"undocumented"` (same
+     as every non-claude peer). Do not invent an integer. After declaring it,
+     re-adapt `tests/host-integration-validator-parity.test.cjs` if it still
+     asserts `registry.runtimes.length === 19` (this fork is **20**).
 4. After any edit to `capabilities/grok/capability.json`:
    `npm run gen:capability-registry` (Step 6). Confirm the embedded grok
    dispatch in `gsd-core/bin/lib/capability-registry.cjs` matches the descriptor.
@@ -335,7 +365,8 @@ node --test tests/grok-upgrades.test.cjs
    follow-up commit on `grok-build` with a clear message (e.g.
    `fix(grok): re-adapt converters after origin/next merge` or
    `fix(grok): declare dispatch.isolation harness-worktree after origin/next`
-   or `fix(grok): declare RUNTIME_META.globalSuffix after #3547`).
+   or `fix(grok): declare RUNTIME_META.globalSuffix after #3547`
+   or `fix(grok): declare dispatch.maxConcurrency undocumented after origin/next`).
 
 ### 6. Build the TypeScript / generated libs
 
@@ -490,6 +521,10 @@ const d=r.capabilities.grok.runtime.hostIntegration.dispatch;
 console.log("installed grok dispatch:", JSON.stringify(d));
 if (d.isolation !== "harness-worktree") {
   console.error("WARN: expected dispatch.isolation harness-worktree; got", d.isolation);
+  process.exitCode = 1;
+}
+if (d.maxConcurrency !== "undocumented") {
+  console.error("WARN: expected dispatch.maxConcurrency undocumented; got", d.maxConcurrency);
   process.exitCode = 1;
 }
 '
