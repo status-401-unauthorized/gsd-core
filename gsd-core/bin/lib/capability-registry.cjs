@@ -1970,7 +1970,8 @@ const capabilities = {
           "background": true,
           "subagentToolkit": "full",
           "backgroundDispatch": true,
-          "isolation": "harness-worktree"
+          "isolation": "harness-worktree",
+          "maxConcurrency": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
@@ -6846,7 +6847,8 @@ const runtimes = {
           "background": true,
           "subagentToolkit": "full",
           "backgroundDispatch": true,
-          "isolation": "harness-worktree"
+          "isolation": "harness-worktree",
+          "maxConcurrency": "undocumented"
         },
         "modelMode": "passive",
         "hookBus": "host",
