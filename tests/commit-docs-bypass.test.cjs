@@ -1,3 +1,4 @@
+// docs-guard-exempt: 'docs/readme.md' is a fast-check filler token and 'commit_docs' is a config key name, not a docs/ path read.
 /**
  * commit_docs bypass guard (#1783; superseded/widened by #3585)
  *
@@ -843,7 +844,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const fc = require('./helpers/fast-check-setup.cjs');
-const { cleanup, createTempGitProject } = require('./helpers.cjs');
+const { cleanup, createTempGitProject, captureFdSync } = require('./helpers.cjs');
 const { seedPhase } = require('./fixtures/index.cjs');
 const { gitOrThrow } = require('./helpers/git-fixture.cjs');
 const { GIT_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
@@ -852,6 +853,7 @@ const commands = require('../gsd-core/bin/lib/commands.cjs');
 const configCli = require('../gsd-core/bin/lib/config.cjs');
 const { loadConfigResolved, CONFIG_DEFAULTS } = require('../gsd-core/bin/lib/config-loader.cjs');
 const io = require('../gsd-core/bin/lib/io.cjs');
+const { ExitError } = require('../gsd-core/bin/lib/cli-exit.cjs');
 const { PHASE_NUMBER_TOKEN_SOURCE } = require('../gsd-core/bin/lib/phase-id.cjs');
 const { DYNAMIC_KEY_PATTERNS } = require('../gsd-core/bin/lib/config-schema.cjs');
 
@@ -879,23 +881,7 @@ function writeConfig(tmpDir, config) {
  * tests/config-get-default.test.cjs's captureFdWrite.
  */
 function captureFdWrite(fd, fn) {
-  const orig = fs.writeSync;
-  let captured = Buffer.alloc(0);
-  fs.writeSync = (writeFd, ...rest) => {
-    if (writeFd !== fd) return orig.call(fs, writeFd, ...rest);
-    const [data, offset = 0, length] = rest;
-    const chunk = Buffer.isBuffer(data)
-      ? data.subarray(offset, offset + (length ?? data.length - offset))
-      : Buffer.from(String(data), 'utf8');
-    captured = Buffer.concat([captured, chunk]);
-    return chunk.length;
-  };
-  try {
-    fn();
-  } finally {
-    fs.writeSync = orig;
-  }
-  return captured.toString('utf-8');
+  return captureFdSync(fd, fn);
 }
 
 function runCommit(tmpDir, message, files) {
@@ -905,35 +891,26 @@ function runCommit(tmpDir, message, files) {
   return JSON.parse(out);
 }
 
-/** Drives cmdConfigSet in-process, sentinel-exit style (mirrors
- * tests/config-get-default.test.cjs's runExpectError) for the one negative
- * (A4) case that must exercise error()'s process.exit(1) path. */
+/** Drives cmdConfigSet in-process (mirrors tests/config-get-default.test.cjs's
+ * runExpectError) for the one negative (A4) case that must exercise error()'s
+ * ExitError-throwing path (ADR-3889 — error() throws ExitError directly, it
+ * no longer calls process.exit()). */
 function runConfigSetExpectError(tmpDir, keyPath, value) {
-  const origExit = process.exit;
-  const origWriteSync = fs.writeSync;
   io.setJsonErrorMode(true);
-  let stderr = '';
-  fs.writeSync = (fd, ...rest) => {
-    if (fd !== 2) return origWriteSync.call(fs, fd, ...rest);
-    const [data, offset = 0, length] = rest;
-    const chunk = Buffer.isBuffer(data)
-      ? data.subarray(offset, offset + (length ?? data.length - offset)).toString('utf8')
-      : String(data);
-    stderr += chunk;
-    return Buffer.byteLength(chunk);
-  };
-  class _ExitSignal extends Error {}
-  process.exit = () => { throw new _ExitSignal('exit'); };
+  let capturedStderr = '';
   try {
-    configCli.cmdConfigSet(tmpDir, keyPath, value, true);
-  } catch (e) {
-    if (!(e instanceof _ExitSignal)) throw e;
+    capturedStderr = captureFdSync(2, () => {
+      try {
+        configCli.cmdConfigSet(tmpDir, keyPath, value, true);
+        assert.fail('expected cmdConfigSet to throw ExitError');
+      } catch (inner) {
+        if (!(inner instanceof ExitError)) throw inner;
+      }
+    });
   } finally {
-    process.exit = origExit;
-    fs.writeSync = origWriteSync;
     io.setJsonErrorMode(false);
   }
-  const parts = stderr.split('\n').filter(Boolean);
+  const parts = capturedStderr.split('\n').filter(Boolean);
   let payload = {};
   try { payload = JSON.parse(parts[parts.length - 1]); } catch { /* leave {} */ }
   return payload;

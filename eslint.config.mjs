@@ -24,6 +24,8 @@ import noUnboundedQuantifier from './eslint-rules/no-unbounded-quantifier.cjs';
 import noHardcodedTmp from './eslint-rules/no-hardcoded-tmp.cjs';
 import noBareNpmExec from './eslint-rules/no-bare-npm-exec.cjs';
 import requireUserprofileWithHome from './eslint-rules/require-userprofile-with-home.cjs';
+import requireFullTmpdirTriad from './eslint-rules/require-full-tmpdir-triad.cjs';
+import noUnboundedDirnameWalk from './eslint-rules/no-unbounded-dirname-walk.cjs';
 import normalizePathInContent from './eslint-rules/normalize-path-in-content.cjs';
 import requireFsOpFallback from './eslint-rules/require-fs-op-fallback.cjs';
 import noUnboundedSpawn from './eslint-rules/no-unbounded-spawn.cjs';
@@ -31,6 +33,9 @@ import noDuplicateFoldMarker from './eslint-rules/no-duplicate-fold-marker.cjs';
 import requireSubprocessTimeout from './eslint-rules/require-subprocess-timeout.cjs';
 import noExternalRequireInBin from './eslint-rules/no-external-require-in-bin.cjs';
 import noPrivateBinaryResolution from './eslint-rules/no-private-binary-resolution.cjs';
+import requireRegisteredExit from './eslint-rules/require-registered-exit.cjs';
+import noSwallowedPrecondition from './eslint-rules/no-swallowed-precondition.cjs';
+import noExactCaseEnvAccess from './eslint-rules/no-exact-case-env-access.cjs';
 
 const localPlugin = {
   rules: {
@@ -49,6 +54,8 @@ const localPlugin = {
     'no-hardcoded-tmp': noHardcodedTmp,
     'no-bare-npm-exec': noBareNpmExec,
     'require-userprofile-with-home': requireUserprofileWithHome,
+    'require-full-tmpdir-triad': requireFullTmpdirTriad,
+    'no-unbounded-dirname-walk': noUnboundedDirnameWalk,
     'normalize-path-in-content': normalizePathInContent,
     'require-fs-op-fallback': requireFsOpFallback,
     'no-unbounded-spawn': noUnboundedSpawn,
@@ -56,6 +63,9 @@ const localPlugin = {
     'require-subprocess-timeout': requireSubprocessTimeout,
     'no-external-require-in-bin': noExternalRequireInBin,
     'no-private-binary-resolution': noPrivateBinaryResolution,
+    'require-registered-exit': requireRegisteredExit,
+    'no-swallowed-precondition': noSwallowedPrecondition,
+    'no-exact-case-env-access': noExactCaseEnvAccess,
   },
 };
 
@@ -68,6 +78,11 @@ export default tseslint.config(
       '.worktrees/**',
       '.claude/**',
       'coverage/**',
+      // #4141: Stryker's sandbox (tempDirName in stryker.config.mjs, also gitignored
+      // and always-ignored by Stryker itself). A run that dies before cleanup leaves a
+      // copy of the tree here; linting it reports the path-scoped `local/*` rules as
+      // undefined, which reads as the plugin being broken rather than as scratch space.
+      '.stryker-tmp/**',
       '**/*.generated.cjs',
       // ADR-457: tsc-generated runtime artifact — lint the src/*.cts source, not the emitted .cjs.
       'gsd-core/bin/lib/claude-orchestration.cjs',
@@ -82,6 +97,8 @@ export default tseslint.config(
       // lint the src/install-model-override-resolver.cts source, not this.
       'gsd-core/bin/lib/install-model-override-resolver.cjs',
       'gsd-core/bin/lib/install-engine.cjs',
+      // #3712: tsc-generated runtime artifact — lint src/real-home-guard.cts, not this.
+      'gsd-core/bin/lib/real-home-guard.cjs',
       // #2874 (epic #2866 Phase 5): tsc-generated runtime artifact — lint the
       // src/install-fs-adapter.cts source, not this.
       'gsd-core/bin/lib/install-fs-adapter.cjs',
@@ -107,6 +124,8 @@ export default tseslint.config(
       'gsd-core/bin/lib/probe-core.cjs',
       'gsd-core/bin/lib/spec-section.cjs',
       'gsd-core/bin/lib/prohibition-enforcement.cjs',
+      // #3770: tsc-generated runtime artifact — lint the src/tdd-red-evidence.cts source.
+      'gsd-core/bin/lib/tdd-red-evidence.cjs',
       'gsd-core/bin/lib/ui-consideration-probe.cjs',
       'gsd-core/bin/lib/code-review-flags.cjs',
       'gsd-core/bin/lib/code-review-depth.cjs',
@@ -119,6 +138,8 @@ export default tseslint.config(
       'gsd-core/bin/lib/artifacts.cjs',
       'gsd-core/bin/lib/assumption-delta.cjs',
       'gsd-core/bin/lib/state-transition.cjs',
+      // #3873: tsc-generated runtime artifact — lint the src/state-md-schema.cts source, not this.
+      'gsd-core/bin/lib/state-md-schema.cjs',
       'gsd-core/bin/lib/command-arg-projection.cjs',
       'gsd-core/bin/lib/clock.cjs',
       'gsd-core/bin/lib/ui-safety-gate.cjs',
@@ -136,6 +157,8 @@ export default tseslint.config(
       'gsd-core/bin/lib/secrets.cjs',
       'gsd-core/bin/lib/smart-entry.cjs',
       'gsd-core/bin/lib/phase-lifecycle.cjs',
+      // #3227: tsc-generated artifact — lint src/state-contract.cts, not this.
+      'gsd-core/bin/lib/state-contract.cjs',
       'gsd-core/bin/lib/workstream-name-policy.cjs',
       'gsd-core/bin/lib/decisions.cjs',
       'gsd-core/bin/lib/validate.cjs',
@@ -203,6 +226,9 @@ export default tseslint.config(
       // 009 also imports node builtins (fs, path) like 007, so tsc emits the
       // same `__importDefault` helper. ADR-457: the linted source is the .cts.
       'gsd-core/bin/lib/installer-migrations/009-pi-retire-reserved-hooks-dir.cjs',
+      // 010 also imports node builtins (fs, path) like 007/009, so tsc emits
+      // the same `__importDefault` helper. ADR-457: the linted source is the .cts.
+      'gsd-core/bin/lib/installer-migrations/010-antigravity-retire-confighome-artifacts.cjs',
       'gsd-core/bin/lib/observability/logger.cjs',
       'gsd-core/bin/lib/active-workstream-store.cjs',
       'gsd-core/bin/lib/adr-parser.cjs',
@@ -238,6 +264,15 @@ export default tseslint.config(
       'gsd-core/bin/lib/config-loader.cjs',
       'gsd-core/bin/lib/phase-locator.cjs',
       'gsd-core/bin/lib/plan-dependency-graph.cjs',
+      // #3674: tsc-generated runtime artifact — lint the src/file-overlap-partitioner.cts source, not this.
+      'gsd-core/bin/lib/file-overlap-partitioner.cjs',
+      // #3675: tsc-generated runtime artifact — lint the src/quick-batch.cts source, not this.
+      'gsd-core/bin/lib/quick-batch.cjs',
+      // #3676: tsc-generated runtime artifacts — lint the
+      // src/quick-batch-dispatch.cts / src/quick-batch-command-router.cts
+      // sources, not these emitted .cjs files.
+      'gsd-core/bin/lib/quick-batch-dispatch.cjs',
+      'gsd-core/bin/lib/quick-batch-command-router.cjs',
       'gsd-core/bin/lib/roadmap-parser.cjs',
       'gsd-core/bin/lib/drift.cjs',
       'gsd-core/bin/lib/cjs-command-router-adapter.cjs',
@@ -294,6 +329,8 @@ export default tseslint.config(
       'gsd-core/bin/lib/capability-writer.cjs',
       // issue #1754: tsc-generated runtime artifact — lint the src/cli-skew-check.cts source.
       'gsd-core/bin/lib/cli-skew-check.cjs',
+      // issue #3146: tsc-generated runtime artifact — lint the src/runtime-identity.cts source.
+      'gsd-core/bin/lib/runtime-identity.cjs',
       // issue #1355: tsc-generated runtime artifact — lint the src/teams-status.cts source.
       'gsd-core/bin/lib/teams-status.cjs',
       // ADR-1372: tsc-generated runtime artifact — lint the src/markdown-sectionizer.cts source.
@@ -330,6 +367,23 @@ export default tseslint.config(
       // src/pattern.cts — module resolution for a .cts source is relative to
       // src/, not the output dir). Same verbatim-third-party exemption.
       'src/vendor/**',
+      // #3970 (ADR-3646 Phase 1): tsc-generated runtime artifact — the
+      // default `import childProcess from 'node:child_process'` import emits
+      // tsc's `__importDefault` helper (uses `var`), same class as 007/009/010
+      // above. Lint the src/task-content-resolution.cts source, not this.
+      'gsd-core/bin/lib/task-content-resolution.cjs',
+      // #3904 (ADR-3889 Phase 0): tsc-generated runtime artifact — generated
+      // by scripts/gen-scripts-cli-exit.cjs from a fresh compile of
+      // src/cli-exit.cts, and byte-guarded by `npm run lint:generated-sync`
+      // (stricter than lint: it forbids ANY hand edit, not just bad ones).
+      // Lint the src/cli-exit.cts source, not this emitted copy.
+      'scripts/lib/cli-exit.cjs',
+      // #3911 (ADR-3889 Phase 7): tsc-generated runtime artifact — generated
+      // by scripts/gen-hooks-cli-exit.cjs from the SAME fresh compile of
+      // src/cli-exit.cts (sibling registry require rewritten to `.js`), and
+      // byte-guarded by `npm run lint:generated-sync`. Lint the
+      // src/cli-exit.cts source, not this emitted copy.
+      'hooks/lib/cli-exit.js',
     ],
   },
 
@@ -392,6 +446,24 @@ export default tseslint.config(
       // the platform seam (src/shell-command-projection.cts, exempt by path).
       // See .gsd/phase/chore-3619-no-bare-binary-spawn/40-design.md.
       'local/no-private-binary-resolution': 'error',
+      // #3910 (epic #3889 Phase 6): ban raw process.exit() outside
+      // terminateNow — the only sanctioned terminator (src/cli-exit.cts).
+      // Load-bearing that this is registered HERE, not only on the emitted
+      // .cjs globs: the compiled gsd-core/bin/lib/*.cjs mirrors are globally
+      // eslint-ignored (ADR-457), so a rule registered only on the emitted
+      // surface never sees the real .cts sources (#3496).
+      'local/require-registered-exit': 'error',
+      // #3987 (issue #1884 class): flag a swallowed mkdirSync/openSync/
+      // platformEnsureDir failure inside a function that also references a
+      // *_ERRNOS retry/tolerate set — a fatal EACCES/ENOSPC/EROFS creating a
+      // precondition can be laundered into a retryable errno downstream. See
+      // eslint-rules/no-swallowed-precondition.cjs for the measured predicate
+      // and its known gap (inline-literal errno classification is not caught;
+      // fixed directly at the call site instead — capability-lock.cts).
+      'local/no-swallowed-precondition': 'error',
+      // #3624 (epic #3411 Phase 4): flag an exact-case env-var read off a
+      // non-process.env receiver. See CONTEXT.md DEFECT.WINDOWS-EXACT-CASE-ENV-ACCESS.
+      'local/no-exact-case-env-access': 'error',
     },
   },
 
@@ -475,6 +547,11 @@ export default tseslint.config(
       // ADR-3212 Phase 1 (#3412): pattern-construction seam prohibition —
       // see the src/**/*.cts block above for detail.
       'local/no-adhoc-regex-escape': 'error',
+      // ADR-1372 T7 widening (#3951 Rung B): reach extended from src/**/*.cts
+      // to scripts/**/*.cjs — see the src/**/*.cts block above for detail.
+      // The rule self-gates on filename too (eslint-rules/no-adhoc-markdown-parsing.cjs),
+      // so registering here alone would be inert without that gate change.
+      'local/no-adhoc-markdown-parsing': 'error',
     },
   },
 
@@ -505,6 +582,10 @@ export default tseslint.config(
       'local/no-external-require-in-bin': 'error',
       // #3619 (epic #3411 Phase 3): see the src/**/*.cts block above for detail.
       'local/no-private-binary-resolution': 'error',
+      // #3910 (epic #3889 Phase 6): see the src/**/*.cts block above for detail.
+      'local/require-registered-exit': 'error',
+      // #3624: see the src/**/*.cts block above for detail.
+      'local/no-exact-case-env-access': 'error',
     },
   },
 
@@ -532,6 +613,14 @@ export default tseslint.config(
     rules: {
       // #3619 (epic #3411 Phase 3): see the src/**/*.cts block above for detail.
       'local/no-private-binary-resolution': 'error',
+      // #3910 (epic #3889 Phase 6): see the src/**/*.cts block above for detail.
+      'local/require-registered-exit': 'error',
+      // #3624: see the src/**/*.cts block above for detail.
+      'local/no-exact-case-env-access': 'error',
+      // #4244 (origin #4020 / #4220): scripts/run-tests.cjs is the actual site
+      // of the shipped Windows CI hang — registered here (not only on
+      // tests/**/*.cjs below) so the rule covers the real bug's own location.
+      'local/no-unbounded-dirname-walk': 'error',
     },
   },
 
@@ -552,26 +641,14 @@ export default tseslint.config(
       'local/no-adhoc-regex-escape': 'error',
       // #3619 (epic #3411 Phase 3): see the src/**/*.cts block above for detail.
       'local/no-private-binary-resolution': 'error',
-      // n/no-process-exit is deliberately OFF for hooks ONLY.
-      //
-      // A hook is a standalone process whose ENTIRE contract is its exit code: the
-      // harness reads exit 2 as "deny". `process.exitCode = N; return;` is not
-      // equivalent — it lets execution continue past the denial, and several exits
-      // here are load-bearing in a way that makes that a behavior change, not a
-      // refactor:
-      //   - stdin-timeout guards (e.g. hooks/gsd-read-guard.js, gsd-cursor-subagent-stop.js)
-      //     fire from a setTimeout where NOTHING else terminates the process if stdin
-      //     never closes;
-      //   - hooks/gsd-worktree-path-guard.js exits from a nested `if` whose fallthrough
-      //     would otherwise reach a different unconditional exit;
-      //   - hooks/gsd-write-guard.js:159-175 documents that pipe writes are async on
-      //     Windows, so it deliberately does fs.writeSync(1/2, ...) BEFORE process.exit(2)
-      //     to avoid truncation.
-      // ADR-0012 and ADR-0174 scope the "never calls process.exit" convention to the
-      // Command Routing Hub (src/command-routing-hub.cts), not to hooks. Rewriting 89
-      // call sites in enforcement hooks to satisfy a rule aimed at libraries would trade
-      // a real behavior risk for a cosmetic win. See .gsd/phase/chore-3059-eslint-glob-coverage-guard/40-design.md.
-      'n/no-process-exit': 'off',
+      // #3910 (epic #3889 Phase 6): Phase 7 (#3911) migrated every enforcement
+      // hook onto terminateNow's write-then-terminate seam (hooks/lib/cli-exit.js),
+      // so the raw-process.exit escape hatch this block used to grant hooks
+      // (n/no-process-exit: 'off') is now dead — see the src/**/*.cts block
+      // above for detail on the rule itself.
+      'local/require-registered-exit': 'error',
+      // #3624: see the src/**/*.cts block above for detail.
+      'local/no-exact-case-env-access': 'error',
     },
   },
 
@@ -625,6 +702,12 @@ export default tseslint.config(
       'local/no-bare-npm-exec': 'error',
       // Require USERPROFILE alongside HOME assignments (ADR-1703 Phase 4)
       'local/require-userprofile-with-home': 'error',
+      // Require TEMP+TMP alongside any TMPDIR override — TMPDIR is never read on
+      // Windows, so a TMPDIR-only redirect silently no-ops there (#4220).
+      'local/require-full-tmpdir-triad': 'error',
+      // Require a fixed-point termination guard on any dirname() ancestor walk —
+      // a length/equality-only bound spins forever at a Windows drive root (#4020 / #4220).
+      'local/no-unbounded-dirname-walk': 'error',
       // Ban unbounded sync child_process spawns in tests (DEFECT.UNBOUNDED-SUBPROCESS).
       // No allowlist: the epic (#3064) migrated every site; the rule runs with no
       // exemption surface. The only sanctioned escapes are an explicit `timeout` on
@@ -639,6 +722,11 @@ export default tseslint.config(
       // // allow-adhoc-regex-escape: comments (design doc Notes: "not a 13th
       // production copy").
       'local/no-adhoc-regex-escape': 'error',
+      // ADR-1372 T7 widening (#3951 Rung B): reach extended from src/**/*.cts
+      // to tests/**/*.cjs — see the src/**/*.cts block above for detail.
+      // The rule self-gates on filename too (eslint-rules/no-adhoc-markdown-parsing.cjs),
+      // so registering here alone would be inert without that gate change.
+      'local/no-adhoc-markdown-parsing': 'error',
       // Ban raw setTimeout sync + elapsed/duration-style assertions via no-restricted-syntax
       'no-restricted-syntax': [
         'error',

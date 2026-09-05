@@ -31,8 +31,9 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const helpers = require('./helpers.cjs');
-const { runGsdTools, createTempProject, cleanup, TOOLS_PATH } = helpers;
+const { runGsdTools, createTempProject, cleanup, TOOLS_PATH, captureFdSync } = helpers;
 const processSeam = require('./helpers/process-seam.cjs');
+const { collectSection } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
 
 // runGsdTools's legacy shape drops stderr on success, but the #3311 contract
 // is exactly that a conflict is VISIBLE — these tests must see stderr. Drive
@@ -551,24 +552,16 @@ describe('#3311 guard: phase.complete does not lose a concurrent STATE.md write'
         },
       });
 
-      // Swallow fd-1 writes (io.output writes JSON straight to fd 1).
-      const origWriteSync = fs.writeSync;
+      // Capture fd-1 writes (io.output writes JSON straight to fd 1).
+      // Delegates to the shared, safe fd-capture helper (#4306) — see
+      // tests/helpers.cjs's captureFdSync.
       const captured = [];
-      fs.writeSync = function patchedWriteSync(fd, data, ...rest) {
-        if (fd === 1) {
-          captured.push(String(data));
-          return String(data).length;
-        }
-        return origWriteSync(fd, data, ...rest);
-      };
-
       let threw = null;
       try {
-        phaseMod.cmdPhaseComplete(tmpDir, '1', true);
+        captured.push(captureFdSync(1, () => phaseMod.cmdPhaseComplete(tmpDir, '1', true)));
       } catch (e) {
         threw = e;
       } finally {
-        fs.writeSync = origWriteSync;
         stateMod._resetStateLockTestHooks();
         stateMod._resetLockProbes();
       }
@@ -631,9 +624,9 @@ describe('#3311 guard: advancePlan stays a targeted field replace', () => {
     const after = result.content;
 
     const section = (text) => {
-      const m = text.match(/## Current Position\s*\r?\n([\s\S]*?)(?=\r?\n##|$)/i);
-      assert.ok(m, 'Current Position section must exist');
-      return m[1];
+      const s = collectSection(text, (h) => /^Current Position$/i.test(h.text));
+      assert.ok(s, 'Current Position section must exist');
+      return s.body;
     };
     const beforeSection = section(before);
     assert.ok(beforeSection.length > 0, 'before-section must be non-empty');

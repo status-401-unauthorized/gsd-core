@@ -25,12 +25,48 @@ node gsd-tools.cjs <command> [args] [--raw] [--cwd <path>]
 **Global flags (CJS):**
 
 
-| Flag           | Description                                                                  |
-| -------------- | ---------------------------------------------------------------------------- |
-| `--raw`        | Machine-readable output (JSON or plain text, no formatting)                  |
-| `--cwd <path>` | Override working directory (for sandboxed subagents)                         |
-| `--ws <name>`  | Workstream context for `.planning/workstreams/<name>` paths |
+| Flag                | Description                                                                  |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `--raw`             | Machine-readable output (JSON or plain text, no formatting)                  |
+| `--cwd <path>`      | Override working directory (for sandboxed subagents)                         |
+| `--ws <name>`       | Workstream context for `.planning/workstreams/<name>` paths |
+| `--pick <field>`    | Extract one field from a command's JSON output — see [`--pick <field>` contract](#--pick-field-contract) below |
 
+
+---
+
+### `--pick <field>` contract
+
+`--pick <field>` runs `<command>` as normal, parses its stdout as JSON, and
+extracts one field by name (dotted paths and `[N]` array indices are
+supported, e.g. `a.b.c`, `directories[-1]`). As of ADR-3473 §8.4 / #3884, the
+three possible outcomes are distinguished **by exit code**, never by an
+ambiguous empty string:
+
+| Outcome | stdout | stderr | Exit code |
+| --- | --- | --- | --- |
+| Field present | The field's value, coerced to a string | (none) | `0` |
+| Field absent (missing key, out-of-range index, dotted path partially missing, or a non-object JSON root) | empty | Diagnostic naming the field and the available top-level keys (or the actual JSON root type) | `1` (`pick_field_absent`) |
+| Command output is not JSON (including `--raw` output, which is plain text/human-readable, not JSON) | empty | Diagnostic saying the output was not JSON | `1` (`pick_output_not_json`) |
+
+A `null` or empty-string (`''`) field value is a real answer, not an absence
+— it still prints (an empty line) at exit **0**. Only the *absence of the
+field itself* is a failure. This is why `--raw` and `--pick` are, in
+practice, mutually exclusive: `--raw` output is not JSON, so combining them
+always hits `pick_output_not_json`.
+
+**This replaces the previous behavior.** Before #3884, an absent field (or
+non-JSON output) silently printed an empty string at exit `0` — indistinguishable
+from a field that genuinely held `null` or `''`. That coercion is gone. The
+common shell idiom
+
+```bash
+X=$(gsd_run query some.command --pick some_field 2>/dev/null) || X=default
+```
+
+now works as written: the `|| X=default` arm fires exactly when the field
+could not be resolved, and never fires merely because the resolved value
+happens to be empty.
 
 ---
 
@@ -45,7 +81,8 @@ node gsd-tools.cjs state load
 # Output STATE.md frontmatter as JSON
 node gsd-tools.cjs state json
 
-# Update a single field
+# Update a single field. Frontmatter keys are projections of body fields —
+# write the body field (see COMMANDS.md#state-update-field-value).
 node gsd-tools.cjs state update <field> <value>
 
 # Get STATE.md content or a specific section
@@ -56,6 +93,10 @@ node gsd-tools.cjs state patch --field1 val1 --field2 val2
 
 # Increment plan counter
 node gsd-tools.cjs state advance-plan
+# When no labeled plan position can be parsed (e.g. ## Current Position drifted
+# to pure narrative prose), declines with reason "plan_position_unreadable" plus
+# the disk-derived counts and the exact labeled lines to re-insert; STATE.md is
+# left byte-identical.
 
 # Record execution metrics
 node gsd-tools.cjs state record-metric --phase N --plan M --duration Xmin [--tasks N] [--files N]
@@ -214,6 +255,168 @@ Scope and limits, so the output is not read as more than it is:
 Every path the scan does recover is checked — there is no cap. The standalone
 `verify-summary` verb keeps its historical default of checking the first two.
 
+### `phase-plan-index`: unresolved `depends_on` tokens (ADR-3473 §8.5, #3427/#3885)
+
+A plan's `depends_on:` token must resolve to another plan in the same phase (by
+exact id or by canonical id). When a token resolves to neither, the edge is
+dropped and the dependent plan becomes a DAG root — `phase-plan-index` now
+names this in `warnings[]` instead of silently discarding it:
+
+```text
+Plan 03-02: depends_on token "typo-plan-id" does not resolve to any plan in this
+phase — edge dropped, wave placement for this plan may be unreliable
+```
+
+The token is escaped (quoted, control characters and embedded newlines
+backslash-escaped) before it is embedded in the warning, so a `depends_on`
+value crafted to contain a newline or a quote cannot forge a second,
+fabricated warning entry when `warnings[]` is printed one-per-line.
+
+**The wave-mismatch warning is suppressed for an affected plan.** Normally a
+plan whose declared `wave:` disagrees with the computed DAG wave gets its own
+warning (`"declared wave: N but depends_on DAG places it in wave M"`). When
+the disagreement is caused by a dropped edge on that same plan, that warning
+would blame the author for a mismatch the tool itself manufactured by losing
+an edge — so it does not fire for that plan; the unresolved-token warning above
+stands in its place. A plan with **no** dropped edges and a genuinely wrong
+`wave:` still gets the mismatch warning as before.
+
+This does not repair `waves` / `wave` themselves — those fields stay computed
+from the DAG with the edge missing, since the edge cannot be invented. A
+consumer using `wave` for scheduling (`WAVE_FILTER`, the wave-safety check)
+is still working from the degraded assignment; only the diagnostic surfaces
+the loss.
+
+### The ROADMAP `**Requirements**:` line grammar
+
+`phase complete` reads each phase's `**Requirements**:` line to decide which
+REQ-IDs to mark. The grammar is deliberately small, and it is documented here
+because the command now warns about it (#3697) — a warning about a rule that
+cannot be looked up is not actionable.
+
+**The canonical form is a comma-separated list of REQ-IDs.** Square brackets are
+optional; a REQ-ID is `PREFIX-N`, where the prefix is a letter followed by
+letters or digits. Two tolerances are worth knowing because the warnings below
+do **not** fire on them: the line is split on commas *and whitespace*, so
+`REQ-01 REQ-02` selects both; and the ID shape is matched case-insensitively,
+so `req-01` is selected and marked. Write the comma list anyway — it is what
+every template and every example uses — but neither spelling is an error:
+
+```
+**Requirements**: REQ-01, REQ-02, REQ-03
+**Requirements**: [REQ-01, REQ-02, REQ-03]
+```
+
+**Ranges are not expanded** — `REQ-01 … REQ-05` selects the two endpoints and
+nothing between them, and `REQ-01..REQ-05` selects nothing at all, because the
+whole token fails the ID shape. This is a deliberate non-feature, not an
+oversight: the line is a traceability record, and silently inventing IDs that
+appear nowhere in `REQUIREMENTS.md` is worse than declining to.
+
+**A deliberately empty line is written `TBD` or `None`.** Those two words are
+the placeholder vocabulary, and they are matched as the line's leading token, so
+`None (per ADR-7)` and `**None**` are declared-empty too. **Any other wording
+that selects no REQ-IDs warns** — `Deferred`, `N/A`, `Pending`, `TBA`, a bare
+`-`, or free prose — because from the command's side an unrecognised word is
+indistinguishable from a line that was meant to cite requirements and failed
+to. A line whose only content is an HTML comment is not "other wording" and
+stays silent, so the shipped template's own `<!-- ... -->` does not warn.
+
+**Write each requirement as a bare ID, separated by a comma.** The line is
+split on commas and whitespace only, and nothing else is stripped, so anything
+attached to an ID takes the ID with it. `REQ-01; REQ-02` marks **only**
+`REQ-02`; so do `REQ-01 ;REQ-02`, `**REQ-01;** REQ-02` and an ID carrying a
+stray invisible character. Those are the cases the warning names — it reports
+the dropped ID, because this is the quietest way to lose a requirement here
+(the command reports `requirements_updated: true` either way).
+
+**What the warning does NOT reach.** Stated so its silence is not read as a
+clean bill, and enumerated rather than summarised, because each of these is a
+requirement that goes missing without a word. The check fires only when the
+thing touching the ID is a `;`, a `:`, or an invisible character:
+
+- **Markdown styling on its own is silent.** `**REQ-01**, REQ-02` drops
+  `REQ-01` and says nothing at all. Styling is not evidence that a separator
+  was meant. `**REQ-01**; REQ-02` is silent for the same reason — the `**`
+  sits between the ID and the `;`, so nothing is touching the ID.
+- **Any other attached punctuation is silent.** `REQ-01/ REQ-02`,
+  `REQ-01| REQ-02`, `REQ-01. REQ-02`, `REQ-01+ REQ-02`, `REQ-01> REQ-02` and
+  their full-width and non-ASCII equivalents (`；`, `，`, `؛`) each mark only
+  `REQ-02`. A fully crossed sweep — 21 separators against bare, leading-space,
+  trailing-space and both-spaces spellings, 84 combinations — found **34**
+  silent under-selections, every one of them a separator glued to exactly one
+  of the two IDs. Only `;` and `:` are in the set. Widening it is a live
+  option — say the word — but each past widening of this check first fired on
+  a citation, so it is not done blind.
+- **A dropped ID whose prefix matches nothing selected is silent.**
+  `REQ-01, REQ-02: login` is reported; `REQ-01, FOO-02: x` is not. A citation
+  is textually identical to a dropped requirement — `REQ-01, see ADR-7:
+  section 3` carries `ADR-7:` in exactly the shape `REQ-01;` has — and prefix
+  agreement is the only thing that separates them without guessing at prose.
+  Anything inside matched parentheses is left alone for the same reason:
+  `(see ADR-7: section 3)` is a citation.
+
+The prefix gate is not complete in the other direction either: a citation that
+*shares* a selected prefix — `REQ-01, see REQ-7: sec 3` — does warn, naming
+`REQ-7` as dropped. Nothing at the token level separates that from a real
+drop.
+
+**Dash spellings need a full ID on both sides.** `REQ-01-REQ-05` reads as a
+range; `REQ-01-05` does not, and neither does any of its typographic variants
+(en dash, em dash, minus sign, and the rest). The reason is that
+`PREFIX-<digits><dash><digits>` is also a date (`FY-2026-08`) and a sub-numbered
+ID (`API-2-01`), so warning on it would be noise on lines that are perfectly
+correct. `..`, `…`, `to`, `thru` and `through` have no such reading and do
+accept a bare numeric endpoint (`REQ-01..05`). The cost is that
+`REQ-01, REQ-02-05` is not reported; a bare `REQ-02-05` still is, because it
+selects nothing.
+
+**What warns, and in which of the three voices.** All go to `warnings[]` and
+none blocks completion:
+
+- *"could not be parsed as a comma-separated REQ-ID list"* — the line did not
+  yield the requirements it appears to name. That covers two cases, and the
+  message says which one it is: ID-shaped text on the line was **not**
+  selected, so something was demonstrably dropped; **or** the line selected
+  nothing at all while not being a `TBD`/`None` placeholder, in which case
+  there may be no ID-shaped text on it whatsoever (`Deferred` takes this
+  voice). Either way nothing was marked and the line needs fixing.
+- *"contains what reads as a range between two cited REQ-IDs"* — the separator
+  is the only thing in question: a separator between two cited IDs could equally
+  be a range or an annotation, and the command cannot tell them apart, so it
+  states both readings rather than asserting a failure that may not have
+  happened. It speaks about the **separator**, not about the whole line. It is
+  also the *weakest* of the three claims, so it yields to the other two: a
+  demonstrated drop elsewhere on the line makes it a misparse, and an
+  unexamined over-cap token makes the line unverified — a voice whose claim is
+  that nothing was dropped cannot speak over a token no rule read.
+
+**Each warning carries a machine-readable kind.** The prose goes to
+`warnings[]` as before — that field is unchanged and is still an array of
+strings — and the kind is emitted beside it as `requirements_line_warning`,
+one of `req-line-misparse`, `req-line-range-reading` or `req-line-unverified`.
+The field is absent entirely when the line is clean. Key on the kind rather
+than on the wording; the wording is free to improve.
+
+Either of those two voices may add a factual note naming **ID-shaped text on the
+line that was not selected**. Square brackets *are* stripped — `[REQ-01, REQ-02]`
+is the documented form — but parentheses are not, so `(REQ-02)` is not marked.
+The command cannot tell that from `(ADR-7)`, which is a citation and correctly
+ignored, so it names what it skipped and leaves the judgement to you. Where the
+skipped text is `PREFIX-<digits>-<digits>` — the shape the dash rule above
+declines to adjudicate, because `FY-2026-08` is a date and `API-2-01` is a
+legal requirement id and no rule separates them — it is still named, with that
+ambiguity stated alongside it. Naming it and saying why it is ambiguous beats
+both alternatives: filtering it hides a real dropped requirement, and reporting
+it bare asks you to check whether a date is a requirement.
+The third voice is for input the command could not examine: *"could not be
+checked ... the REQ-ID selection on this line is unverified"*. Range detection
+is bounded at 2,048 characters per token, so a longer token is not classified —
+and unclassified is reported, never treated as clean. Selection itself is *not*
+bounded, so a valid REQ-ID longer than that is still selected and marked
+normally; it only triggers this voice if something beside it could have formed a
+range with it, which is the case where the bound actually suppressed a check.
+
 ---
 
 ## Roadmap Commands
@@ -324,8 +527,9 @@ elsewhere — phase scoping cannot be trusted, and the command now refuses
 rather than falling back to an over-inclusive filter that would archive every
 phase directory in the project. `unreadable` (no ROADMAP.md at all) and
 `unscoped` (no section for this version) are pre-existing, legitimately
-handled states and are not refused here. Pass `--force` to override, the same
-affordance the unstarted-phase guard uses.
+handled states and are not refused here. Pass `--force --confirm` to override, the same
+affordance the unstarted-phase guard uses (`--confirm` is required for any mutating run —
+#3726; `--force` alone does not imply it).
 
 ---
 
@@ -395,7 +599,7 @@ node gsd-tools.cjs capability set code-review --gate workflow.code_review=false
 node gsd-tools.cjs query teams-status [--active]
 ```
 
-Read-only detector for claude-code's experimental agent-teams feature (issue #1355). Resolves the runtime via the canonical `GSD_RUNTIME` → `config.runtime` → `'claude'` precedence, then checks `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`.
+Read-only detector for claude-code's experimental agent-teams feature (issue #1355). Resolves the runtime via the canonical `GSD_RUNTIME` → `config.runtime` → per-install runtime marker → `'claude'` precedence (#3897), then checks `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`.
 
 **Default (no flags):** prints a JSON object and exits 0:
 
@@ -503,6 +707,42 @@ hatch for a flag-shaped value the space-separated form cannot express — e.g.
 | `predicates` | array | Each entry is a live `Predicate` — `id`, `klass`, `value`, `line` (1-based source line), `section` (nearest enclosing heading) |
 
 This command is strictly read-only — no config writes, no disk mutation. See [ADR-1671](adr/1671-dynamic-context-management-platform.md) and [Architecture — CLI Tools](ARCHITECTURE.md#cli-tools-gsd-corebin).
+
+---
+
+## Intel Commands
+
+```bash
+node gsd-tools.cjs intel query <term>
+```
+
+Searches every JSON intel file under `.planning/intel/` (keys and values, including
+`arch-decisions.json`) for `<term>`. No-ops with `{ enabled: false }` when the `intel`
+capability is not active (`intel.enabled` in config).
+
+**Output JSON:**
+
+```json
+{ "matches": [{ "source": "file-roles.json", "entries": [...] }], "term": "…", "total": 3, "truncated": false }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `total` | number | Count of matched entries across every intel file |
+| `truncated` | boolean | `true` when the recursive walk of at least one intel file hit the 48-level depth ceiling before finishing — see below |
+
+### The 48-level recursion ceiling and `truncated` (ADR-3473 §8.5, #3885)
+
+The search recurses into nested objects/arrays up to **48 levels deep** (the bound is on
+depth, not breadth or total node count — a wide-but-shallow structure is unaffected). A
+match at or above the ceiling is not returned, and `truncated` is set to `true` on the
+result so a caller can tell "I stopped looking" apart from "there is no match here."
+
+`truncated: false` means the walk reached the bottom of every branch it visited — it does
+**not** by itself mean anything was found; check `total` for that. Before this fix, a
+search past the ceiling threw an uncaught `RangeError: Maximum call stack size exceeded`
+instead of returning a diagnosable result; a shallower search (depth ≤ 48) is unaffected
+and its result is unchanged.
 
 ---
 
@@ -776,7 +1016,7 @@ if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
 
 ```bash
 # Archive milestone
-node gsd-tools.cjs milestone complete <version> [--name <name>] [--no-archive-phases] [--force] [--dry-run] [--archive-quick]
+node gsd-tools.cjs milestone complete <version> (--confirm | --dry-run) [--name <name>] [--no-archive-phases] [--force] [--archive-quick]
 
 # Archive .planning/quick/* into milestones/<version>-quick/ WITHOUT the milestone complete close-out (#2142)
 node gsd-tools.cjs milestone archive-quick <version> [--dry-run]
@@ -791,13 +1031,14 @@ node gsd-tools.cjs requirements mark-complete <ids>
 | Flag | Description |
 |------|-------------|
 | `<version>` | Milestone version label to archive (e.g. `v1.0`). |
+| `--confirm` | **Required to mutate (#3726).** The archive is irreversible — ROADMAP.md/REQUIREMENTS.md archived, phase directories MOVED, STATE.md rewritten — so without this flag the command refuses and changes nothing (exit 1, with a message naming both `--confirm` and `--dry-run`). Not implied by `--force`, which only overrides the guards below. |
 | `--name <name>` | Display name for the MILESTONES.md entry. Defaults to `<version>`. |
 | `--no-archive-phases` | Leave phase directories in place instead of moving them into `.planning/milestones/<version>-phases/`. |
 | `--archive-quick` | Opt-in (default OFF, #2142): also move every directory under `.planning/quick/` into `.planning/milestones/<version>-quick/`, (re)write that archive directory's `README.md` index, and clear STATE.md's `### Quick Tasks Completed` table rows. See "`milestone archive-quick`" below for the narrower standalone form and the full behavior. |
 | `--force` | Override the unstarted-phase guard (see below). |
 | `--dry-run` | Print the archive plan (roadmap, requirements, phases, and — when `--archive-quick` is also passed — quick-task dirs to move) without mutating anything. |
 
-**Unstarted-phase guard.** Before archiving, the command scans the ROADMAP scoped for `<version>` and refuses if any `### Phase N:` heading in that slice has no matching phase directory on disk (`disk_status: no_directory`). Phase 0 (pre-milestone) and Phase 999 (backlog) sentinels are excluded. The guard runs whenever `--force` is absent, independent of `STATE.md`'s `milestone:` field — if that field is present but does not match `<version>`, a WARNING naming both values is emitted to stderr and the scan still runs (#2946). Pass `--force` to override.
+**Unstarted-phase guard.** Before archiving, the command scans the ROADMAP scoped for `<version>` and refuses if any `### Phase N:` heading in that slice has no matching phase directory on disk (`disk_status: no_directory`). Phase 0 (pre-milestone) and Phase 999 (backlog) sentinels are excluded. The guard runs whenever `--force` is absent, independent of `STATE.md`'s `milestone:` field — if that field is present but does not match `<version>`, a WARNING naming both values is emitted to stderr and the scan still runs (#2946). Pass `--force --confirm` to override (`--confirm` is required for any mutating run — #3726; `--force` alone does not imply it).
 
 **Sentinel directories are never archived.** The phase-directory move performed when `--no-archive-phases` is absent is now filtered through the same canonical sentinel predicate as `phases list` and `phases clear`: `999.*` (backlog) and `0-*` (pre-milestone) directories are left in place rather than moved into `.planning/milestones/<version>-phases/`. Previously this path was scoped only by the milestone window, with no sentinel filter, so a sentinel directory sitting inside the window could be archived along with the milestone's real phases.
 
@@ -884,6 +1125,15 @@ node gsd-tools.cjs verify-path-exists <path>
 
 # Append a row to STATE.md's "Quick Tasks Completed" table (schema-backed; #2133)
 node gsd-tools.cjs quick-tasks-append --task "<description>"
+# Optional (#3356) — supply a real quick id and task directory to write the canonical row the
+# `/gsd-quick` workflow itself renders, instead of a positional `#` and an em-dash `Directory`:
+node gsd-tools.cjs quick-tasks-append --task "<description>" --quick-id <id> --slug <slug>
+node gsd-tools.cjs quick-tasks-append --task "<description>" --directory "[<id>-<slug>](./quick/<id>-<slug>/)"
+# All three flags are optional. Omit them (as `fast.md` does, having neither an id nor a task
+# directory) and the emitted row is byte-identical to the pre-#3356 behavior. `--directory` wins
+# outright when given; otherwise `--quick-id` + `--slug` together derive the permalink.
+# This append touches only the body table — it no longer forces a re-derive of the disk-derived
+# `progress.*` frontmatter, which previously overwrote curated values (#3356).
 # See "Milestone Commands" below for `milestone archive-quick` (#2142) — sweeps .planning/quick/* into
 # milestones/<version>-quick/ and clears this table, without a full `milestone complete`.
 
@@ -911,8 +1161,17 @@ active window are still outstanding.
 
 ```bash
 # Complete a todo
-node gsd-tools.cjs todo complete <filename>
+node gsd-tools.cjs todo complete <filename> [--dry-run]
+```
 
+`--dry-run` previews the completion (a `dry_run`/`would_*` JSON payload naming
+the source, the destination, and the frontmatter keys it would set) without
+moving the file or touching anything on disk. A real completion moves the todo
+from `todos/pending/` to `todos/completed/` and upserts `completed:` and
+`status: completed` inside the file's frontmatter block. Unknown flags are
+rejected loudly.
+
+```bash
 # UAT audit — scan all phases for unresolved items
 node gsd-tools.cjs audit-uat
 
@@ -1001,11 +1260,12 @@ node gsd-tools.cjs worktree base-check
 node gsd-tools.cjs worktree set-baseref
 ```
 
-**`worktree base-check`** reads `worktree.baseRef` from a three-layer cascade — `.claude/settings.local.json`, then `.claude/settings.json`, then the user/global `settings.json` under `CLAUDE_CONFIG_DIR` (or `~/.claude`) — and compares the current `HEAD` SHA against `origin/HEAD`. Project-level settings take precedence over the user/global layer, so a machine-wide `worktree.baseRef:"head"` set via `/config` is honored when no project override exists. The `shouldDegrade` field is `true` when the execute-phase orchestrator will fall back to sequential execution. Possible `reason` values:
+**`worktree base-check`** reads `worktree.baseRef` from a three-layer cascade — `.claude/settings.local.json`, then `.claude/settings.json`, then the user/global `settings.json` under `CLAUDE_CONFIG_DIR` (or `~/.claude`) — and compares the current `HEAD` SHA against `origin/HEAD`. Project-level settings take precedence over the user/global layer, so a machine-wide `worktree.baseRef:"head"` set via `/config` is honored when no project override exists. The `shouldDegrade` field is `true` when the execute-phase orchestrator will fall back to sequential execution. `--mode` declares who creates the isolated worktree (#3659): `harness-worktree` (the default — the runtime harness forks it and does **not** read project-settings `baseRef`, #48) or `orchestrator-worktree` (GSD itself runs `git worktree add` with an explicit start-point and honors `"head"`); invalid values fail closed with an error. Possible `reason` values:
 
 | `reason` | `shouldDegrade` | Meaning |
 |---|---|---|
-| `baseref-head` | `false` | `worktree.baseRef:"head"` is set; no mismatch possible |
+| `baseref-head` | `false` | `worktree.baseRef:"head"` is set and `--mode orchestrator-worktree` declares GSD-managed worktrees — the fork base is the orchestrator HEAD by construction |
+| `baseref-head-ignored-by-harness` | `true` | `worktree.baseRef:"head"` is set but HEAD differs from `origin/HEAD` in harness (default) mode — the harness does not read the setting (#48), so the run degrades to sequential (#3659) |
 | `head-matches-fork` | `false` | HEAD and `origin/HEAD` are the same commit |
 | `head-diverged-from-fork` | `true` | Branch is ahead of or diverged from `origin/HEAD` |
 | `fork-ref-unknown` | `true` | `origin/HEAD` could not be resolved |
@@ -1043,6 +1303,27 @@ node gsd-tools.cjs worktree record-agent \
 **`worktree record-agent`** appends one `{agent_id, worktree_path, branch, expected_base}` entry to an already-initialized manifest, validating every field **at write time using the same rules the `cleanup-wave` reader enforces** — `--branch` must match the disposable `^(worktree-)?agent-[A-Za-z0-9._/-]+$` namespace (accepts both `agent-<id>` and legacy `worktree-agent-<id>`), and `--path`/`--branch`/`--base` must be non-empty. `--agent-id` is required (write-strict), even though the reader treats it as optional. A missing or garbled field — or a duplicate `(worktree_path, branch)` the reader would dedup away — fails loudly with a recovery hint and a non-zero exit **without** writing, instead of appending an under-populated or silently-dropped entry. Whitespace-only `--path`/`--base` are rejected (values are trimmed). The on-disk manifest shape is unchanged unless `--files` is supplied (see below); the reader still re-derives `allowed_bases`, and the orchestrator still initializes the empty `{orchestrator_root, worktrees: []}` shell inline before any agent is recorded.
 
 `--files` is optional (#2596). When supplied it records the plan's declared `files_modified` — the same whitespace-separated `PLAN_FILES` list the per-plan worktree gate already builds — as an extra `files_modified` array on the entry, and `cleanup-wave` then reports any path the branch committed outside it. A blank or omitted `--files` writes no field at all, leaving the 4-field on-disk shape untouched, and the scope check is simply skipped for that entry: an unrecorded scope means *unknown*, never *declares nothing*. Values are compared against a diff, never opened as paths and never passed to a shell.
+
+`--deletions` is optional (#3003). When supplied it records the plan's declared `files_deleted` — built by the per-plan worktree gate exactly like `PLAN_FILES`, from the plan's own frontmatter — as a `declared_deletions` array on the entry. It is the opt-in the deletions guard reads (see below). A blank or omitted `--deletions` writes no field, leaving the on-disk shape untouched and the guard's original unconditional block in force. Like `--files`, values are compared against a diff and never opened or passed to a shell.
+
+**Intentional deletions (gate, #3003)**
+
+`cleanup-wave` blocks the merge of any executor branch whose diff deletes a file — a net against a mass-deletion accident. A plan whose scope legitimately includes removing a file declares those paths in its `files_deleted` frontmatter, which reaches the entry as `declared_deletions`; the guard then blocks only the deletions **not** in that list.
+
+| Branch deletes | Entry declares | Result |
+|---|---|---|
+| nothing | — | merges |
+| `tests/a.ts` | *(no field)* | **blocked** — unchanged pre-#3003 behavior |
+| `tests/a.ts` | `["tests/a.ts"]` | merges |
+| `tests/a.ts`, `src/b.ts` | `["tests/a.ts"]` | **blocked**, and the block detail names only `src/b.ts` |
+| `tests/a.ts` | `["tests"]` | **blocked** — a directory does not authorize its children |
+| `tests/a.ts` | `["*.ts"]` | **blocked** — globs are literal paths here, matching nothing |
+
+Matching is **exact after normalization**: git's C-quoting is decoded, backslashes become forward slashes, and a leading `./` and any trailing `/` are stripped — on both sides. The decode matters more than it looks: with `core.quotepath` at its git default, a path like `tests/é.ts` is reported as the literal `"tests/\303\251.ts"`, which would never compare equal to the plainly-declared path, so a correctly declared deletion of any non-ASCII path would block forever with nothing pointing at the encoding. It is deliberately neither a prefix nor a glob match — either would let one declaration authorize a whole set of deletions, which is the accident the guard exists to catch. A declared path that was not in fact deleted is inert. A blocked entry still isolates: the rest of the wave proceeds (#2852). If the deletion check itself fails the entry blocks on `deletion_check_failed` and is never filtered — a broken check is not an authorization.
+
+A declared deletion is also treated as in-scope by the advisory below, so authorizing a removal does not then warn that the removed path was out of the declared scope. That is done by **subtracting** declared deletions from the advisory's findings, not by adding them to the declared scope it matches against — the advisory reads its scope list with prefix-and-glob semantics, so adding them would quietly give `declared_deletions` a second, wider matching rule than the table above, and `["*.md"]` would go from inert to silencing the advisory entirely. One field, one matching rule, on every surface. Subtraction also means the advisory's activation is unchanged: it still runs only when `files_modified` is recorded, so a plan that declares deletions alone stays as silent as it was before #3003.
+
+One limit worth knowing, shared with `--files` and failing closed: a declared path containing a **space** cannot be expressed, because the flag value is whitespace-separated — such a path splits into fragments, matches nothing, and the entry blocks. Flag values are also read positionally and never re-inspected for shape, so a malformed `--deletions --files src/a.ts` records the literal `--files` as the declaration; that is harmless (it is a path git never reports as deleted, so it authorizes nothing) and `--files` still resolves to `src/a.ts` on its own lookup.
 
 **Scope conformance at merge (advisory, #2596)**
 

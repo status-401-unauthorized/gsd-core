@@ -114,6 +114,52 @@ describe('smart-entry: situation coverage', () => {
     });
   }
 
+  // #3860-family guard is NOT wanted here; these are #3864's missing pins:
+  // the classifier's verify branch must match the same verif* stem that
+  // state-document's normalizeStateStatus matches, or a STATE.md declaring
+  // `status: verified` falls through to `unknown` (and, on a clean tree with
+  // unpushed commits, to idle-stranded — differently wrong).
+  test('#3864: status "verified" classifies as verify-pending', () => {
+    const dir = track(makeProject({ state: state({ status: 'verified', total_phases: 5, current_phase: 2 }), roadmap: true }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'verify-pending');
+  });
+
+  test('#3864: status "verification" classifies as verify-pending', () => {
+    const dir = track(makeProject({ state: state({ status: 'verification', total_phases: 5, current_phase: 2 }), roadmap: true }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'verify-pending');
+  });
+
+  test('#3864: the stem does not over-match — "completed" still reaches complete', () => {
+    const dir = track(makeProject({ state: state({ status: 'completed', total_phases: 5, current_phase: 5 }), roadmap: true }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'complete');
+  });
+
+  test('#3864: "Phase complete — ready for verification" at 5/5 stays complete (complete beats a verif-bearing status)', () => {
+    // A real handler-written Status default (state-document.cts). It carries
+    // the verif stem but names COMPLETION — isComplete must win over the
+    // verify-pending branch when the project is actually done.
+    const dir = track(makeProject({ state: state({ status: 'Phase complete — ready for verification', total_phases: 5, current_phase: 5 }), roadmap: true }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'complete');
+  });
+
+  test('#3864: "Phase complete — ready for verification" mid-project is verify-pending', () => {
+    // Same real status word, phases remaining: pre-fix this fell through to
+    // unknown/idle-stranded (no "verify" substring); the stem now routes it.
+    const dir = track(makeProject({ state: state({ status: 'Phase complete — ready for verification', total_phases: 5, current_phase: 2 }), roadmap: true }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'verify-pending');
+  });
+
+  test('#3864: verify-failed still wins over the verify-pending stem (ordering pinned)', () => {
+    const dir = track(makeProject({ state: state({ status: 'verify-failed', total_phases: 5, current_phase: 2 }), roadmap: true, verifyFail: true }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'verify-failed');
+  });
+
   test('SITUATIONS constant lists all 11 (incl unknown) and is frozen', () => {
     assert.equal(SITUATIONS.length, 11);
     assert.ok(SITUATIONS.includes('unknown'));
@@ -281,7 +327,7 @@ describe('smart-entry: real STATE.md schema (nested progress YAML + body Phase f
       roadmap: true,
     }));
     const signals = detectSignals(dir);
-    assert.equal(signals.current_phase, 3, 'current_phase from body Phase: field');
+    assert.equal(signals.current_phase, '3', 'current_phase from body Phase: field');
     assert.equal(signals.total_phases, 5, 'total_phases from nested progress.total_phases');
     assert.equal(signals.progress, 40, 'percent from nested progress.percent');
     assert.equal(signals.status, 'verifying');
@@ -410,6 +456,19 @@ describe('smart-entry: JSON shape invariants', () => {
 
 describe('smart-entry: CLI dispatch (gsd-tools smart-entry)', () => {
   afterEach(removeAll);
+
+  test('#4023: --json preserves decimal current_phase as a phase-id string', () => {
+    for (const phase of ['12.1', '12.10']) {
+      const dir = track(makeProject({
+        state: state({ status: 'executing', total_phases: 13, current_phase: phase }),
+        roadmap: true,
+      }));
+      const r = runNode([TOOLS, 'smart-entry', '--json', '--cwd', dir], { timeoutMs: PROBE_TIMEOUT_MS });
+      throwIfFailed(r, 'gsd-tools smart-entry --json');
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.signals.current_phase, phase);
+    }
+  });
 
   test('--json in an empty dir returns no-project machine JSON', () => {
     // A bare tmpdir with no .planning is a true no-project.

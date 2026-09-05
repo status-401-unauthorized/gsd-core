@@ -132,7 +132,8 @@ const { installRuntimeArtifacts } = require('../gsd-core/bin/lib/install-engine.
 const { applySurface } = require('../gsd-core/bin/lib/surface.cjs');
 const { loadSkillsManifest, resolveProfile } = require('../gsd-core/bin/lib/install-profiles.cjs');
 const { resolveRuntimeArtifactLayout } = require('../gsd-core/bin/lib/runtime-artifact-layout.cjs');
-const { cleanup } = require('./helpers.cjs');
+const { cleanup, sandboxHome } = require('./helpers.cjs');
+const { runMinimalInstall } = require('./helpers/install-shared.cjs');
 
 const COMMANDS_GSD = path.join(ROOT, 'commands', 'gsd');
 
@@ -169,14 +170,25 @@ describe('#1575 — golden-parity: surface path matches install path for descrip
 
   for (const runtime of DESCRIPTOR_RUNTIMES) {
     test(`${runtime}: surface agents byte-identical to install agents`, (t) => {
-      const configDir = fs.mkdtempSync(path.join(os.tmpdir(), `gsd-1575-${runtime}-`));
-      t.after(() => { try { cleanup(configDir); } catch { /* best-effort */ } });
+      const installed = runMinimalInstall({ runtime, scope: 'global' });
+      const { configDir, root } = installed;
+      t.after(() => { try { cleanup(root); } catch { /* best-effort */ } });
+      // #3738: antigravity's skills/agents kinds declare a global `home`
+      // override resolved from os.homedir() — sandbox HOME to the install root
+      // (the #3712 marker real-home-guard needs) so the override resolves
+      // inside the sandbox instead of the runner's real home.
+      sandboxHome(t, root);
 
       // Step 1: install path writes agents
       installRuntimeArtifacts(runtime, configDir, 'global', parity1575Profile, resolveAttribution1575);
 
-      // Step 2: snapshot agent files
-      const agentsDir = path.join(configDir, 'agents');
+      // Step 2: snapshot agent files at the installer's REAL destination —
+      // honor the kind `home` override (codex → ~/.agents, antigravity →
+      // ~/.gemini/config per #3738) exactly like assertDestWithinConfigHome's
+      // root selection, never assume configDir/agents.
+      const parityLayout = resolveRuntimeArtifactLayout(runtime, configDir, 'global');
+      const parityAgentsKind = parityLayout.kinds.find((k) => k.kind === 'agents');
+      const agentsDir = path.join(parityAgentsKind.home ?? configDir, parityAgentsKind.destSubpath);
       const installSnap = snapshotAgents(agentsDir);
       assert.ok(installSnap.size > 0, `${runtime}: install must produce at least one gsd-* agent`);
 
@@ -214,8 +226,10 @@ describe('#1575 — golden-parity: surface path matches install path for descrip
     // is a no-op (it replaces existing lines, doesn't add new ones). But this test
     // proves the agentCtx threading is correct for both paths regardless.
     const attrResolver = () => 'Test Bot <test@example.com>';
-    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-1575-attr-'));
-    t.after(() => { try { cleanup(configDir); } catch { /* best-effort */ } });
+    const installed = runMinimalInstall({ runtime: 'cursor', scope: 'global' });
+    const { configDir, root } = installed;
+    t.after(() => { try { cleanup(root); } catch { /* best-effort */ } });
+    sandboxHome(t, root);
 
     installRuntimeArtifacts('cursor', configDir, 'global', parity1575Profile, attrResolver);
 
@@ -252,8 +266,9 @@ describe('#1575 — golden-parity: surface path matches install path for descrip
 
 describe('#1575 — surface path: no prune data-loss over pre-existing legacy agents', () => {
   test('pre-existing gsd-* agents not in staged set are pruned; user agents preserved', (t) => {
-    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-1575-prune-'));
-    t.after(() => { try { cleanup(configDir); } catch { /* best-effort */ } });
+    const installed = runMinimalInstall({ runtime: 'copilot', scope: 'global' });
+    const { configDir, root } = installed;
+    t.after(() => { try { cleanup(root); } catch { /* best-effort */ } });
 
     // Seed a pre-existing legacy .agent.md (simulating a prior install)
     const agentsDir = path.join(configDir, 'agents');
@@ -282,3 +297,33 @@ describe('#1575 — surface path: no prune data-loss over pre-existing legacy ag
 });
   });
 }
+
+test('runMinimalInstall resolves local config dirs from RUNTIME_META alone (#3031)', () => {
+  // install-shared.cjs used to carry a SECOND, hand-maintained local-dir map
+  // beside RUNTIME_META. It drifted: four runtimes present in RUNTIME_META
+  // (hermes, kimi, kimi-code, zcode) were missing from it, so `scope: 'local'`
+  // for any of them resolved `path.join(root, undefined)` and threw a bare
+  // TypeError naming neither the runtime nor the map at fault. #3023 had
+  // already hit this for `pi` and fixed it by adding one more entry, which
+  // left the divergence itself intact for the next runtime to rediscover.
+  //
+  // Same anti-divergence pattern as the buildParityManifest guard above: the
+  // duplicate is gone, and this asserts it does not come back.
+  const helperSrc = fs.readFileSync(
+    path.join(ROOT, 'tests', 'helpers', 'install-shared.cjs'),
+    'utf8',
+  );
+  assert.doesNotMatch(
+    helperSrc,
+    /const\s+LOCAL_DIR_NAME\s*=/,
+    'install-shared.cjs must not re-declare a second local-dir map beside RUNTIME_META',
+  );
+
+  // Every runtime the harness knows about must be usable at local scope.
+  const { RUNTIME_META } = require('./helpers/install-shared.cjs');
+  const missing = Object.entries(RUNTIME_META)
+    .filter(([, meta]) => !meta.localDir)
+    .map(([runtime]) => runtime);
+  assert.deepEqual(missing, [],
+    'every RUNTIME_META entry needs a localDir or local-scope installs throw on path.join(root, undefined)');
+});

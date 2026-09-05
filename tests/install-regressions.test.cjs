@@ -6,6 +6,7 @@
  * regressions file for the installer module cluster.
  *
  * Defects covered:
+ *   #3664         — --config-dir foreign-agent destination warning (warn-and-proceed)
  *   #3664 Defect #1 — stale skills/gsd/gsd-<stem>/ dirs on Hermes upgrade
  *   #3664 Defect #2 — --hermes --profile=core falls through to wrong path
  *   #2973 M1–M3    — dev-preferences migration at profile=core for hermes/qwen/claude
@@ -20,8 +21,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { runNode } = require('./helpers/process-seam.cjs');
 const { throwIfFailed } = require('./helpers/git-fixture.cjs');
+const { INSTALL_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
-const { createTempDir, cleanup } = require('./helpers.cjs');
+const { createTempDir, cleanup, mockPartialWriteThenThrow } = require('./helpers.cjs');
 const {
   loadSkillsManifest,
   resolveProfile,
@@ -38,7 +40,7 @@ try {
   else process.env.GSD_TEST_MODE = savedTestMode;
 }
 
-const { install, mergeClaudePermissions, GSD_CLAUDE_ALLOW_PERMISSIONS, GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS, GSD_CLAUDE_DENY_PERMISSIONS, copyWithPathReplacement } = installExports || {};
+const { install, mergeClaudePermissions, GSD_CLAUDE_ALLOW_PERMISSIONS, GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS, GSD_CLAUDE_LEGACY_DENY_PERMISSIONS, copyWithPathReplacement } = installExports || {};
 
 const {
   installRuntimeArtifacts,
@@ -53,7 +55,6 @@ const {
 
 const INSTALL_SCRIPT = path.join(__dirname, '..', 'bin', 'install.js');
 // #3145: class-norm timeout, not a per-suite value — see helpers/timeouts.cjs.
-const { INSTALL_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 const HOOKS_SRC = path.join(__dirname, '..', 'hooks');
 const REAL_COMMANDS_DIR = path.join(__dirname, '..', 'commands', 'gsd');
 const MANIFEST = loadSkillsManifest(REAL_COMMANDS_DIR);
@@ -398,30 +399,27 @@ describe('mergeClaudePermissions (#768): exports and permission constants', () =
     }
   });
 
-  test('GSD_CLAUDE_DENY_PERMISSIONS is a non-empty array of strings', () => {
-    assert.ok(Array.isArray(GSD_CLAUDE_DENY_PERMISSIONS),
-      'GSD_CLAUDE_DENY_PERMISSIONS must be an array');
-    assert.ok(GSD_CLAUDE_DENY_PERMISSIONS.length > 0,
-      'GSD_CLAUDE_DENY_PERMISSIONS must not be empty');
-    for (const entry of GSD_CLAUDE_DENY_PERMISSIONS) {
-      assert.strictEqual(typeof entry, 'string', `deny entry must be a string, got: ${JSON.stringify(entry)}`);
-    }
+  test('GSD_CLAUDE_LEGACY_DENY_PERMISSIONS lists exactly the three retired Read() deny rules (#4221)', () => {
+    assert.ok(Array.isArray(GSD_CLAUDE_LEGACY_DENY_PERMISSIONS),
+      'GSD_CLAUDE_LEGACY_DENY_PERMISSIONS must be an array');
+    assert.deepStrictEqual(
+      [...GSD_CLAUDE_LEGACY_DENY_PERMISSIONS].sort(),
+      ['Read(.env)', 'Read(.env.*)', 'Read(.secrets)'].sort(),
+      'the legacy deny list must be exactly the three strings #768 used to write'
+    );
   });
 });
 
 describe('mergeClaudePermissions (#768): fresh settings object', () => {
-  test('populates permissions.allow and permissions.deny on empty settings', () => {
+  test('populates permissions.allow on empty settings and never creates permissions.deny (#4221)', () => {
     const settings = {};
     mergeClaudePermissions(settings);
     assert.ok(Array.isArray(settings.permissions?.allow), 'permissions.allow must be an array');
-    assert.ok(Array.isArray(settings.permissions?.deny), 'permissions.deny must be an array');
+    assert.strictEqual(settings.permissions.deny, undefined,
+      'permissions.deny must not be created — the Read(.env*) deny rules are retired (#4221)');
     for (const entry of GSD_CLAUDE_ALLOW_PERMISSIONS) {
       assert.ok(settings.permissions.allow.includes(entry),
         `permissions.allow must contain "${entry}"`);
-    }
-    for (const entry of GSD_CLAUDE_DENY_PERMISSIONS) {
-      assert.ok(settings.permissions.deny.includes(entry),
-        `permissions.deny must contain "${entry}"`);
     }
   });
 
@@ -454,15 +452,14 @@ describe('mergeClaudePermissions (#768): fresh settings object', () => {
       'permissions.allow must NOT contain the unmatched Write(STATE.md) form (#2278)');
   });
 
-  test('includes .env denial entries in deny', () => {
-    const settings = {};
+  test('never adds Read(.env*) / Read(.secrets) deny rules (#4221: retired in favor of gsd-secret-read-guard.js)', () => {
+    const settings = { permissions: { deny: ['WebSearch'] } };
     mergeClaudePermissions(settings);
-    assert.ok(settings.permissions.deny.includes('Read(.env)'),
-      'permissions.deny must contain Read(.env)');
-    assert.ok(settings.permissions.deny.includes('Read(.env.*)'),
-      'permissions.deny must contain Read(.env.*)');
-    assert.ok(settings.permissions.deny.includes('Read(.secrets)'),
-      'permissions.deny must contain Read(.secrets)');
+    for (const entry of GSD_CLAUDE_LEGACY_DENY_PERMISSIONS) {
+      assert.ok(!settings.permissions.deny.includes(entry),
+        `permissions.deny must NOT contain the retired "${entry}"`);
+    }
+    assert.deepStrictEqual(settings.permissions.deny, ['WebSearch']);
   });
 });
 
@@ -480,11 +477,11 @@ describe('mergeClaudePermissions (#768): non-destructive merge', () => {
       'existing allow entries must be preserved');
     assert.ok(settings.permissions.deny.includes('WebSearch'),
       'existing deny entries must be preserved');
-    // GSD entries must be added
+    // GSD allow entries must be added; the retired deny rules must not be
     assert.ok(settings.permissions.allow.includes('Bash(npx gsd-core *)'),
       'GSD allow entry must be added');
-    assert.ok(settings.permissions.deny.includes('Read(.env)'),
-      'GSD deny entry must be added');
+    assert.ok(!settings.permissions.deny.includes('Read(.env)'),
+      'the retired Read(.env) deny rule must not be added (#4221)');
   });
 
   test('does not duplicate entries on repeated calls (idempotent)', () => {
@@ -495,10 +492,8 @@ describe('mergeClaudePermissions (#768): non-destructive merge', () => {
       const count = settings.permissions.allow.filter((e) => e === entry).length;
       assert.strictEqual(count, 1, `allow entry "${entry}" must appear exactly once after two merges`);
     }
-    for (const entry of GSD_CLAUDE_DENY_PERMISSIONS) {
-      const count = settings.permissions.deny.filter((e) => e === entry).length;
-      assert.strictEqual(count, 1, `deny entry "${entry}" must appear exactly once after two merges`);
-    }
+    assert.strictEqual(settings.permissions.deny, undefined,
+      'permissions.deny must still be absent after two merges (#4221)');
   });
 
   test('preserves other permission sub-keys (ask, disableBypassPermissionsMode)', () => {
@@ -647,6 +642,105 @@ describe('mergeClaudePermissions (#2278): legacy Write(...) → Edit(...) migrat
   });
 });
 
+// ─── #4221 — the Read(.env*) / Read(.secrets) deny rules are retired in favor
+// of the managed gsd-secret-read-guard.js hook. A merge against an existing
+// install must remove exactly the retired strings and leave no `deny: []`.
+describe('mergeClaudePermissions (#4221): legacy Read(.env*) deny-rule retirement', () => {
+  test('existing install with the three retired rules + a user entry: retired rules removed, user entry kept', () => {
+    const settings = {
+      permissions: {
+        allow: ['Bash(git *)'],
+        deny: ['Read(.env)', 'Read(.env.*)', 'Read(.secrets)', 'WebSearch'],
+      },
+    };
+    mergeClaudePermissions(settings);
+    assert.deepStrictEqual(settings.permissions.deny, ['WebSearch']);
+    assert.ok(settings.permissions.allow.includes('Bash(git *)'));
+  });
+
+  test('a partial set of retired rules is removed', () => {
+    const settings = { permissions: { deny: ['WebSearch', 'Read(.env.*)'] } };
+    mergeClaudePermissions(settings);
+    assert.deepStrictEqual(settings.permissions.deny, ['WebSearch']);
+  });
+
+  test('near-miss user strings are not byte-equal and survive', () => {
+    const settings = { permissions: { deny: ['Read(./.env)', 'Read(.env) ', 'read(.env)', 'Read(.env.*.bak)'] } };
+    mergeClaudePermissions(settings);
+    assert.deepStrictEqual(settings.permissions.deny, ['Read(./.env)', 'Read(.env) ', 'read(.env)', 'Read(.env.*.bak)']);
+  });
+
+  test('idempotent across repeated merges', () => {
+    const settings = { permissions: { deny: ['Read(.env)', 'WebSearch'] } };
+    mergeClaudePermissions(settings);
+    mergeClaudePermissions(settings);
+    assert.deepStrictEqual(settings.permissions.deny, ['WebSearch']);
+  });
+
+  test('a GSD-only deny array is deleted, not left as an empty array', () => {
+    const settings = { permissions: { deny: ['Read(.env)', 'Read(.env.*)', 'Read(.secrets)'] } };
+    mergeClaudePermissions(settings);
+    assert.strictEqual(settings.permissions.deny, undefined,
+      'a deny array emptied by the retirement filter must be removed (no `"deny": []` residue)');
+    assert.ok(Array.isArray(settings.permissions.allow), 'allow is still populated');
+  });
+
+  test('a pre-existing empty deny array the user wrote is preserved untouched', () => {
+    const settings = { permissions: { deny: [] } };
+    mergeClaudePermissions(settings);
+    assert.deepStrictEqual(settings.permissions.deny, []);
+  });
+
+  test('a malformed non-array deny is still repaired to an empty array', () => {
+    const settings = { permissions: { deny: 'Read(.env)' } };
+    mergeClaudePermissions(settings);
+    assert.deepStrictEqual(settings.permissions.deny, []);
+  });
+
+  test('uninstall: GSD-only allow + deny leaves no permissions key at all', (t) => {
+    const root = createTempDir('gsd-claude-perm-uninstall-4221-');
+    t.after(() => cleanup(root));
+    const runOpts = { env: { ...process.env, HOME: root, USERPROFILE: root }, timeoutMs: INSTALL_TIMEOUT_MS };
+
+    const r1 = runNode([INSTALL_SCRIPT, '--claude', '--global', '--config-dir', root], runOpts);
+    assert.strictEqual(r1.exitCode, 0, `install failed: ${r1.stderr}`);
+
+    const settingsPath = path.join(root, 'settings.json');
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    settings.permissions.deny = ['Read(.env)', 'Read(.env.*)', 'Read(.secrets)'];
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+    const r2 = runNode([INSTALL_SCRIPT, '--claude', '--global', '--config-dir', root, '--uninstall'], runOpts);
+    assert.strictEqual(r2.exitCode, 0, `uninstall failed: ${r2.stderr}`);
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    assert.strictEqual(after.permissions, undefined,
+      'with only GSD-owned allow and deny entries, uninstall must remove the whole permissions key');
+  });
+
+  test('uninstall: a foreign allow entry keeps permissions.allow while the emptied deny key goes', (t) => {
+    const root = createTempDir('gsd-claude-perm-uninstall-4221-foreign-');
+    t.after(() => cleanup(root));
+    const runOpts = { env: { ...process.env, HOME: root, USERPROFILE: root }, timeoutMs: INSTALL_TIMEOUT_MS };
+
+    const r1 = runNode([INSTALL_SCRIPT, '--claude', '--global', '--config-dir', root], runOpts);
+    assert.strictEqual(r1.exitCode, 0, `install failed: ${r1.stderr}`);
+
+    const settingsPath = path.join(root, 'settings.json');
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    settings.permissions.allow.push('Bash(git *)');
+    settings.permissions.deny = ['Read(.env)', 'Read(.env.*)', 'Read(.secrets)'];
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+    const r2 = runNode([INSTALL_SCRIPT, '--claude', '--global', '--config-dir', root, '--uninstall'], runOpts);
+    assert.strictEqual(r2.exitCode, 0, `uninstall failed: ${r2.stderr}`);
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    assert.deepStrictEqual(after.permissions.allow, ['Bash(git *)']);
+    assert.strictEqual(after.permissions.deny, undefined, 'emptied deny key must be removed');
+  });
+});
+
 describe('mergeClaudePermissions (#768): end-to-end install writes permissions to settings.json', () => {
   test('--claude --global install writes GSD allow/deny entries to settings.json', (t) => {
     const root = createTempDir('gsd-claude-perm-install-');
@@ -666,15 +760,13 @@ describe('mergeClaudePermissions (#768): end-to-end install writes permissions t
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
     assert.ok(Array.isArray(settings.permissions?.allow),
       'settings.json must have permissions.allow array');
-    assert.ok(Array.isArray(settings.permissions?.deny),
-      'settings.json must have permissions.deny array');
+    assert.strictEqual(settings.permissions.deny, undefined,
+      'a fresh install must not write permissions.deny at all (#4221)');
 
     assert.ok(settings.permissions.allow.includes('Bash(npx gsd-core *)'),
       'settings.json permissions.allow must include Bash(npx gsd-core *)');
     assert.ok(settings.permissions.allow.includes('Read(.planning/*)'),
       'settings.json permissions.allow must include Read(.planning/*)');
-    assert.ok(settings.permissions.deny.includes('Read(.env)'),
-      'settings.json permissions.deny must include Read(.env)');
   });
 
   test('non-claude runtime (antigravity) does NOT write GSD allow/deny permissions to settings.json', (t) => {
@@ -723,11 +815,8 @@ describe('mergeClaudePermissions (#768): end-to-end install writes permissions t
       assert.strictEqual(count, 1,
         `allow entry "${entry}" must appear exactly once after two installs`);
     }
-    for (const entry of GSD_CLAUDE_DENY_PERMISSIONS) {
-      const count = (settings.permissions?.deny ?? []).filter((e) => e === entry).length;
-      assert.strictEqual(count, 1,
-        `deny entry "${entry}" must appear exactly once after two installs`);
-    }
+    assert.strictEqual(settings.permissions?.deny, undefined,
+      'permissions.deny must still be absent after two installs (#4221)');
   });
 
   test('--claude --global uninstall removes GSD permission entries from settings.json', (t) => {
@@ -752,9 +841,10 @@ describe('mergeClaudePermissions (#768): end-to-end install writes permissions t
     assert.ok((afterInstall.permissions?.allow ?? []).includes('Bash(npx gsd-core *)'),
       'permissions.allow must contain GSD entry after install');
 
-    // Now add a user permission to make sure we don't nuke it
+    // Now add a user permission to make sure we don't nuke it, and simulate
+    // a pre-#4221 install that still carries the retired deny rules.
     afterInstall.permissions.allow.push('Bash(git *)');
-    afterInstall.permissions.deny.push('WebSearch');
+    afterInstall.permissions.deny = ['Read(.env)', 'Read(.env.*)', 'Read(.secrets)', 'WebSearch'];
     fs.writeFileSync(settingsPath, JSON.stringify(afterInstall, null, 2) + '\n');
 
     // Uninstall
@@ -773,13 +863,15 @@ describe('mergeClaudePermissions (#768): end-to-end install writes permissions t
       'GSD Bash allow entry must be removed by uninstall');
     assert.ok(!allow.includes('Read(.planning/*)'),
       'GSD Read(.planning/*) allow entry must be removed by uninstall');
-    assert.ok(!deny.includes('Read(.env)'),
-      'GSD Read(.env) deny entry must be removed by uninstall');
+    for (const entry of GSD_CLAUDE_LEGACY_DENY_PERMISSIONS) {
+      assert.ok(!deny.includes(entry),
+        `retired GSD deny entry "${entry}" must be removed by uninstall (#4221)`);
+    }
 
     // User entries must survive
     assert.ok(allow.includes('Bash(git *)'),
       'user Bash(git *) allow entry must survive uninstall');
-    assert.ok(deny.includes('WebSearch'),
+    assert.deepStrictEqual(afterUninstall.permissions.deny, ['WebSearch'],
       'user WebSearch deny entry must survive uninstall');
   });
 
@@ -1683,5 +1775,474 @@ describe('#3329 regression: stale managed .sh hook commands are reconciled on in
 
     assert.strictEqual(changed, false, 'a null expected command must disable rewriting for that hook');
     assert.strictEqual(settings.hooks.SessionStart[0].hooks[0].command, original);
+  });
+});
+
+// ─── #3664 — config-dir foreign-agent destination warning ───────────────────
+//
+// --config-dir aimed at a directory that is not a supported runtime's config
+// home must never be a SILENT success: the installer emits the selected
+// runtime's artifacts verbatim (Claude-only Skill tool IDs, mcp__server__tool
+// grants), which are inert or invalid in a foreign harness and surface only
+// at dispatch time. Warn-and-proceed when the destination already holds
+// foreign (non-GSD) agent files; fresh custom dirs, gsd-only dirs (updates,
+// the --all shared dir), the no-flag default-home path, and test temp dirs
+// stay silent. Folded into this suite per the lint-test-file-count cap
+// (primary + one integration per production module).
+
+const installerMod = require('../bin/install.js');
+
+function capturedLogs(t, fn) {
+  const lines = [];
+  const mock = t.mock.method(console, 'log', (...args) => {
+    lines.push(args.join(' '));
+  });
+  const result = fn();
+  mock.mock.restore();
+  return { lines, result };
+}
+
+function makeForeignDest(t, name, agentFiles) {
+  const dest = createTempDir(`gsd-3664-${name}-`);
+  const agentsDir = path.join(dest, 'agents');
+  fs.mkdirSync(agentsDir, { recursive: true });
+  for (const file of agentFiles) {
+    fs.writeFileSync(path.join(agentsDir, file), '---\ntools: Read\n---\nbody\n');
+  }
+  t.after(() => cleanup(dest));
+  return { dest, agentsDir };
+}
+
+describe('#3664 — config-dir foreign-agent destination warning', () => {
+  test('warns when the destination holds foreign agent files', (t) => {
+    const { dest } = makeForeignDest(t, 'foreign', ['junie-guide.md']);
+    const { lines } = capturedLogs(t, () =>
+      installerMod.warnIfForeignAgentDest('claude', dest, 'global', true),
+    );
+    const warning = lines.find((l) => l.includes('(#3664)'));
+    assert.ok(warning, `expected a #3664 warning, got: ${lines.join(' | ') || '(none)'}`);
+    assert.ok(warning.includes('claude'), `warning must name the selected runtime: ${warning}`);
+    assert.ok(
+      /tool IDs and MCP grants may (be inert|not apply)/.test(warning),
+      `warning must name the tool/MCP risk: ${warning}`,
+    );
+  });
+
+  test('installer warns and proceeds on a foreign-agent destination', (t) => {
+    const home = createTempDir('gsd-3664-e2e-home-');
+    t.after(() => cleanup(home));
+    const dest = createTempDir('gsd-3664-e2e-dest-');
+    t.after(() => cleanup(dest));
+    fs.mkdirSync(path.join(dest, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(dest, 'agents', 'junie-guide.md'), '---\ntools: Read\n---\nbody\n');
+
+    const result = runNode(
+      [path.join(__dirname, '..', 'bin', 'install.js'), '--claude', '--global', '--config-dir', dest],
+      {
+        env: {
+          ...process.env,
+          HOME: home,
+          USERPROFILE: home,
+          GSD_HOME: home,
+          CI: '1',
+        },
+        timeoutMs: INSTALL_TIMEOUT_MS,
+      },
+    );
+    assert.equal(result.exitCode, 0, `warn-and-proceed must exit 0; stderr: ${result.stderr.slice(0, 500)}`);
+    assert.ok(
+      result.stdout.includes('(#3664)'),
+      `stdout must carry the #3664 warning: ${result.stdout.slice(-800)}`,
+    );
+    const emitted = fs.existsSync(path.join(dest, 'agents'))
+      ? fs.readdirSync(path.join(dest, 'agents')).filter((f) => /^gsd-.*\.md$/.test(f))
+      : [];
+    assert.ok(emitted.length > 0, 'install must still emit the gsd-* agents');
+    assert.ok(fs.existsSync(path.join(dest, 'agents', 'junie-guide.md')));
+  });
+
+  test('silent on a fresh custom dir', (t) => {
+    const { dest } = makeForeignDest(t, 'fresh', []);
+    const { lines } = capturedLogs(t, () =>
+      installerMod.warnIfForeignAgentDest('claude', dest, 'global', true),
+    );
+    assert.ok(!lines.some((l) => l.includes('(#3664)')), `fresh dir must be silent: ${lines.join(' | ')}`);
+  });
+
+  test('silent on a gsd-only agents dir', (t) => {
+    const { dest } = makeForeignDest(t, 'gsdonly', ['gsd-executor.md', 'gsd-verifier.md']);
+    const { lines } = capturedLogs(t, () =>
+      installerMod.warnIfForeignAgentDest('claude', dest, 'global', true),
+    );
+    assert.ok(!lines.some((l) => l.includes('(#3664)')), `gsd-only dir must be silent: ${lines.join(' | ')}`);
+  });
+
+  test('silent when the config-dir flag was not passed', (t) => {
+    const { dest } = makeForeignDest(t, 'noflag', ['personal-agent.md']);
+    const { lines } = capturedLogs(t, () =>
+      installerMod.warnIfForeignAgentDest('claude', dest, 'global', false),
+    );
+    assert.ok(!lines.some((l) => l.includes('(#3664)')), `no-flag path must be silent: ${lines.join(' | ')}`);
+  });
+
+  test('warns on mixed gsd and personal agents', (t) => {
+    const { dest } = makeForeignDest(t, 'mixed', ['gsd-executor.md', 'my-own-agent.md']);
+    const { lines } = capturedLogs(t, () =>
+      installerMod.warnIfForeignAgentDest('claude', dest, 'global', true),
+    );
+    const warning = lines.find((l) => l.includes('(#3664)'));
+    assert.ok(warning, 'mixed dir with a foreign agent must warn');
+    assert.ok(warning.includes('contains 1 non-GSD agent file'), `warning reports the foreign count: ${warning}`);
+  });
+
+  test('ignores non-markdown files', (t) => {
+    const { dest, agentsDir } = makeForeignDest(t, 'nonmd', []);
+    fs.writeFileSync(path.join(agentsDir, 'notes.txt'), 'not an agent');
+    const { lines } = capturedLogs(t, () =>
+      installerMod.warnIfForeignAgentDest('claude', dest, 'global', true),
+    );
+    assert.ok(!lines.some((l) => l.includes('(#3664)')), `non-agent files are not harness evidence: ${lines.join(' | ')}`);
+  });
+
+  test('warns for the kimi runtime (kimi-agents kind)', (t) => {
+    const { dest } = makeForeignDest(t, 'kimi-foreign', ['junie-guide.md']);
+    const { lines } = capturedLogs(t, () =>
+      installerMod.warnIfForeignAgentDest('kimi', dest, 'global', true),
+    );
+    assert.ok(
+      lines.some((l) => l.includes('(#3664)') && l.includes('kimi')),
+      `kimi's kimi-agents kind must take the gate: ${lines.join(' | ')}`,
+    );
+  });
+
+  test('silent on kimi\'s own gsd.md in a shared multi-runtime dir', (t) => {
+    // kimi's root agent is agents/gsd.md — a bare stem, no gsd- prefix. A
+    // shared --all dir accumulates it alongside gsd-*.md; none of it is
+    // foreign, so every runtime's install into that dir must stay silent.
+    const { dest } = makeForeignDest(t, 'shared-kimi', ['gsd-executor.md', 'gsd.md']);
+    const { lines } = capturedLogs(t, () => {
+      installerMod.warnIfForeignAgentDest('kimi', dest, 'global', true);
+      installerMod.warnIfForeignAgentDest('claude', dest, 'global', true);
+    });
+    assert.ok(
+      !lines.some((l) => l.includes('(#3664)')),
+      `GSD-owned gsd.md must not read as a foreign agent: ${lines.join(' | ')}`,
+    );
+  });
+
+  test('degrades silently when the layout cannot resolve', (t) => {
+    const dest = createTempDir('gsd-3664-unknown-');
+    t.after(() => cleanup(dest));
+    const { lines } = capturedLogs(t, () =>
+      installerMod.warnIfForeignAgentDest('not-a-registered-runtime', dest, 'global', true),
+    );
+    assert.ok(!lines.some((l) => l.includes('(#3664)')), `unresolvable layout must degrade silently: ${lines.join(' | ')}`);
+  });
+});
+
+// ─── #1874 F6 — malformed settings.local.json is preserved by the #338 migration ───
+
+describe('#1874 F6 (#338 migration): a malformed settings.local.json is preserved', () => {
+  test('local file stays byte-identical and shared GSD entries are not stripped', (t) => {
+    const root = createTempDir('gsd-1874-f6-');
+    t.after(() => cleanup(root));
+
+    const claudeDir = path.join(root, '.claude');
+    fs.mkdirSync(claudeDir, { recursive: true });
+
+    // Shared settings carries GSD-shaped entries, so the #338 migration branch fires.
+    const sharedSettingsPath = path.join(claudeDir, 'settings.json');
+    fs.writeFileSync(sharedSettingsPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: `${process.execPath} ${path.join(claudeDir, 'hooks', 'gsd-check-update.js')}` }] },
+        ],
+      },
+    }, null, 2) + '\n');
+
+    // Unparseable local settings — the stray brace defeats both the JSON and the
+    // JSONC path — carrying user content that must survive.
+    const localSettingsPath = path.join(claudeDir, 'settings.local.json');
+    const malformedLocal = '{\n  "permissions": { "allow": ["Bash(npm test)"] },\n}}\n';
+    fs.writeFileSync(localSettingsPath, malformedLocal);
+
+    const env = { ...process.env, HOME: root, USERPROFILE: root };
+    delete env.GSD_TEST_MODE;
+    const result = runNode(
+      [INSTALL_SCRIPT, '--claude', '--local'],
+      { cwd: root, env, timeoutMs: 60_000 },
+    );
+    assert.strictEqual(result.exitCode, 0,
+      `installer exited ${result.exitCode}\n${result.stdout}\n${result.stderr}`);
+
+    // Byte-equality, not parse-equality: the file is unparseable by construction.
+    assert.strictEqual(
+      fs.readFileSync(localSettingsPath, 'utf8'),
+      malformedLocal,
+      'a malformed settings.local.json must be left byte-for-byte intact'
+    );
+
+    // Aborting only the local write would still strip the shared file below,
+    // destroying the GSD entries outright instead of relocating them. The whole
+    // migration must stand down so it can retry once the user fixes the file.
+    const sharedAfter = JSON.parse(fs.readFileSync(sharedSettingsPath, 'utf8'));
+    const sessionStart = (sharedAfter.hooks && sharedAfter.hooks.SessionStart) || [];
+    assert.ok(
+      sessionStart.some(
+        entry => entry && entry.hooks && Array.isArray(entry.hooks) &&
+          entry.hooks.some(h => h && h.command && h.command.includes('gsd-check-update'))
+      ),
+      'GSD entries must remain in settings.json when the migration is skipped'
+    );
+  });
+});
+
+// ─── #1874 F6 (adjacent): a malformed settings file must not crash the install ───
+// The bare `return;` in the unparseable-settings guard returned undefined while
+// every sibling early exit returns the full result shape, so installAllRuntimes'
+// statusline lookup (results.find(r => r.runtime)) threw. Reachable on its own —
+// no #338 migration required.
+
+describe('#1874 F6 adjacent: malformed settings.local.json does not crash the install', () => {
+  test('installer exits 0 and preserves the malformed file when no migration applies', (t) => {
+    const root = createTempDir('gsd-1874-f6-nocrash-');
+    t.after(() => cleanup(root));
+
+    const claudeDir = path.join(root, '.claude');
+    fs.mkdirSync(claudeDir, { recursive: true });
+    const localSettingsPath = path.join(claudeDir, 'settings.local.json');
+    const malformedLocal = '{\n  "permissions": { "allow": ["Bash(npm test)"] },\n}}\n';
+    fs.writeFileSync(localSettingsPath, malformedLocal);
+
+    const env = { ...process.env, HOME: root, USERPROFILE: root };
+    delete env.GSD_TEST_MODE;
+    const result = runNode(
+      [INSTALL_SCRIPT, '--claude', '--local'],
+      { cwd: root, env, timeoutMs: 60_000 },
+    );
+
+    assert.strictEqual(result.exitCode, 0,
+      `installer must not crash on an unparseable settings file\n${result.stdout}\n${result.stderr}`);
+    assert.strictEqual(
+      fs.readFileSync(localSettingsPath, 'utf8'),
+      malformedLocal,
+      'the unparseable file must be left intact'
+    );
+  });
+});
+
+// ─── #1874 F18 — ~/.gsd/defaults.json is machine-global: lock it, write it once ───
+//
+// Every runtime and project on the box reads this file. The read-modify-write
+// took no lock (so concurrent installs lost each other's key) and issued two
+// separate whole-file writes (so a crash could truncate it, and the second
+// write bought nothing).
+
+describe('#1874 F18: ~/.gsd/defaults.json read-modify-write is locked and atomic', () => {
+  const { writeNonClaudeDefaults } = installExports || {};
+
+  // The function early-returns under GSD_TEST_MODE, and resolves its target via
+  // os.homedir() — which reads HOME on POSIX and USERPROFILE on Windows.
+  function withRealInstallHome(root, fn) {
+    const saved = {
+      testMode: process.env.GSD_TEST_MODE,
+      home: process.env.HOME,
+      userProfile: process.env.USERPROFILE,
+    };
+    delete process.env.GSD_TEST_MODE;
+    process.env.HOME = root;
+    process.env.USERPROFILE = root;
+    try {
+      return fn();
+    } finally {
+      if (saved.testMode === undefined) delete process.env.GSD_TEST_MODE;
+      else process.env.GSD_TEST_MODE = saved.testMode;
+      if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
+      if (saved.userProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = saved.userProfile;
+    }
+  }
+
+  test('a clean install writes defaults.json exactly once, not twice', (t) => {
+    const root = createTempDir('gsd-1874-f18-once-');
+    t.after(() => cleanup(root));
+
+    const defaultsPath = path.join(root, '.gsd', 'defaults.json');
+    const writes = [];
+    const origWriteFileSync = fs.writeFileSync;
+    fs.writeFileSync = (target, ...rest) => {
+      // Count writes aimed at defaults.json, including the atomic temp sibling.
+      const resolved = path.resolve(String(target));
+      if (resolved === defaultsPath || resolved.startsWith(`${defaultsPath}.tmp-`)) writes.push(resolved);
+      return origWriteFileSync.call(fs, target, ...rest);
+    };
+    t.after(() => { fs.writeFileSync = origWriteFileSync; });
+
+    withRealInstallHome(root, () => {
+      const origLog = console.log;
+      console.log = () => {};
+      t.after(() => { console.log = origLog; });
+      writeNonClaudeDefaults('codex');
+    });
+
+    // Both keys change on a clean install; that is one file state, so one write.
+    assert.strictEqual(writes.length, 1,
+      `defaults.json must be written once per install, got ${writes.length}`);
+
+    const after = JSON.parse(fs.readFileSync(defaultsPath, 'utf8'));
+    assert.strictEqual(after.resolve_model_ids, 'omit');
+    assert.strictEqual(after.runtime, 'codex');
+  });
+
+  test('the read-modify-write holds the install-migration lock', (t) => {
+    const root = createTempDir('gsd-1874-f18-lock-');
+    t.after(() => cleanup(root));
+
+    const gsdDir = path.join(root, '.gsd');
+    const lockPath = path.join(gsdDir, 'gsd-install-migration.lock');
+    const defaultsPath = path.join(gsdDir, 'defaults.json');
+    let lockHeldDuringWrite = null;
+
+    const origWriteFileSync = fs.writeFileSync;
+    fs.writeFileSync = (target, ...rest) => {
+      const resolved = path.resolve(String(target));
+      if (resolved === defaultsPath || resolved.startsWith(`${defaultsPath}.tmp-`)) {
+        lockHeldDuringWrite = fs.existsSync(lockPath);
+      }
+      return origWriteFileSync.call(fs, target, ...rest);
+    };
+    t.after(() => { fs.writeFileSync = origWriteFileSync; });
+
+    withRealInstallHome(root, () => {
+      const origLog = console.log;
+      console.log = () => {};
+      t.after(() => { console.log = origLog; });
+      writeNonClaudeDefaults('codex');
+    });
+
+    assert.strictEqual(lockHeldDuringWrite, true,
+      'the lock must be held while defaults.json is being written');
+    assert.strictEqual(fs.existsSync(lockPath), false,
+      'the lock must be released when the write completes');
+  });
+
+  test('a failure mid-write leaves the previous defaults.json intact and parseable', (t) => {
+    const root = createTempDir('gsd-1874-f18-crash-');
+    t.after(() => cleanup(root));
+
+    const gsdDir = path.join(root, '.gsd');
+    fs.mkdirSync(gsdDir, { recursive: true });
+    const defaultsPath = path.join(gsdDir, 'defaults.json');
+    // A pre-existing file carrying settings other installs depend on.
+    const prior = JSON.stringify({ model_profile: 'balanced', resolve_model_ids: true }, null, 2) + '\n';
+    fs.writeFileSync(defaultsPath, prior);
+
+    // Faithful crash window: the bytes written before the failure DO land, then
+    // the call fails.
+    t.after(mockPartialWriteThenThrow(
+      fs,
+      (target) => {
+        const resolved = path.resolve(String(target));
+        return resolved === defaultsPath || resolved.startsWith(`${defaultsPath}.tmp-`);
+      },
+      10,
+      { code: 'ENOSPC', message: 'ENOSPC: no space left on device' },
+    ));
+
+    withRealInstallHome(root, () => {
+      const origLog = console.log;
+      console.log = () => {};
+      t.after(() => { console.log = origLog; });
+      // The installer treats this as best-effort and logs rather than throwing.
+      writeNonClaudeDefaults('codex');
+    });
+
+    assert.strictEqual(fs.readFileSync(defaultsPath, 'utf8'), prior,
+      'defaults.json must be byte-identical to its pre-write contents');
+    // The read path swallows parse errors and treats a corrupt file as absent,
+    // so a truncated write would silently degrade model resolution box-wide.
+    const recovered = JSON.parse(fs.readFileSync(defaultsPath, 'utf8'));
+    assert.strictEqual(recovered.model_profile, 'balanced');
+    assert.strictEqual(recovered.resolve_model_ids, true);
+
+    assert.deepStrictEqual(
+      fs.readdirSync(gsdDir).filter(n => n.startsWith('defaults.json.tmp-')),
+      [],
+      'no atomic temp residue may survive a failed write'
+    );
+    assert.strictEqual(fs.existsSync(path.join(gsdDir, 'gsd-install-migration.lock')), false,
+      'the lock must be released even when the write fails');
+  });
+
+  test('an install that changes nothing does not rewrite the file', (t) => {
+    const root = createTempDir('gsd-1874-f18-noop-');
+    t.after(() => cleanup(root));
+
+    const gsdDir = path.join(root, '.gsd');
+    fs.mkdirSync(gsdDir, { recursive: true });
+    const defaultsPath = path.join(gsdDir, 'defaults.json');
+    const prior = JSON.stringify({ resolve_model_ids: 'omit', runtime: 'codex' }, null, 2) + '\n';
+    fs.writeFileSync(defaultsPath, prior);
+
+    const writes = [];
+    const origWriteFileSync = fs.writeFileSync;
+    fs.writeFileSync = (target, ...rest) => {
+      const resolved = path.resolve(String(target));
+      if (resolved === defaultsPath || resolved.startsWith(`${defaultsPath}.tmp-`)) writes.push(resolved);
+      return origWriteFileSync.call(fs, target, ...rest);
+    };
+    t.after(() => { fs.writeFileSync = origWriteFileSync; });
+    withRealInstallHome(root, () => {
+      const origLog = console.log;
+      console.log = () => {};
+      t.after(() => { console.log = origLog; });
+      writeNonClaudeDefaults('codex');
+    });
+
+    assert.deepStrictEqual(writes, [], 'an unchanged defaults.json must not be rewritten');
+    assert.strictEqual(fs.readFileSync(defaultsPath, 'utf8'), prior);
+  });
+
+  test('a read-only .gsd directory blocks the lock and the RMW never partially applies', (t) => {
+    const root = createTempDir('gsd-1874-f18-readonly-');
+    t.after(() => cleanup(root));
+
+    const gsdDir = path.join(root, '.gsd');
+    fs.mkdirSync(gsdDir, { recursive: true });
+    const lockPath = path.join(gsdDir, 'gsd-install-migration.lock');
+    const defaultsPath = path.join(gsdDir, 'defaults.json');
+    // A pre-existing file the RMW must never touch if the lock cannot be taken.
+    const prior = JSON.stringify({ model_profile: 'balanced', resolve_model_ids: true }, null, 2) + '\n';
+    fs.writeFileSync(defaultsPath, prior);
+
+    // fs-method override rather than chmod — root bypasses mode bits, so a
+    // permission-based test silently passes with zero coverage in root CI.
+    // Simulates a read-only .gsd directory: the exclusive lock-file create
+    // fails with EACCES before any read-modify-write is attempted.
+    const origOpenSync = fs.openSync;
+    fs.openSync = (target, flags, ...rest) => {
+      if (path.resolve(String(target)) === lockPath) {
+        throw Object.assign(new Error('EACCES: permission denied, open ' + lockPath), { code: 'EACCES' });
+      }
+      return origOpenSync.call(fs, target, flags, ...rest);
+    };
+    t.after(() => { fs.openSync = origOpenSync; });
+
+    let threw = false;
+    withRealInstallHome(root, () => {
+      const origLog = console.log;
+      console.log = () => {};
+      t.after(() => { console.log = origLog; });
+      // writeNonClaudeDefaults treats lock/write failure as best-effort and
+      // must not let it escape as an uncaught exception.
+      try { writeNonClaudeDefaults('codex'); } catch { threw = true; }
+    });
+
+    assert.strictEqual(threw, false,
+      'a blocked lock must not crash the installer — writeNonClaudeDefaults degrades gracefully');
+    assert.strictEqual(fs.readFileSync(defaultsPath, 'utf8'), prior,
+      'defaults.json must be untouched when the lock could not be acquired — no partial RMW');
+    assert.strictEqual(fs.existsSync(lockPath), false,
+      'no lock file may be left behind when its creation itself failed');
   });
 });

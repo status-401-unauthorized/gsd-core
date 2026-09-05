@@ -1,3 +1,4 @@
+// docs-guard-exempt: 'docs/SUMMARY.md' is a synthetic fixture path and a predicate-check literal (isSummaryArtifactRelPath), never read as content.
 'use strict';
 
 /**
@@ -24,6 +25,7 @@ const { createTempDir, cleanup } = require('./helpers.cjs');
 const { createFixture } = require('./fixtures/index.cjs');
 const { makeFaultyGit } = require('./helpers/faulty-deps.cjs');
 const { escapeRegex } = require('../gsd-core/bin/lib/pattern.cjs');
+const { HOOK_FANOUT_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
 // 30000ms: this file's single named bound for every migrated subprocess call
 // below (git plumbing on small mkdtemp fixtures, gsd-tools.cjs/hook CLI runs,
@@ -4357,7 +4359,11 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 const ROOT = path.join(__dirname, '..');
-const { isGitSubcommand, tokenize, extractBranchArgument } = require(path.join(ROOT, 'hooks', 'lib', 'git-cmd.js'));
+// Seeded fast-check convention: the shared setup helper, NOT 'fast-check'
+// directly, so numRuns/seed are configured globally before any fc.assert().
+// Required by RULESET.TESTS.property-based-testing for the parser added below.
+const fc = require('./helpers/fast-check-setup.cjs');
+const { isGitSubcommand, tokenize, extractBranchArgument, resolveCommitSubject } = require(path.join(ROOT, 'hooks', 'lib', 'git-cmd.js'));
 
 // ── tokenize ─────────────────────────────────────────────────────────────────
 
@@ -4452,6 +4458,372 @@ describe('gsd-validate-commit.sh delegates to git-cmd.js', () => {
       fs.existsSync(path.join(ROOT, 'hooks', 'lib', 'git-cmd.js')),
       'hooks/lib/git-cmd.js does not exist — library file missing',
     );
+  });
+});
+
+// ── resolveCommitSubject (#3802) ─────────────────────────────────────────────
+// A PURE STRING helper: it maps an already-selected `-m` argument to the subject
+// to validate. It deliberately does not tokenize — an earlier revision walked
+// tokens and regressed four cases that upstream allowed (`git commit -- -m WIP`,
+// `git commit --amend && echo -m WIP`, `-m "" --allow-empty-message`, and
+// unquoted `git commit -m WIP`). Reported in review of #3802.
+describe('git-cmd.js resolveCommitSubject', () => {
+  const sub = (open, body, close) => `$(cat ${open}\n${body}\n${close}\n)`;
+
+  test('resolves the heredoc body rather than the opener', () => {
+    assert.strictEqual(resolveCommitSubject(sub("<<'EOF'", 'feat(auth): add login flow', 'EOF')),
+      'feat(auth): add login flow');
+  });
+
+  test('accepts the QUOTED opener spellings, which bash does not expand', () => {
+    // Only the spellings that SUPPRESS expansion may be resolved. The two bare
+    // rows that used to live here — `<<EOF` and `<< EOF`, both asserted to
+    // resolve — are the round-4 BLOCKER and now assert the opposite, in the
+    // dedicated row below (review of #3816, round 4).
+    // no space before << is legal bash too (review of #3816, round 3)
+    assert.strictEqual(resolveCommitSubject("$(cat<<'EOF'\nfix: nospace\nEOF\n)"), 'fix: nospace');
+    // NOTE: resolvable HERE, but unreachable through gsd-validate-commit.sh —
+    // its DOUBLE-quoted `-m` capture stops at this spelling's own delimiter
+    // quote. Round 4 disproved the stronger form of this claim: the
+    // SINGLE-quoted capture delivers the spelling intact, so "unreachable"
+    // held only for one arm. It holds for both now because the hook gates the
+    // resolver on the double-quoted arm — a consequence of that gate, not a
+    // property of the capture alone. The hook-level rows in
+    // tests/hooks-opt-in.test.cjs pin both halves; all are correct together.
+    assert.strictEqual(resolveCommitSubject(sub('<<"EOF"', 'fix: dquoted', 'EOF')), 'fix: dquoted');
+    // A delimiter that is not identifier-shaped is still a valid bash word.
+    assert.strictEqual(resolveCommitSubject(sub("<<'END-MSG'", 'fix: hyphen tag', 'END-MSG')),
+      'fix: hyphen tag');
+  });
+
+  test('round 4: a RELATIVE path ending in cat is not recognised', () => {
+    // Codex review of #3816, round 4. The path class accepted `./cat` and
+    // `../evil/cat`, so any relative executable merely ENDING in `cat` was
+    // trusted to echo its stdin. With a planted one printing `WIP injected`,
+    // the resolver validated the heredoc body while git's real subject was
+    // `WIP injected` (measured base=2 -> head=0 against a real commit).
+    // Non-vacuous: each body below is conforming, so a resolver that still
+    // recognised these returns the body.
+    for (const prog of ['./cat', '../evil/cat', 'x/cat']) {
+      assert.strictEqual(resolveCommitSubject(`$(${prog} <<'EOF'\nfix: body\nEOF\n)`),
+        `$(${prog} <<'EOF'`, `${prog}: a relative path is not a known cat`);
+    }
+  });
+
+  test('a path-qualified cat is still the same form', () => {
+    assert.strictEqual(resolveCommitSubject("$(/bin/cat <<'EOF'\nfix: pathed cat\nEOF\n)"),
+      'fix: pathed cat');
+  });
+
+  test('<<- strips the leading tabs bash strips', () => {
+    // With `<<-`, bash removes leading TABS from body lines, so the subject the
+    // user sees has none. Returning the raw line blocked a conforming message.
+    // The delimiter is QUOTED here because `<<-` and quoting are independent:
+    // `<<-` controls tab stripping, the quote controls expansion. This row is
+    // about tab stripping, so it uses a spelling that is resolvable at all —
+    // a bare `<<-EOF` is refused by the round-4 expansion guard, which is that
+    // guard's row to assert, not this one's.
+    assert.strictEqual(resolveCommitSubject("$(cat <<-'EOF'\n\tfix(parser): strip heredoc tabs\n\tEOF\n)"),
+      'fix(parser): strip heredoc tabs');
+  });
+
+  test('an immediately-following terminator is an EMPTY message, not a subject', () => {
+    // `$(cat <<'EOF'` then straight to `EOF` — the message is empty, and the
+    // delimiter must not be mistaken for the subject.
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\nEOF\n)"), '');
+    assert.strictEqual(resolveCommitSubject("$(cat <<-'EOF'\n\tEOF\n)"), '',
+      'the <<- form strips the tab first, so the terminator still matches');
+  });
+
+  // The security half. Recognition is anchored at BOTH ends and requires a
+  // command substitution, so a message that merely contains — or ENDS IN —
+  // `<<WORD` is not an opener.
+  test('a message ENDING in <<WORD is not a heredoc — this was an enforcement bypass', () => {
+    // Without the `^$(` anchor this resolved to line 2 and ALLOWED a
+    // non-conforming commit (review of #3802).
+    assert.strictEqual(resolveCommitSubject('WIP notes <<EOF\nfix: smuggled subject'),
+      'WIP notes <<EOF', 'the real subject is the non-conforming first line, and must be judged');
+  });
+
+  test('a message merely containing << is untouched', () => {
+    assert.strictEqual(resolveCommitSubject('fix(parser): preserve literal <<EOF'),
+      'fix(parser): preserve literal <<EOF');
+    assert.strictEqual(resolveCommitSubject('fix(parser): handle a << b shifts'),
+      'fix(parser): handle a << b shifts');
+  });
+
+  test('a COMMAND smuggled before the cat is not a path — recognition must fail closed', () => {
+    // Codex review of #3816: `\S*` as the path prefix accepted `id;/bin/cat`,
+    // so the resolver validated the heredoc BODY while bash runs `id` first and
+    // git's real subject is id's OUTPUT — an enforcement bypass. A prefix
+    // carrying any shell metacharacter now fails recognition and falls back to
+    // the opener line, which the format gate rejects.
+    assert.strictEqual(resolveCommitSubject("$(id;/bin/cat <<'EOF'\nfix: smuggled\nEOF\n)"),
+      "$(id;/bin/cat <<'EOF'");
+    assert.strictEqual(resolveCommitSubject("$(x&&/bin/cat <<'EOF'\nfix: smuggled\nEOF\n)"),
+      "$(x&&/bin/cat <<'EOF'");
+    assert.strictEqual(resolveCommitSubject("$(a|b/cat <<'EOF'\nfix: smuggled\nEOF\n)"),
+      "$(a|b/cat <<'EOF'");
+    // Round 2: Unicode whitespace after `$(` is NOT bash whitespace — bash
+    // reads `<NBSP>/bin/cat` as the executable NAME, so recognizing it here
+    // claimed a substitution that does not run cat. Recognition whitespace is
+    // ASCII space/tab only.
+    assert.strictEqual(resolveCommitSubject("$(\u00a0/bin/cat <<'EOF'\nfix: smuggled\nEOF\n)"),
+      "$(\u00a0/bin/cat <<'EOF'");
+    // the legitimate path-qualified form is unchanged
+    assert.strictEqual(resolveCommitSubject("$(/usr/bin/cat <<'EOF'\nfix: pathed\nEOF\n)"),
+      'fix: pathed');
+  });
+
+  test('a Unicode-blank first line is the SUBJECT — git keeps what trim() skips', () => {
+    // Codex review of #3816, verified against `git stripspace`: git's blank is
+    // ASCII space/tab, so a NBSP line is PRESERVED and is the real subject.
+    // JavaScript's trim() treated it as blank and resolved to the second line —
+    // validating a line git never uses, an enforcement bypass.
+    const nbsp = '\u00a0';
+    assert.strictEqual(resolveCommitSubject(`$(cat <<'EOF'\n${nbsp}\nfix: smuggled\nEOF\n)`), nbsp,
+      'the NBSP line must be returned (and fail the format gate), never skipped past');
+  });
+
+  test('MAJOR 3: a TRUNCATED capture is not resolved at all', () => {
+    // The `-m` capture stops at the first `"`, so a message containing one
+    // arrives here without its tail — and without its terminator. Resolving
+    // anyway hands the length gate a PREFIX of the real subject and lets an
+    // over-long message through: an enforcement hole that did not exist before
+    // this fix. Falling back to the opener fails the format gate, which is what
+    // this whole form did before the fix (review of #3802).
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\nfeat: aaaa"), "$(cat <<'EOF'",
+      'the subject line runs to the end of a truncated capture, so it cannot be measured');
+    // Truncation is only fatal to the line it lands IN: a captured line is
+    // complete exactly when another line follows it. A quote further down the
+    // BODY leaves the subject intact and measurable, so blocking it would be a
+    // false positive the blunt version of this guard would have introduced.
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\nfeat: short\nbody with a "), 'feat: short',
+      'a complete subject line stays measurable even when the capture truncates later');
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'"), "$(cat <<'EOF'",
+      'an opener with no body at all is likewise unresolvable');
+  });
+
+  test('BLOCKER (round 3): text after the terminator is part of the real message', () => {
+    // `-m "$(cat <<'EOF'\nfeat: ok\nEOF\n) <200 a's>"` expands to ONE long
+    // subject; discarding the tail measured a PREFIX (8 chars vs 200+) and
+    // dodged COMMIT_SUBJECT_TOO_LONG — the truncation-guard class from the
+    // other side of the terminator (review of #3816, round 3). Only the
+    // canonical single closing-paren line may follow the terminator; anything
+    // else falls back to the opener and the format gate.
+    assert.strictEqual(resolveCommitSubject(`$(cat <<'EOF'\nfeat: ok\nEOF\n) ${'a'.repeat(200)}`),
+      "$(cat <<'EOF'", 'a substitution composed with more text cannot have its body trusted');
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\nfeat: ok\nEOF\n)$(printf x)"),
+      "$(cat <<'EOF'", 'a second substitution after the close is the same composition');
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\nEOF\n)feat: sneaky"),
+      "$(cat <<'EOF'", 'text glued straight onto the closing paren too');
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\nfeat: ok\nEOF"),
+      "$(cat <<'EOF'", 'a terminator with NO closing line at all is not the canonical shape either');
+    // the canonical tail still resolves — including an indented or space-padded close
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\nfeat: ok\nEOF\n)"), 'feat: ok');
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\nfeat: ok\nEOF\n\t) "), 'feat: ok');
+  });
+
+  test('MINOR 1: leading blank body lines are skipped, as git does', () => {
+    // git's default cleanup=whitespace strips leading blank lines, so the real
+    // subject is the first NON-empty line. Taking lines[1] blindly returned ''
+    // and falsely blocked a conforming commit — the defect class #3802 reports.
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\n\nfeat: after blank\nEOF\n)"),
+      'feat: after blank');
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\n\n\n  \nfeat: after several\nEOF\n)"),
+      'feat: after several');
+  });
+
+  test('a backslash-escaped delimiter is the same delimiter', () => {
+    // `<<\\D` suppresses expansion exactly as `<<'D'` does, so it stays
+    // resolvable. This is the row that makes the bare-delimiter guard below a
+    // real distinction rather than a blanket refusal: the two spellings differ
+    // by one character and by whether bash expands the body.
+    assert.strictEqual(resolveCommitSubject('$(cat <<\\EOF\nfix: backslash tag\nEOF\n)'),
+      'fix: backslash tag');
+  });
+
+  test('BLOCKER (round 4): a BARE delimiter is not resolved — bash expands that body', () => {
+    // Review of #3816, round 4. Only `<<'D'`, `<<"D"` and `<<\\D` suppress
+    // expansion. With a bare `<<D` bash substitutes `$var`, `$(...)` and
+    // arithmetic into the body BEFORE git sees it, so the literal text here is
+    // not the subject git receives — resolving it dodged the format gate
+    // (`feat: $UNSET_VAR` -> git gets `feat:`) and the length gate
+    // (`feat: ${LONG}` -> git gets any length). Falling back to the opener line
+    // is the same fail-closed rule the metacharacter, truncation and
+    // post-terminator guards follow.
+    //
+    // Non-vacuous: every body below is conforming, so a resolver that still
+    // read the body returns the body and these fail.
+    assert.strictEqual(resolveCommitSubject(sub('<<EOF', 'fix: bare', 'EOF')),
+      '$(cat <<EOF', 'a bare delimiter must fall back to the opener line');
+    assert.strictEqual(resolveCommitSubject(sub('<< EOF', 'fix: spaced', 'EOF')),
+      '$(cat << EOF', 'a spaced bare delimiter is still bare');
+    assert.strictEqual(resolveCommitSubject(sub('<<-EOF', '\tfix: dashed bare', 'EOF')),
+      '$(cat <<-EOF', '<<- does not quote the delimiter; it only strips tabs');
+    // The expansion that makes this a bypass rather than a nicety.
+    assert.strictEqual(resolveCommitSubject(sub('<<EOF', 'feat: $UNSET_VAR', 'EOF')),
+      '$(cat <<EOF', "git's real subject here is `feat:` — never the unexpanded literal");
+  });
+
+  // RULESET.TESTS.property-based-testing — this is a parser/transformation on a
+  // hook path, so the invariants are asserted over generated input rather than
+  // examples alone. Seeded setup helper, not `fast-check` directly, so numRuns
+  // and seed are configured before any fc.assert (repo convention).
+  //
+  // Review of #3816, Major 1: the previous generator was a bare
+  // fc.string({maxLength: 400}), whose pinned-seed corpus contained NO newline
+  // and NO opener — 0 of 200 inputs reached the parser, so all three properties
+  // reduced to `f(s) === s`. The generator now CONSTRUCTS heredoc-shaped input
+  // (every opener spelling, <<- tabs, optional terminator, CRLF) alongside plain
+  // and multi-line strings, and each property PROVES its corpus took the heredoc
+  // arm: `resolved` counts inputs whose output is not the first line, which only
+  // the resolver's body-scanning branch can produce.
+  const delimiterArb = fc.stringMatching(/^[A-Za-z][A-Za-z0-9_-]{0,8}$/);
+  const bodyLineArb = fc.stringMatching(/^[^\n\r]{0,60}$/);
+  const heredocArb = fc.record({
+    delim: delimiterArb,
+    quote: fc.constantFrom("'", '"', '', '\\'),
+    dash: fc.boolean(),
+    spaced: fc.boolean(),
+    catPath: fc.constantFrom('cat', '/bin/cat'),
+    body: fc.array(bodyLineArb, { minLength: 0, maxLength: 5 }),
+    terminated: fc.boolean(),
+    eol: fc.constantFrom('\n', '\r\n'),
+  }).map(({ delim, quote, dash, spaced, catPath, body, terminated, eol }) => {
+    const word = quote === '\\' ? `\\${delim}` : quote ? `${quote}${delim}${quote}` : delim;
+    const opener = `$(${catPath} <<${dash ? '-' : ''}${spaced ? ' ' : ''}${word}`;
+    const emitted = [...body.map((l) => (dash ? `\t${l}` : l))];
+    if (terminated) emitted.push(dash ? `\t${delim}` : delim, ')');
+    // GENERATION-TIME oracle for the one result the derivation check cannot
+    // classify by membership: ''. Computed from what the generator KNOWS it
+    // built — never by re-running resolver logic — so a resolver degrading to
+    // '' anywhere it should not fails the property (Codex review of #3816,
+    // rounds 1+2). '' is legitimate exactly when the FIRST reachable
+    // terminator is followed by the one canonical closing-paren line (the
+    // round-3 post-terminator guard: any other tail must fall back to the
+    // opener, never to '') and every scanned line before that terminator is
+    // ASCII-blank. A body line that reads as the delimiter after <<- tab
+    // stripping terminates early, and whatever follows it is its tail.
+    const seen = emitted.map((l) => (dash ? l.replace(/^\t+/, '') : l));
+    const stop = seen.indexOf(delim);
+    const tail = stop === -1 ? null : seen.slice(stop + 1);
+    const canonicalTail = tail !== null && tail.length === 1 && /^[ \t]*\)[ \t]*$/.test(tail[0]);
+    const expectEmpty = canonicalTail
+      && seen.slice(0, stop).every((l) => /^[ \t]*$/.test(l));
+    return { text: [opener, ...emitted].join(eol), expectEmpty };
+  });
+  const messageArb = fc.oneof(
+    { weight: 3, arbitrary: heredocArb },
+    // plain single- and multi-line messages: the subject is the first line
+    // verbatim, so '' is legitimate only when the first line IS ''.
+    fc.string({ maxLength: 400 }).map((s) => ({ text: s, expectEmpty: s.split(/\r?\n/)[0] === '' })),
+    // multi-line plain messages — the old generator never produced a newline
+    fc.array(bodyLineArb, { minLength: 1, maxLength: 4 })
+      .map((ls) => ({ text: ls.join('\n'), expectEmpty: ls[0] === '' })),
+  );
+  const firstLineOf = (input) => String(input).split(/\r?\n/)[0];
+  // Floor for the resolved-input count across the seeded corpus. Deliberately
+  // far below the ~60% heredoc weighting so generator drift cannot flake it,
+  // while still failing loudly if the corpus stops reaching the parser — the
+  // exact vacuity Major 1 caught.
+  const MIN_RESOLVED = 20;
+
+  test('property: total — never throws, always returns a string', () => {
+    // Totality is a SECURITY property here, not tidiness: this runs inside a
+    // PreToolUse hook whose caller treats a failed extraction as "nothing to
+    // validate", so an exception fails OPEN. Backed by a corpus that reaches
+    // the parser, which is what makes the claim about the PARSER and not about
+    // fc.string pass-through.
+    let resolved = 0;
+    fc.assert(fc.property(messageArb, (m) => {
+      const out = resolveCommitSubject(m.text);
+      assert.strictEqual(typeof out, 'string');
+      if (out !== firstLineOf(m.text)) resolved += 1;
+    }));
+    assert.ok(resolved >= MIN_RESOLVED,
+      `only ${resolved} corpus inputs were actually resolved past the first line — the property is `
+      + 'running on inputs that never reach the parser again (review of #3816, Major 1)');
+    for (const odd of [null, undefined, '', '\n', '\n\n\n', '\r\n', '$(cat <<', '$(cat <<-']) {
+      assert.strictEqual(typeof resolveCommitSubject(odd), 'string', JSON.stringify(odd));
+    }
+  });
+
+  test('property: idempotent — resolving a resolved subject changes nothing', () => {
+    let resolved = 0;
+    fc.assert(fc.property(messageArb, (m) => {
+      const once = resolveCommitSubject(m.text);
+      assert.strictEqual(resolveCommitSubject(once), once);
+      if (once !== firstLineOf(m.text)) resolved += 1;
+    }));
+    assert.ok(resolved >= MIN_RESOLVED,
+      `only ${resolved} corpus inputs were actually resolved — vacuous corpus (review of #3816)`);
+  });
+
+  test('property: the result is a single line derived from an input line by git\'s own strips', () => {
+    // The subject is a LINE, never a synthesised string: whatever comes back
+    // must be one of the input's own lines, modulo exactly the transformations
+    // git itself performs — `<<-` leading-tab stripping and cleanup=whitespace
+    // trailing-whitespace stripping. A resolver that concatenated lines or
+    // trimmed anything MORE than that would fail this. The one result
+    // membership cannot classify — '' — is judged by the GENERATOR's own
+    // metadata (`expectEmpty`, computed from what it built, not from resolver
+    // logic), so a resolver conditionally degrading to '' fails loudly (Codex
+    // review of #3816, rounds 1+2).
+    let resolved = 0;
+    fc.assert(fc.property(messageArb, (m) => {
+      const out = resolveCommitSubject(m.text);
+      assert.ok(!/[\n\r]/.test(out), 'a subject is one line');
+      const lines = String(m.text).split(/\r?\n/);
+      const derivations = (l) => {
+        const untabbed = l.replace(/^\t+/, '');
+        return [l, untabbed, untabbed.replace(/[ \t]+$/, '')];
+      };
+      if (out === '') {
+        assert.ok(m.expectEmpty,
+          `resolved to '' for an input the generator did NOT build as an empty message: `
+          + JSON.stringify(m.text));
+      } else {
+        assert.ok(lines.some((l) => derivations(l).includes(out)),
+          `result ${JSON.stringify(out)} is not derived from any line of the input`);
+      }
+      if (out !== firstLineOf(m.text)) resolved += 1;
+    }));
+    assert.ok(resolved >= MIN_RESOLVED,
+      `only ${resolved} corpus inputs were actually resolved — vacuous corpus (review of #3816)`);
+  });
+
+  test('MAJOR 2: trailing whitespace is stripped, as git cleanup=whitespace does', () => {
+    // git strips whitespace at BOTH ends of the line, not just leading blank
+    // lines. Measuring the raw line rejected a body of `feat: ` + 66 x's + three
+    // spaces as 75 chars when git's actual subject is a conforming 72 — a
+    // still-blocked conforming commit, the defect #3802 reports (review of #3816).
+    const subject72 = `feat: ${'x'.repeat(66)}`;
+    assert.strictEqual(subject72.length, 72, 'fixture built wrong');
+    assert.strictEqual(resolveCommitSubject(sub("<<'EOF'", `${subject72}   `, 'EOF')), subject72);
+    assert.strictEqual(resolveCommitSubject(sub("<<'EOF'", 'feat: tab tail\t \t', 'EOF')),
+      'feat: tab tail', 'tabs are trailing whitespace too');
+  });
+
+  test('MINOR 3: CRLF bodies resolve identically to LF bodies', () => {
+    // split('\n') left \r on every body line, so the delimiter never matched on
+    // CRLF input: the truncation guard was inert, an empty CRLF message resolved
+    // to "EOF\r" instead of '', and a real 72-char subject measured 73
+    // (review of #3816).
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\r\nfeat: crlf subject\r\nEOF\r\n)"),
+      'feat: crlf subject');
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\r\nEOF\r\n)"), '',
+      'an empty CRLF message is EMPTY — it used to resolve to the terminator plus \\r');
+    assert.strictEqual(resolveCommitSubject("$(cat <<'EOF'\r\nfeat: aaaa"), "$(cat <<'EOF'",
+      'the truncation guard must be live on CRLF input, not defeated by an unmatchable delimiter');
+  });
+
+  test('ordinary messages pass through as their first line', () => {
+    assert.strictEqual(resolveCommitSubject('feat(auth): add login flow'), 'feat(auth): add login flow');
+    assert.strictEqual(resolveCommitSubject('feat: subject\n\nBody paragraph.'), 'feat: subject');
+    assert.strictEqual(resolveCommitSubject(''), '');
+    assert.strictEqual(resolveCommitSubject(null), '');
+    assert.strictEqual(resolveCommitSubject(undefined), '');
   });
 });
 
@@ -5488,6 +5860,10 @@ describe('install.js guard for gsd-worktree-path-guard.js', () => {
   before(() => {
     // ADR-857 phase 5f-1b: hook registration moved to runtime-hooks-surface.cts.
     // Concatenate both sources so structural assertions find patterns in either file.
+    // allow-test-rule: structural-implementation-guard (#3545) — structural install.js
+    // guard; install.js has side effects on require and no exported symbol for hook-registration wiring;
+    // every src.includes()/indexOf() and block.includes() call below traces
+    // back to this read
     const installSrc = fs.readFileSync(INSTALL_SRC, 'utf-8');
     let hooksSurfaceSrc = '';
     try { hooksSurfaceSrc = fs.readFileSync(HOOKS_SURFACE_SRC, 'utf-8'); } catch { /* ok */ }
@@ -5836,15 +6212,18 @@ const GATE_SNIPPET = [
 ].join('\n');
 
 function runGate(cwd, env) {
-  // 30000ms: previously UNBOUNDED (execFileSync had no `timeout` option).
-  // The snippet is pure shell string/array parsing plus one `git config
-  // --file .gitmodules` lookup against a small fixture repo — matched to the
-  // 30s bound already established for the other bash guard snippets in this
-  // suite for consistency, though it does substantially less work than those.
+  // This is a bash FAN-OUT: the `-c` snippet runs shell string/array parsing
+  // plus a `git config --file .gitmodules` subprocess under one bash
+  // interpreter, not a single plumbing call — 30000ms was the wrong CLASS,
+  // not a slow machine. It timed out on `next` itself, run 32608945654,
+  // `full test (windows-latest, 24, shard 1/3)`, test `plan touching only
+  // src/ in a submodule project keeps worktree isolation ENABLED`:
+  // `outcome=timed_out` exitCode null. See HOOK_FANOUT_TIMEOUT_MS in
+  // ./helpers/timeouts.cjs for the class rationale.
   const r = seamRunHookGate('-c', [GATE_SNIPPET], {
     interpreter: 'bash',
     cwd,
-    timeoutMs: 30_000,
+    timeoutMs: HOOK_FANOUT_TIMEOUT_MS,
     env: { ...process.env, ...env },
   });
   if (r.exitCode !== 0) {
@@ -7129,5 +7508,353 @@ describe('#2596 --files on the record-agent and create verbs', () => {
         `record-agent and create disagree on the files_modified VALUE for ${JSON.stringify(extraArgs)}`,
       );
     }
+  });
+});
+
+
+// ══ #3003 — declared deletions for the cleanup-wave guard ═══════════════════════════════
+//
+// The deletions guard blocked ANY deletion in an executor branch, unconditionally. A plan
+// whose stated scope includes removing a file (folding a test into a sibling suite) could
+// not be merged by the tool meant to merge it, forcing a manual --no-ff outside the tool —
+// strictly less safe than what the guard protects against.
+//
+// #3003's pinned decision: an optional `declared_deletions` PATH LIST on the manifest entry.
+// A path list, not a boolean, precisely so an unexpected deletion riding along with a
+// declared one still blocks. These tests exist mostly to hold that line — the rows that
+// matter are the OVER-AUTHORIZATION set, because every way of loosening the matcher
+// (prefix, glob, startsWith) silently rebuilds the boolean opt-in that was rejected.
+//
+// Matching is EXACT after normalization. No globs, no prefixes. That is deliberate
+// Greenspun-avoidance: `declaredScopePrefix` already exists for the ADVISORY and returns
+// null ("matches everything") for a glob-leading pattern — correct there, because a false
+// alarm costs more than a miss for an advisory. For a GATE that same rule would let
+// `["*.ts"]` disarm the guard completely.
+//
+// See https://github.com/open-gsd/gsd-core/issues/3003
+
+describe('#3003 — declared deletions: authorization is exact set membership', () => {
+  const REPO = '/repo/main';
+  const WT = '/repo/.claude/worktrees/agent-a1';
+  const BR = 'worktree-agent-a1';
+
+  /** A wave-cleanup git double whose deletion list and per-key overrides are injectable. */
+  function makeDeletionGit({ deletions = '', deletionExit = 0, changed = null } = {}) {
+    return (args) => {
+      const key = args.join(' ');
+      const ok = (stdout = '') => ({ exitCode: 0, stdout, stderr: '', signal: null, error: null, timedOut: false });
+      if (key === `-C ${WT} rev-parse --abbrev-ref HEAD`) return ok(BR);
+      if (key === `merge-base HEAD ${BR}`) return ok('abc123');
+      if (key === `diff --diff-filter=D --name-only HEAD...${BR}`) {
+        return deletionExit === 0
+          ? ok(deletions)
+          : { exitCode: deletionExit, stdout: '', stderr: 'fatal: bad revision', signal: null, error: null, timedOut: false };
+      }
+      if (key === `diff --name-only HEAD...${BR}`) return ok(changed === null ? deletions : changed);
+      if (key === `-C ${WT} status --porcelain --untracked-files=all`) return ok('');
+      return ok();
+    };
+  }
+
+  function runWave(entry, gitOpts) {
+    return executeWorktreeWaveCleanupPlan(
+      {
+        ok: true,
+        repoRoot: REPO,
+        action: 'cleanup_wave',
+        discovery: 'manifest',
+        entries: [{ agent_id: 'a1', worktree_path: WT, branch: BR, expected_base: 'abc123', ...entry }],
+      },
+      { execGit: makeDeletionGit(gitOpts) },
+    );
+  }
+
+  const firstEntry = (result) => result.entries[0];
+  const blockedOnDeletions = (result) => firstEntry(result).reason === 'branch_contains_deletions';
+
+  // ── backward compatibility: these must pass BEFORE the change too ──────────────────────
+
+  test('no deletions proceeds', () => {
+    const result = runWave({}, { deletions: '' });
+    assert.notEqual(firstEntry(result).reason, 'branch_contains_deletions');
+  });
+
+  test('absent declaration keeps the unconditional block', () => {
+    const result = runWave({}, { deletions: 'tests/a.test.ts\n' });
+    assert.ok(blockedOnDeletions(result), 'an entry with no declaration must block exactly as before');
+  });
+
+  // ── the feature ────────────────────────────────────────────────────────────────────────
+
+  test('a fully declared deletion merges', () => {
+    const result = runWave(
+      { declared_deletions: ['tests/a.test.ts'] },
+      { deletions: 'tests/a.test.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result), `expected merge, got ${firstEntry(result).reason}`);
+  });
+
+  test('an undeclared deletion still blocks, and names only the residue', () => {
+    const result = runWave(
+      { declared_deletions: ['tests/a.test.ts'] },
+      { deletions: 'tests/a.test.ts\nsrc/billing.ts\n' },
+    );
+    assert.ok(blockedOnDeletions(result));
+    const detail = firstEntry(result).stderr;
+    assert.match(detail, /src\/billing\.ts/, 'the undeclared path must be named');
+    assert.doesNotMatch(detail, /tests\/a\.test\.ts/,
+      'a declared path must NOT appear in the block detail — it would misdirect the operator');
+  });
+
+  test('an over-declaration is inert', () => {
+    const result = runWave(
+      { declared_deletions: ['tests/a.test.ts', 'never/deleted.ts'] },
+      { deletions: 'tests/a.test.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result));
+  });
+
+  test('an empty declaration is not an authorization', () => {
+    const result = runWave({ declared_deletions: [] }, { deletions: 'tests/a.test.ts\n' });
+    assert.ok(blockedOnDeletions(result));
+  });
+
+  test('a broken deletion check is never an authorization', () => {
+    const result = runWave(
+      { declared_deletions: ['tests/a.test.ts'] },
+      { deletions: '', deletionExit: 128 },
+    );
+    assert.equal(firstEntry(result).reason, 'deletion_check_failed',
+      'a failed check must block on its own reason, never be filtered into a pass');
+  });
+
+  // ── the over-authorization set: each of these BLOCKS, and each would PASS under a
+  //    prefix / glob / startsWith matcher. This is the line the design exists to hold. ────
+
+  test('a directory declaration does not authorize its children', () => {
+    const result = runWave({ declared_deletions: ['tests'] }, { deletions: 'tests/a.test.ts\n' });
+    assert.ok(blockedOnDeletions(result),
+      'prefix matching would authorize a mass deletion — the exact accident the guard catches');
+  });
+
+  test('a glob declaration authorizes nothing', () => {
+    const result = runWave({ declared_deletions: ['*.ts'] }, { deletions: 'tests/a.test.ts\n' });
+    assert.ok(blockedOnDeletions(result),
+      'a glob-leading declaration must not disarm the guard (declaredScopePrefix returns null here)');
+  });
+
+  test('a declaration is not a string prefix of another path', () => {
+    const result = runWave({ declared_deletions: ['tests/a.ts'] }, { deletions: 'tests/ab.ts\n' });
+    assert.ok(blockedOnDeletions(result), 'startsWith would leak tests/a.ts -> tests/ab.ts');
+  });
+
+  // ── normalization: both sides meet in the same shape ───────────────────────────────────
+
+  test('a backslash declaration normalizes on any OS', () => {
+    const result = runWave({ declared_deletions: ['tests\\a.test.ts'] }, { deletions: 'tests/a.test.ts\n' });
+    assert.ok(!blockedOnDeletions(result));
+  });
+
+  test('leading ./ and trailing slash normalize', () => {
+    const result = runWave({ declared_deletions: ['./tests/a.test.ts'] }, { deletions: 'tests/a.test.ts\n' });
+    assert.ok(!blockedOnDeletions(result));
+  });
+
+  test('a duplicated declaration is inert', () => {
+    const result = runWave(
+      { declared_deletions: ['tests/a.test.ts', 'tests/a.test.ts'] },
+      { deletions: 'tests/a.test.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result));
+  });
+
+  test('non-string and blank declarations are dropped', () => {
+    const result = runWave(
+      { declared_deletions: [null, 0, '', '   ', [], 'tests/a.test.ts'] },
+      { deletions: 'tests/a.test.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result), 'junk elements drop; the one real path still authorizes');
+  });
+
+  test('a non-array declaration is treated as absent', () => {
+    for (const bogus of ['tests/a.test.ts', {}, 0, true]) {
+      const result = runWave({ declared_deletions: bogus }, { deletions: 'tests/a.test.ts\n' });
+      assert.ok(blockedOnDeletions(result), `non-array ${JSON.stringify(bogus)} must not authorize`);
+    }
+  });
+
+  // ── the advisory interaction the design nearly missed ──────────────────────────────────
+
+  test('a declared deletion is in scope for the advisory', () => {
+    // `git diff --name-only` includes deleted paths, and the #2596 advisory compares that
+    // against files_modified ALONE. Without subtracting the declaration out, authorizing a
+    // deletion produces a SCOPE_OUT_OF_DECLARED warning for the very path just authorized.
+    const result = runWave(
+      { files_modified: ['src/keep.ts'], declared_deletions: ['tests/a.test.ts'] },
+      { deletions: 'tests/a.test.ts\n', changed: 'src/keep.ts\ntests/a.test.ts\n' },
+    );
+    // The merge assertion is load-bearing: without it a revert blocks the entry, warnings
+    // come back empty, and the path-absence assertion below passes for the wrong reason.
+    assert.ok(!blockedOnDeletions(result), `expected merge, got ${firstEntry(result).reason}`);
+    const paths = firstEntry(result).warnings.map((w) => w.path);
+    assert.ok(!paths.includes('tests/a.test.ts'),
+      'a declared deletion must not be reported out-of-scope');
+  });
+
+  test('the advisory does not activate on declarations alone', () => {
+    // Before this fix, gating unioned files_modified + declared_deletions into the scope
+    // list, so a plan that declared ONLY a deletion (no files_modified) still produced a
+    // non-empty scope list, and every modified path warned as out-of-declared-scope on a
+    // plan that had declared no modification scope at all. Gating on files_modified alone
+    // keeps the advisory as silent as it was pre-#2596 when nothing was declared modified.
+    const result = runWave(
+      { declared_deletions: ['src/gone.ts'] },
+      { deletions: 'src/gone.ts\n', changed: 'src/gone.ts\nsrc/other.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result), `expected merge, got ${firstEntry(result).reason}`);
+    assert.deepEqual(firstEntry(result).warnings, [], 'no files_modified means no advisory scope at all');
+  });
+
+  test('a glob in declared_deletions does not mute the advisory', () => {
+    // `declaredScopePrefix` returns null for a glob-leading pattern, meaning "matches
+    // everything" — correct for the advisory's OWN matcher, but under the old UNION this
+    // silenced the advisory entirely for a modified path that has nothing to do with the
+    // glob. Exact-match subtraction gives declared_deletions one rule on every surface.
+    const result = runWave(
+      { files_modified: ['src/kept.ts'], declared_deletions: ['*.md'] },
+      { deletions: '', changed: 'src/kept.ts\nsrc/stray.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result), `expected merge, got ${firstEntry(result).reason}`);
+    const paths = firstEntry(result).warnings.map((w) => w.path);
+    assert.ok(paths.includes('src/stray.ts'), 'a glob declaration must not disarm the advisory');
+  });
+
+  test('a bare directory in declared_deletions does not mute the advisory for its children', () => {
+    // Same trap as the glob case: a directory-shaped declared_deletions entry authorizes
+    // nothing at the gate (exact match only), but under the old UNION it would have widened
+    // the advisory's own prefix matching to cover everything under that directory.
+    const result = runWave(
+      { files_modified: ['src/kept.ts'], declared_deletions: ['src'] },
+      { deletions: '', changed: 'src/kept.ts\nsrc/stray.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result), `expected merge, got ${firstEntry(result).reason}`);
+    const paths = firstEntry(result).warnings.map((w) => w.path);
+    assert.ok(paths.includes('src/stray.ts'), 'a bare directory declaration must not mute the advisory for its children');
+  });
+
+  test('the advisory still fires for a genuinely out-of-scope path', () => {
+    const result = runWave(
+      { files_modified: ['src/keep.ts'], declared_deletions: ['tests/a.test.ts'] },
+      { deletions: 'tests/a.test.ts\n', changed: 'src/keep.ts\ntests/a.test.ts\nsrc/rogue.ts\n' },
+    );
+    const paths = firstEntry(result).warnings.map((w) => w.path);
+    assert.ok(paths.includes('src/rogue.ts'), 'the advisory must not be blunted by this change');
+  });
+
+  // ── git C-quoting decode: both sides meet in the same shape ────────────────────────────
+
+  test('a declared non-ASCII deletion merges even though git C-quotes the path', () => {
+    // With core.quotepath at its git default, a non-ASCII deleted path comes back from
+    // `git diff --diff-filter=D --name-only` wrapped in double quotes and C-escaped:
+    // `tests/é.ts` is reported as the literal string built here with String.raw so the
+    // runtime value actually contains backslash-3-0-3 / backslash-2-5-1 sequences, not a
+    // JS-interpreted escape. Confirmed via `raw.length === 19` and `raw.includes('\\303')`.
+    // Without decodeGitQuotedPath this quoted form can never equal the plainly-declared
+    // path below, so the entry would block forever.
+    const quoted = String.raw`"tests/\303\251.ts"`;
+    const result = runWave(
+      { declared_deletions: ['tests/é.ts'] },
+      { deletions: `${quoted}\n` },
+    );
+    assert.ok(!blockedOnDeletions(result), `expected merge, got ${firstEntry(result).reason}`);
+  });
+
+  test('a declaration written in git-quoted form also matches a plainly reported path', () => {
+    // The reverse direction: normalizeScopePath runs on BOTH sides, so a declaration
+    // authored in the quoted-and-escaped form must still match a plain git report. This
+    // pins the symmetry so a future one-sided decode (only on the git side) is caught.
+    const quoted = String.raw`"tests/\303\251.ts"`;
+    const result = runWave(
+      { declared_deletions: [quoted] },
+      { deletions: 'tests/é.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result), `expected merge, got ${firstEntry(result).reason}`);
+  });
+
+  test('an undeclared non-ASCII deletion still blocks, and the residue names the decoded path', () => {
+    // The path must not be declared, so the guard blocks — and the operator-facing detail
+    // must show the DECODED path (the one they can actually act on), not the raw escaped
+    // quoted form git emitted.
+    const quoted = String.raw`"tests/\303\251.ts"`;
+    const result = runWave(
+      { declared_deletions: ['src/keep.ts'] },
+      { deletions: `${quoted}\n` },
+    );
+    assert.ok(blockedOnDeletions(result));
+    const detail = firstEntry(result).stderr;
+    assert.match(detail, /tests\/é\.ts/, 'the block detail must name the decoded path, not the raw escaped form');
+    assert.doesNotMatch(detail, /\\303\\251/, 'the raw C-escaped bytes must not leak into the operator-facing detail');
+  });
+
+  test('a path merely containing a quote is not decoded', () => {
+    // `tests/a"b.ts` is not wrapped in a leading-and-trailing quote pair, so the
+    // startsWith('"') && endsWith('"') guard must leave it completely untouched — declaring
+    // that exact literal string must still merge.
+    const result = runWave(
+      { declared_deletions: ['tests/a"b.ts'] },
+      { deletions: 'tests/a"b.ts\n' },
+    );
+    assert.ok(!blockedOnDeletions(result), `expected merge, got ${firstEntry(result).reason}`);
+  });
+
+  // NOTE: "a fully declared deletion merges" (above) already covers a plain ASCII declared
+  // deletion merging — no additional plain-ASCII regression test added here to avoid
+  // duplicating it.
+
+  // ── #2852 regression: a block isolates, it does not abort the wave ─────────────────────
+
+  test('a blocked entry does not abort the rest of the wave', () => {
+    const second = { agent_id: 'a2', worktree_path: '/repo/.claude/worktrees/agent-a2', branch: 'worktree-agent-a2', expected_base: 'abc123' };
+    const result = executeWorktreeWaveCleanupPlan(
+      {
+        ok: true,
+        repoRoot: REPO,
+        action: 'cleanup_wave',
+        discovery: 'manifest',
+        entries: [
+          { agent_id: 'a1', worktree_path: WT, branch: BR, expected_base: 'abc123', declared_deletions: ['tests/a.test.ts'] },
+          second,
+        ],
+      },
+      { execGit: makeDeletionGit({ deletions: 'tests/a.test.ts\nsrc/billing.ts\n' }) },
+    );
+    assert.equal(result.entries[0].reason, 'branch_contains_deletions');
+    assert.equal(result.entries.length, 2, 'the second entry must still have been processed');
+    assert.deepEqual(result.pending, [], 'nothing may be left pending — that would be an aborted wave');
+  });
+
+  // ── property: authorization is exactly set membership ──────────────────────────────────
+
+  test('property: a deletion merges iff its normalized path is in the declared set', () => {
+    const PATHS = ['a.ts', 'src/b.ts', 'tests/c.test.ts', 'deep/nested/d.ts', 'e.md'];
+    fc.assert(
+      fc.property(
+        fc.subarray(PATHS, { minLength: 1 }),
+        fc.subarray(PATHS, { minLength: 1 }),
+        (deleted, declared) => {
+          const result = runWave(
+            { declared_deletions: declared },
+            { deletions: `${deleted.join('\n')}\n` },
+          );
+          const everyDeletionDeclared = deleted.every((p) => declared.includes(p));
+          assert.equal(
+            !blockedOnDeletions(result),
+            everyDeletionDeclared,
+            `deleted=${JSON.stringify(deleted)} declared=${JSON.stringify(declared)}`,
+          );
+        },
+      ),
+      { seed: 3003, numRuns: 200 },
+    );
   });
 });

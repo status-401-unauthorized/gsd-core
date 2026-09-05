@@ -32,7 +32,10 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('node:child_process');
-const { readFileNormalized } = require('./helpers.cjs');
+const { readFileNormalized, readWorkflowCombined, createTempDir, cleanup } = require('./helpers.cjs');
+const { runHook, OUTCOME } = require('./helpers/process-seam.cjs');
+const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+const fc = require('fast-check');
 
 const COMMAND_PATH = path.join(__dirname, '..', 'commands', 'gsd', 'plan-review-convergence.md');
 const WORKFLOW_PATH = path.join(__dirname, '..', 'gsd-core', 'workflows', 'plan-review-convergence.md');
@@ -808,6 +811,25 @@ describe('plan-review-convergence workflow: escalation gate (#2306)', () => {
       workflow.includes('TEXT_MODE') || workflow.includes('text_mode'),
       'workflow must support TEXT_MODE for plain-text escalation prompt'
     );
+  });
+
+  test('#3771 "Proceed anyway" is withheld at max cycles when a plan-revision conflict is open', () => {
+    const maxCyclesSection = workflow.slice(workflow.indexOf('**Max cycles check:**'));
+    const branchPoint = maxCyclesSection.indexOf('**Otherwise (`OPEN_CONFLICTS` == 0):**');
+    assert.notEqual(branchPoint, -1,
+      'the max-cycles escalation must branch on OPEN_CONFLICTS before offering "Proceed anyway"');
+    const openConflictBranch = maxCyclesSection.slice(0, branchPoint);
+    const noConflictBranch = maxCyclesSection.slice(branchPoint);
+    // Match the actual OFFER shapes (a numbered option or an AskUserQuestion label), not any
+    // sentence that merely mentions the phrase while explaining it is withheld.
+    const offersProceedAnyway = (text) =>
+      /1\.\s*Proceed anyway/.test(text) || /label:\s*"Proceed anyway"/.test(text);
+    assert.ok(!offersProceedAnyway(openConflictBranch),
+      'an open plan-revision conflict is a blocker — the branch reached while OPEN_CONFLICTS > 0 must never offer to accept it silently');
+    assert.match(openConflictBranch, /blocker/i,
+      'the open-conflict branch must tell the user why "Proceed anyway" is unavailable');
+    assert.ok(offersProceedAnyway(noConflictBranch),
+      '"Proceed anyway" must still be offered when there is no open conflict, only HIGH/actionable concerns');
   });
 });
 
@@ -1911,5 +1933,465 @@ describe('plan-review-convergence: cross-artifact fact-drift pass (#1956)', () =
         'the ARCHITECTURE.md drift-guard paragraph must describe the cross-artifact fact-drift axis'
       );
     });
+  });
+});
+
+// ══ #2398 — consensus gate for CYCLE_SUMMARY with multi-reviewer runs ═══════════════════
+//
+// Supersedes PR #2417, which its author closed on the unresolved B2 finding: the approved
+// wording let a lone HIGH count if "the source-grounding pass independently confirms it",
+// but that pass verifies "every symbol THE PLAN cites" — it never takes reviewer claims as
+// input. For a genuine architectural HIGH raised by one reviewer and missed by another:
+// ungroundable, uncorroborated, so it stopped gating. Net effect, in the #2417 review's
+// words: configuring MORE reviewers produced a WEAKER gate than configuring one.
+//
+// The gate therefore splits by what a claim ASSERTS:
+//   - existence/citation-class  -> source-grounding OR corroboration (catches fabricated cites)
+//   - judgment/architectural    -> counts unless the RAISER carries an evidence-quality
+//                                  discount marker  <- this is the B2 fix
+//
+// Linus's Law is the reason: "different reviewers think differently" — demanding two of them
+// independently raise the SAME architectural finding destroys the mechanism a multi-reviewer
+// setup exists for. Its limits clause supplies the other half: "rubber-stamp reviews don't
+// count", and a reviewer that produced no file:line evidence is a rubber-stamp for that cycle.
+//
+// Assertions are on parsed structure and typed sets. The contract SENTENCES are themselves the
+// deliverable (source-text-is-the-product), and carry no allow-test-rule marker deliberately:
+// no-source-grep never inspects .md reads, so a marker suppresses nothing and consumes the
+// ceilinged unverified-marker budget (measured 2026-08-21, 280 -> 281 fails the gate).
+//
+// See https://github.com/open-gsd/gsd-core/issues/2398
+
+const WORKFLOW_2398 = path.join(__dirname, '..', 'gsd-core', 'workflows', 'plan-review-convergence.md');
+const REVIEWER_INSTANCES_2398 = path.join(__dirname, '..', 'gsd-core', 'references', 'reviewer-instances.md');
+const runner2398 = require('../gsd-core/bin/lib/review-lane-runner.cjs');
+
+const lf2398 = (t) => String(t == null ? '' : t).replace(/\r\n/g, '\n');
+
+function read2398(p) {
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+}
+
+/** The `### 5a` step body, bounded by the next `### ` heading. */
+function step5a2398(text) {
+  const lines = lf2398(text).split('\n');
+  const start = lines.findIndex((l) => /^###\s+5a[.\s]/.test(l));
+  if (start === -1) return '';
+  let end = start + 1;
+  while (end < lines.length && !/^###\s/.test(lines[end])) end += 1;
+  return lines.slice(start, end).join('\n');
+}
+
+/** The consensus-gate block: from its heading to the line before `Counting rules:`. */
+function consensusGate2398(text) {
+  const body = lf2398(text);
+  const gateAt = body.search(/^\s*Consensus gate\b/m);
+  if (gateAt === -1) return '';
+  const countingAt = body.indexOf('Counting rules:', gateAt);
+  return countingAt === -1 ? body.slice(gateAt) : body.slice(gateAt, countingAt);
+}
+
+/** Every `[reviewed-without-*]` marker literal named in `text`, deduped and sorted. */
+function markerNames2398(text) {
+  return [...new Set([...lf2398(text).matchAll(/\[reviewed-without-[a-z-]+\]/g)].map((m) => m[0]))].sort();
+}
+
+/** Ordered positions of the contract landmarks the gate must sit between. */
+function landmarks2398(text) {
+  const body = lf2398(text);
+  return {
+    contract: body.indexOf('IMPORTANT — CYCLE_SUMMARY contract'),
+    gate: body.search(/^\s*Consensus gate\b/m),
+    counting: body.indexOf('Counting rules:'),
+    definitions: body.indexOf('Definitions:'),
+  };
+}
+
+describe('#2398 — consensus gate is declared and correctly positioned', () => {
+  const workflow = read2398(WORKFLOW_2398);
+
+  test('step 5a declares a consensus gate', () => {
+    assert.notEqual(consensusGate2398(step5a2398(workflow)), '', 'no Consensus gate block found in step 5a');
+  });
+
+  test('gate precedes the counting rules it constrains', () => {
+    const at = landmarks2398(step5a2398(workflow));
+    assert.ok(at.contract >= 0 && at.gate >= 0 && at.counting >= 0 && at.definitions >= 0,
+      `missing landmark: ${JSON.stringify(at)}`);
+    assert.ok(at.contract < at.gate, 'gate must sit inside the CYCLE_SUMMARY contract');
+    assert.ok(at.gate < at.counting, 'gate must precede Counting rules, or it constrains nothing');
+    assert.ok(at.counting < at.definitions, 'existing Counting rules -> Definitions order must survive');
+  });
+
+  test('the CYCLE_SUMMARY contract line itself is unchanged', () => {
+    // The orchestrator greps `current_high=[0-9]+` at :320-321. This change alters the NUMBER
+    // the agent computes, never the line's shape — that is the Hyrum-safe boundary.
+    assert.ok(lf2398(workflow).includes('CYCLE_SUMMARY: current_high=<N> current_actionable=<M>'));
+  });
+
+  test('step 5a fences stay balanced', () => {
+    const fences = (lf2398(step5a2398(workflow)).match(/^\s*```/gm) || []).length;
+    assert.equal(fences % 2, 0, `odd fence count (${fences}) in step 5a — a fence was left open`);
+  });
+});
+
+describe('#2398 — gate semantics: the clauses that make it correct', () => {
+  const gate = () => lf2398(consensusGate2398(step5a2398(read2398(WORKFLOW_2398)))).toLowerCase();
+
+  test('gate engages only when 2+ reviewers actually ran', () => {
+    const g = gate();
+    assert.ok(/2\+|two or more|at least two/.test(g), 'gate must state its 2+ reviewer trigger');
+    assert.ok(/\bran\b|produced|returned/.test(g),
+      'trigger must be reviewers that RAN, not merely configured — a failed reviewer must not arm the gate');
+  });
+
+  test('single reviewer is documented as unchanged', () => {
+    assert.ok(/single reviewer|one reviewer|exactly one/.test(gate()),
+      'the single-reviewer no-op is the backward-compatibility promise and must be stated');
+  });
+
+  test('threshold is two, not three', () => {
+    const g = gate();
+    assert.ok(!/three or more|3\+ reviewers/.test(g), 'threshold must be 2, matching the approved scope');
+  });
+
+  // ── the B2 regression ──────────────────────────────────────────────────────────────────
+  test('judgment-class lone HIGH is exempt from corroboration (B2)', () => {
+    const g = gate();
+    assert.ok(/judgment|architectural/.test(g), 'gate must name the judgment/architectural class');
+    assert.ok(/counts?\b[\s\S]{0,200}?(unless|except)[\s\S]{0,200}?marker/.test(g),
+      'a judgment-class lone HIGH must COUNT unless the raiser is marked — if it instead requires '
+      + 'corroboration, B2 is back and more reviewers produce a weaker gate');
+  });
+
+  test('existence-class lone HIGH requires grounding or corroboration', () => {
+    const g = gate();
+    assert.ok(/existence|citation-class|cites a symbol/.test(g), 'gate must name the checkable class');
+    assert.ok(/source-ground/.test(g) && /corroborat/.test(g),
+      'the checkable class keeps both original paths: grounding OR corroboration');
+  });
+
+  test('classification is by assertion, not by citation presence (row 14)', () => {
+    assert.ok(/asserts?\b/.test(gate()),
+      'gate must classify by what the claim ASSERTS — keying on the presence of a file:line '
+      + 'silently reclassifies every architectural finding that cites context, reintroducing B2');
+  });
+
+  test('an all-marked cycle fails open', () => {
+    const g = gate();
+    assert.ok(/every reviewer|all reviewers/.test(g) && /(does not (apply|engage)|fails? open)/.test(g),
+      'if every reviewer is marked the gate must disengage — a gate must never manufacture convergence');
+  });
+
+  test('a suppressed HIGH remains listed and tagged', () => {
+    const g = gate();
+    assert.ok(/current high concerns/.test(g), 'suppressed HIGHs must still be listed');
+    assert.ok(/tag|unconfirmed|single-reviewer/.test(g), 'and must be visibly tagged, not silently dropped');
+  });
+
+  test('gate governs current_high only, and says so explicitly', () => {
+    const g = gate();
+    assert.ok(/current_high/.test(g), 'gate must name the count it governs');
+    // Asserting the gate never MENTIONS current_actionable was the wrong test: stating the
+    // exclusion is what keeps a future editor from quietly widening the gate's reach.
+    assert.ok(/current_actionable is unaffected|does not affect current_actionable|current_actionable is out of scope/.test(g),
+      'gate must state explicitly that current_actionable is out of scope');
+  });
+
+  test('gate keys on a leading marker, not a quoted one', () => {
+    // stampBlindReview's own doc warns a review that merely QUOTES a marker must not be
+    // mis-stamped; the stamp is a LEADING blockquote, so the gate must say so.
+    assert.ok(/leading|opens|begins|first line|blockquote/.test(gate()),
+      'gate must require the marker to OPEN the reviewer section, or a review quoting a marker '
+      + 'gets its own findings suppressed');
+  });
+});
+
+describe('#2398 — marker parity: the gate names markers the runner actually PRODUCES', () => {
+  // Earlier this asserted the marker string appeared somewhere in the runner's SOURCE TEXT.
+  // That would pass even if stampUngroundedReview were broken or never called — string
+  // co-occurrence, not behavior. These invoke the real exported stampers instead.
+
+  /** Markers the runner genuinely emits, observed by calling it. */
+  function emittedMarkers2398() {
+    const observed = new Set();
+    const ungrounded = runner2398.stampUngroundedReview('HIGH: no idempotency on retried writes.');
+    const blind = runner2398.stampBlindReview('REVIEWED-WITHOUT-REPO-ACCESS\nHIGH: something.');
+    for (const stamped of [ungrounded, blind]) {
+      const m = /^> (\[reviewed-without-[a-z-]+\])/.exec(stamped);
+      if (m) observed.add(m[1]);
+    }
+    return [...observed].sort();
+  }
+
+  test('the runner stamps an uncited review, and the marker LEADS the output', () => {
+    const stamped = runner2398.stampUngroundedReview('HIGH: no idempotency on retried writes.');
+    assert.match(stamped, /^> \[reviewed-without-source-citations\]/,
+      'the marker must be the leading blockquote — the gate keys on that position');
+    assert.ok(stamped.includes('HIGH: no idempotency on retried writes.'),
+      'the original review must be preserved beneath the marker');
+  });
+
+  test('the runner does NOT stamp a review carrying a file:line citation', () => {
+    const cited = 'HIGH: see src/a.ts:42 — the race is real.';
+    assert.equal(runner2398.stampUngroundedReview(cited), cited);
+  });
+
+  test('the runner stamps a self-reported blind review', () => {
+    assert.match(
+      runner2398.stampBlindReview('REVIEWED-WITHOUT-REPO-ACCESS\nHIGH: something.'),
+      /^> \[reviewed-without-repo-access\]/,
+    );
+  });
+
+  test('stamping is idempotent — an already-stamped review gains no second marker', () => {
+    const once = runner2398.stampUngroundedReview('bare review');
+    assert.equal(runner2398.stampUngroundedReview(once), once);
+  });
+
+  test('gate names only markers the runner actually produces', () => {
+    const emitted = emittedMarkers2398();
+    const named = markerNames2398(consensusGate2398(step5a2398(read2398(WORKFLOW_2398))));
+    assert.deepEqual(emitted, ['[reviewed-without-repo-access]', '[reviewed-without-source-citations]'],
+      'runner must produce both markers when invoked');
+    assert.ok(named.length >= 1, 'the gate must name at least one concrete marker literal');
+    assert.deepEqual(named.filter((m) => !emitted.includes(m)), [],
+      'gate names a marker the runner never produces — the gate would be inert');
+  });
+
+  test('parity fails when the gate names a marker the runner does not produce', () => {
+    // Non-vacuity: a guard that only reads a correct tree never runs its failure branch.
+    const emitted = emittedMarkers2398();
+    const mutated = markerNames2398('[reviewed-without-source-citations] and [reviewed-without-telemetry]');
+    assert.deepEqual(mutated.filter((m) => !emitted.includes(m)), ['[reviewed-without-telemetry]']);
+  });
+
+  test('parsers are total on empty, whitespace-only and absent input', () => {
+    for (const input of ['', '   \n\t\n ', null, undefined, read2398('/nonexistent/2398.md')]) {
+      assert.equal(step5a2398(input), '');
+      assert.equal(consensusGate2398(input), '');
+      assert.deepEqual(markerNames2398(input), []);
+    }
+  });
+
+  test('parsers are newline-agnostic (CRLF === LF)', () => {
+    for (const p of [WORKFLOW_2398, REVIEWER_INSTANCES_2398]) {
+      const lfText = lf2398(read2398(p));
+      const crlf = lfText.replace(/\n/g, '\r\n');
+      assert.equal(step5a2398(crlf), step5a2398(lfText));
+      assert.deepEqual(markerNames2398(crlf), markerNames2398(lfText));
+    }
+  });
+
+  test('property: parity is strictly sensitive to a marker the runner never produces', () => {
+    const emitted = emittedMarkers2398();
+    fc.assert(
+      fc.property(
+        fc.subarray(emitted, { minLength: 1 }),
+        fc.constantFrom('telemetry', 'network', 'sandbox', 'cache'),
+        (subset, novel) => {
+          assert.deepEqual(markerNames2398(subset.join(' ')).filter((m) => !emitted.includes(m)), []);
+          const withNovel = `${subset.join(' ')} [reviewed-without-${novel}]`;
+          assert.deepEqual(markerNames2398(withNovel).filter((m) => !emitted.includes(m)),
+            [`[reviewed-without-${novel}]`]);
+        },
+      ),
+      { seed: 2398, numRuns: 100 },
+    );
+  });
+});
+
+describe('#2398 — reviewer-instances cross-reference', () => {
+  test('reviewer-instances documents the convergence-gate interaction', () => {
+    const ref = lf2398(read2398(REVIEWER_INSTANCES_2398)).toLowerCase();
+    assert.ok(/consensus gate/.test(ref), 'the reference must name the gate');
+    assert.ok(/plan-review-convergence|current_high/.test(ref),
+      'and must point at where it takes effect, so a reader configuring instances finds it');
+  });
+});
+
+// ── #3899 ────────────────────────────────────────────────────────────────────
+//
+// The line that resolves REVIEWS.md is real shell an orchestrator executes, and it
+// was wrong: `REVIEWS_FILE=$(ls ${phase_dir}/${padded_phase}-REVIEWS.md 2>/dev/null)`
+// word-splits an unquoted `${phase_dir}`, so a project path containing a space
+// resolves to the empty string with `ls`'s error discarded — and the workflow then
+// blamed the review agent for a path-quoting defect. A glob metacharacter is worse:
+// it does not resolve to empty, it resolves to whatever sibling the pattern happens
+// to match, so the convergence loop reads a different phase's REVIEWS.md and never
+// notices.
+//
+// Every text assertion in this file would have passed against that line. So this
+// block EXECUTES the fragment against real fixtures instead of reading it.
+
+/**
+ * The REVIEWS.md resolution fragment, extracted from the workflow and RUN.
+ *
+ * Anchored to the post-review verification step, not searched document-wide: filtering
+ * the whole file for "a bash fence that assigns REVIEWS_FILE" would keep passing if the
+ * real fence stopped assigning it and some unrelated fence started — the harness would
+ * then execute the wrong block and report green. The span runs from the step's opening
+ * sentence to the next `###` heading, which is the same boundary the #1956 fact-drift
+ * suite anchors on above (`AFTER_AGENT_LINE`).
+ */
+function extractReviewsFileResolution3899() {
+  // The workflow markdown IS the runtime instruction; this fence is the shell an
+  // orchestrator runs. It is extracted to be executed below, not string-matched.
+  const workflow = readWorkflowCombined(WORKFLOW_PATH);
+  const start = workflow.search(/^After agent returns, verify REVIEWS\.md exists/m);
+  assert.ok(start >= 0, 'workflow must retain the "After agent returns…" verification step');
+  const rest = workflow.slice(start);
+  const nextHeading = rest.search(/^### /m);
+  const span = nextHeading >= 0 ? rest.slice(0, nextHeading) : rest;
+
+  const blocks = span.split('```').filter((f) => /^bash\n/.test(f) && /^REVIEWS_FILE=/m.test(f));
+  assert.equal(
+    blocks.length,
+    1,
+    `expected exactly one bash fence assigning REVIEWS_FILE in the verification step, found ${blocks.length}`,
+  );
+  return blocks[0].replace(/^bash\n/, '');
+}
+
+/** Run the extracted fragment with `phase_dir` / `padded_phase` bound, and echo what it resolved. */
+function runReviewsFileResolution3899(phaseDir, paddedPhase = '01') {
+  const dir = createTempDir('gsd-3899-gate-');
+  try {
+    const script = path.join(dir, 'resolve.sh');
+    fs.writeFileSync(
+      script,
+      `${extractReviewsFileResolution3899()}\nprintf '%s' "\${REVIEWS_FILE}"\n`,
+    );
+    return runHook(script, [], {
+      interpreter: 'bash',
+      env: { ...process.env, phase_dir: phaseDir, padded_phase: paddedPhase },
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+  } finally {
+    cleanup(dir);
+  }
+}
+
+/**
+ * Build a phase directory literally named `dirName` under a fresh temp root and hand
+ * its absolute path to `fn`. `siblings` create decoy phase directories beside it, each
+ * carrying its own REVIEWS.md — that is what turns a glob metacharacter from
+ * "resolves by accident" into "resolves to the wrong file".
+ */
+function withPhaseDir3899(dirName, { reviews = 'real', siblings = [] }, fn) {
+  const root = createTempDir('gsd-3899-phase-');
+  try {
+    for (const sibling of siblings) {
+      fs.mkdirSync(path.join(root, sibling), { recursive: true });
+      fs.writeFileSync(path.join(root, sibling, '01-REVIEWS.md'), 'decoy\n');
+    }
+    const phaseDir = path.join(root, dirName);
+    fs.mkdirSync(phaseDir, { recursive: true });
+    const reviewsFile = path.join(phaseDir, '01-REVIEWS.md');
+    if (reviews !== null) fs.writeFileSync(reviewsFile, `${reviews}\n`);
+    return fn(phaseDir, reviewsFile);
+  } finally {
+    cleanup(root);
+  }
+}
+
+describe('#3899 REVIEWS.md path resolution is path-safe and fails closed', () => {
+  const posixOnly = { skip: process.platform === 'win32' ? 'POSIX-only bash fragment' : false };
+
+  test('a phase_dir containing a space resolves to the real file', posixOnly, () => {
+    withPhaseDir3899('My Projects', {}, (phaseDir, reviewsFile) => {
+      const r = runReviewsFileResolution3899(phaseDir);
+      assert.equal(r.outcome, OUTCOME.EXITED);
+      assert.equal(r.exitCode, 0, `guard rejected an existing file: ${r.stderr}`);
+      assert.equal(r.stdout, reviewsFile);
+    });
+  });
+
+  test('a glob metacharacter resolves to the real file, never a decoy sibling', posixOnly, () => {
+    // `glob[1]dir` is a bash character class matching the literal directory `glob1dir`,
+    // so the unquoted form silently reads the decoy's REVIEWS.md and reports success.
+    withPhaseDir3899('glob[1]dir', { siblings: ['glob1dir'] }, (phaseDir, reviewsFile) => {
+      const r = runReviewsFileResolution3899(phaseDir);
+      assert.equal(r.outcome, OUTCOME.EXITED);
+      assert.equal(r.exitCode, 0, `guard rejected an existing file: ${r.stderr}`);
+      assert.equal(r.stdout, reviewsFile);
+      assert.equal(fs.readFileSync(r.stdout, 'utf8').trim(), 'real');
+    });
+  });
+
+  test('a missing reviews file exits non-zero and names the path, not the agent', posixOnly, () => {
+    withPhaseDir3899('My Projects', { reviews: null }, (phaseDir, reviewsFile) => {
+      const r = runReviewsFileResolution3899(phaseDir);
+      assert.equal(r.outcome, OUTCOME.EXITED);
+      assert.notEqual(r.exitCode, 0, 'an absent reviews file must fail closed');
+      assert.ok(
+        r.stderr.includes(reviewsFile),
+        `the error must identify the expected location, got: ${r.stderr}`,
+      );
+      assert.ok(
+        !/review agent did not produce/i.test(r.stderr),
+        `a path failure must not be attributed to the review agent, got: ${r.stderr}`,
+      );
+    });
+  });
+
+  test('an empty phase_dir fails with a diagnostic naming phase_dir', posixOnly, () => {
+    const r = runReviewsFileResolution3899('');
+    assert.equal(r.outcome, OUTCOME.EXITED);
+    assert.notEqual(r.exitCode, 0, 'an empty phase_dir must fail closed');
+    assert.match(r.stderr, /phase_dir/, `the error must identify phase_dir, got: ${r.stderr}`);
+  });
+
+  // This -r arm is developer-box-only when CI runs as root or on Windows.
+  test('an unreadable reviews file exits non-zero', {
+    skip:
+      process.platform === 'win32'
+        ? 'POSIX permission bits'
+        : typeof process.getuid === 'function' && process.getuid() === 0
+          ? 'root bypasses the read permission bit'
+          : false,
+  }, () => {
+    withPhaseDir3899('My Projects', {}, (phaseDir, reviewsFile) => {
+      fs.chmodSync(reviewsFile, 0o000);
+      const r = runReviewsFileResolution3899(phaseDir);
+      fs.chmodSync(reviewsFile, 0o600); // let cleanup() remove it
+      assert.equal(r.outcome, OUTCOME.EXITED);
+      assert.notEqual(r.exitCode, 0, 'an unreadable reviews file must fail closed');
+      assert.ok(r.stderr.includes(reviewsFile), `the error must name the path, got: ${r.stderr}`);
+    });
+  });
+
+  test('a directory standing in for the reviews file exits non-zero', posixOnly, () => {
+    withPhaseDir3899('My Projects', { reviews: null }, (phaseDir, reviewsFile) => {
+      // `[ -r ]` alone is true for a readable DIRECTORY, so the gate would pass and hand
+      // a directory to the consumers that read the file.
+      fs.mkdirSync(reviewsFile);
+      const r = runReviewsFileResolution3899(phaseDir);
+      assert.equal(r.outcome, OUTCOME.EXITED);
+      assert.notEqual(r.exitCode, 0, 'a directory is not a reviews file — it must fail closed');
+      assert.ok(r.stderr.includes(reviewsFile), `the error must name the path, got: ${r.stderr}`);
+    });
+  });
+
+  test('the resolution keeps no silent-empty path — no subshell, no discarded stderr', () => {
+    const fragment = extractReviewsFileResolution3899();
+    const lines = fragment.split('\n');
+    const assignment = lines.find((line) => /^REVIEWS_FILE=/.test(line));
+    assert.ok(assignment, 'no REVIEWS_FILE assignment in the extracted fence');
+    // Both subshell spellings: `$(ls …)` is what shipped, and a backtick rewrite would
+    // reintroduce the identical word-splitting through a form `$(`-only matching misses.
+    assert.ok(
+      !/\$\(|`/.test(assignment),
+      `the assignment must not run a subshell, got: ${assignment}`,
+    );
+    // Scoped to the lines that touch REVIEWS_FILE rather than the whole fence: an unrelated
+    // future redirect elsewhere in the block is not this bug, and banning it globally would
+    // red the suite for a change that cannot reintroduce the defect.
+    const discarded = lines.filter((l) => /REVIEWS_FILE/.test(l) && /2>\s*\/dev\/null/.test(l));
+    assert.deepEqual(
+      discarded,
+      [],
+      'the existence check must not discard stderr — that is what hid the path error',
+    );
   });
 });

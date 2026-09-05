@@ -1,3 +1,5 @@
+@~/.claude/gsd-core/references/response-language-directive.md
+
 <purpose>
 Review source files changed during a phase for bugs, security issues, and code quality problems. Computes file scope (--files override > SUMMARY.md > git diff fallback), checks config gate, spawns gsd-code-reviewer agent, commits REVIEW.md, and presents results to user. When --fix is passed, delegates to code-review-fix.md after review to auto-apply findings via gsd-code-fixer.
 </purpose>
@@ -17,7 +19,7 @@ Read all files referenced by the invoking prompt's execution_context before star
 Parse arguments and load project state:
 
 ```bash
-_GSD_SHIM_NAME="gsd-tools.cjs"; _GSD_RUNTIME_ROOT="${RUNTIME_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"; GSD_TOOLS="${_GSD_RUNTIME_ROOT}/gsd-core/bin/${_GSD_SHIM_NAME}"; if [ -f "$GSD_TOOLS" ]; then gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${_GSD_RUNTIME_ROOT}/.claude/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${_GSD_RUNTIME_ROOT}/.claude/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${_GSD_RUNTIME_ROOT}/.codex/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${_GSD_RUNTIME_ROOT}/.codex/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif command -v gsd-tools >/dev/null 2>&1; then GSD_TOOLS="$(command -v gsd-tools)"; gsd_run() { "$GSD_TOOLS" "$@"; }; elif [ -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${HERMES_HOME:-$HOME/.hermes}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${HERMES_HOME:-$HOME/.hermes}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${CURSOR_CONFIG_DIR:-$HOME/.cursor}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${CURSOR_CONFIG_DIR:-$HOME/.cursor}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${CODEX_HOME:-$HOME/.codex}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${CODEX_HOME:-$HOME/.codex}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${GEMINI_CONFIG_DIR:-$HOME/.gemini}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${GEMINI_CONFIG_DIR:-$HOME/.gemini}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${COPILOT_CONFIG_DIR:-$HOME/.copilot}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${COPILOT_CONFIG_DIR:-$HOME/.copilot}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${WINDSURF_CONFIG_DIR:-$HOME/.codeium/windsurf}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${WINDSURF_CONFIG_DIR:-$HOME/.codeium/windsurf}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${AUGMENT_CONFIG_DIR:-$HOME/.augment}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${AUGMENT_CONFIG_DIR:-$HOME/.augment}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${TRAE_CONFIG_DIR:-$HOME/.trae}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${TRAE_CONFIG_DIR:-$HOME/.trae}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${QWEN_CONFIG_DIR:-$HOME/.qwen}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${QWEN_CONFIG_DIR:-$HOME/.qwen}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${CODEBUDDY_CONFIG_DIR:-$HOME/.codebuddy}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${CODEBUDDY_CONFIG_DIR:-$HOME/.codebuddy}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${CLINE_CONFIG_DIR:-$HOME/.cline}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${CLINE_CONFIG_DIR:-$HOME/.cline}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${GROK_AGENTS_HOME:-$HOME/.agents}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${GROK_AGENTS_HOME:-$HOME/.agents}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${ANTIGRAVITY_CONFIG_DIR:-$HOME/.gemini/antigravity}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${ANTIGRAVITY_CONFIG_DIR:-$HOME/.gemini/antigravity}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; elif [ -f "${KILO_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/kilo}/gsd-core/bin/${_GSD_SHIM_NAME}" ]; then GSD_TOOLS="${KILO_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/kilo}/gsd-core/bin/${_GSD_SHIM_NAME}"; gsd_run() { node "$GSD_TOOLS" "$@"; }; else echo "ERROR: gsd-tools.cjs not found at $GSD_TOOLS and gsd-tools is not on PATH. Run: npx -y @opengsd/gsd-core@latest --claude --local" >&2; exit 1; fi; if [ -n "${CLAUDE_ENV_FILE:-}" ] && [ -n "${GSD_TOOLS:-}" ]; then printf "export PATH='%s':\"\$PATH\"\n" "${GSD_TOOLS%/*}" >> "$CLAUDE_ENV_FILE" 2>/dev/null || true; fi
+_GSD_SHIM_NAME="gsd-tools.cjs"; _GSD_RUNTIME_ROOT="${RUNTIME_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"; GSD_TOOLS="${_GSD_RUNTIME_ROOT}/gsd-core/bin/${_GSD_SHIM_NAME}"; _gsd_at() { for _p; do if [ -f "$_p" ]; then GSD_TOOLS="$_p"; return 0; fi; done; return 1; }; if _gsd_at "${_GSD_RUNTIME_ROOT}/gsd-core/bin/${_GSD_SHIM_NAME}" "${_GSD_RUNTIME_ROOT}/.claude/gsd-core/bin/${_GSD_SHIM_NAME}" "${_GSD_RUNTIME_ROOT}/.codex/gsd-core/bin/${_GSD_SHIM_NAME}"; then gsd_run() { node "$GSD_TOOLS" "$@"; }; elif unset -f gsd_run; _G="$(command -v gsd_run)"; then GSD_TOOLS="$_G"; gsd_run() { "$GSD_TOOLS" "$@"; }; elif _gsd_at "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/gsd-core/bin/${_GSD_SHIM_NAME}" "${HERMES_HOME:-$HOME/.hermes}/gsd-core/bin/${_GSD_SHIM_NAME}" "${CURSOR_CONFIG_DIR:-$HOME/.cursor}/gsd-core/bin/${_GSD_SHIM_NAME}" "${CODEX_HOME:-$HOME/.codex}/gsd-core/bin/${_GSD_SHIM_NAME}" "${GEMINI_CONFIG_DIR:-$HOME/.gemini}/gsd-core/bin/${_GSD_SHIM_NAME}" "${COPILOT_CONFIG_DIR:-$HOME/.copilot}/gsd-core/bin/${_GSD_SHIM_NAME}" "${WINDSURF_CONFIG_DIR:-$HOME/.codeium/windsurf}/gsd-core/bin/${_GSD_SHIM_NAME}" "${AUGMENT_CONFIG_DIR:-$HOME/.augment}/gsd-core/bin/${_GSD_SHIM_NAME}" "${TRAE_CONFIG_DIR:-$HOME/.trae}/gsd-core/bin/${_GSD_SHIM_NAME}" "${QWEN_CONFIG_DIR:-$HOME/.qwen}/gsd-core/bin/${_GSD_SHIM_NAME}" "${CODEBUDDY_CONFIG_DIR:-$HOME/.codebuddy}/gsd-core/bin/${_GSD_SHIM_NAME}" "${CLINE_CONFIG_DIR:-$HOME/.cline}/gsd-core/bin/${_GSD_SHIM_NAME}" "${GROK_AGENTS_HOME:-$HOME/.agents}/gsd-core/bin/${_GSD_SHIM_NAME}" "${ANTIGRAVITY_CONFIG_DIR:-$HOME/.gemini/antigravity}/gsd-core/bin/${_GSD_SHIM_NAME}" "${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/gsd-core/bin/${_GSD_SHIM_NAME}" "${KILO_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/kilo}/gsd-core/bin/${_GSD_SHIM_NAME}"; then gsd_run() { node "$GSD_TOOLS" "$@"; }; else echo "ERROR: gsd-tools.cjs not found at $GSD_TOOLS and gsd_run is not on PATH. Run: npx -y @opengsd/gsd-core@latest --claude --local" >&2; exit 1; fi; GSD_IDENTITY_STATUS=unverified; case "$(gsd_run runtime-identity --raw 2>/dev/null || true)" in '{"packageName":"@opengsd/gsd-core"'*'}') GSD_IDENTITY_STATUS=ok;; esac; export GSD_IDENTITY_STATUS; [ "$GSD_IDENTITY_STATUS" = ok ] || echo "WARNING: \"$GSD_TOOLS\" did not prove it is @opengsd/gsd-core - it is either a different package or an @opengsd/gsd-core older than the runtime-identity verb. See docs/how-to/diagnose-a-foreign-gsd-tools.md" >&2; if [ -n "${CLAUDE_ENV_FILE:-}" ] && [ -n "${GSD_TOOLS:-}" ]; then printf "export PATH='%s':\"\$PATH\"\n" "${GSD_TOOLS%/*}" >> "$CLAUDE_ENV_FILE" 2>/dev/null || true; fi
 PHASE_ARG="${1}"
 
 # Parse all code-review flags into a structured IR via code-review-flags.cjs.
@@ -81,25 +83,35 @@ fi
 </step>
 
 <step name="check_config_gate">
-Check if code review is active via the capability registry:
+Check if code review is active via `workflow.code_review` (the capability's on/off toggle — independent of `workflow.code_review_point`, the loop-point selector; a manual invocation must work regardless of which automatic point is currently configured):
 
 ```bash
-EXECUTE_POST_HOOKS_JSON=$(gsd_run loop render-hooks execute:post --raw)
+CODE_REVIEW_ENABLED=$(gsd_run query config-get workflow.code_review --raw 2>/dev/null || echo "true")
 ```
 
-Resolve active step hooks from `EXECUTE_POST_HOOKS_JSON` where `kind == "step"` and `ref.skill == "code-review"`.
-
-If no active code-review step hook exists:
+If `CODE_REVIEW_ENABLED` is not `"true"`:
 ```
 Code review skipped (code-review capability inactive)
 ```
 Exit workflow.
 
-Default is active through the Capability Registry schema — only skip when the registry resolves no active code-review step hook. This check runs AFTER phase validation so invalid phase errors are shown first.
+Default is active (`workflow.code_review` schema default is `true`) — only skip when explicitly disabled. This check runs AFTER phase validation so invalid phase errors are shown first.
 </step>
 
 <step name="compute_file_scope">
 Three-tier scoping with explicit precedence:
+
+Compute the phase's last review commit, if any. This narrows Tiers 2 and 3 below to what
+changed since that review (wave-scoped reviews under `workflow.code_review_point=execute:wave:post`):
+
+```bash
+# #3661: incremental scoping — when this phase has a prior review, later tiers
+# narrow to what changed since it (wave-scoped reviews under
+# workflow.code_review_point=execute:wave:post). Empty on a phase's first review
+# (the entire execute:post-default path), in which case Tiers 2 and 3 below are
+# unchanged from today.
+LAST_REVIEW_COMMIT=$(git log --format=%H -1 -- "${PHASE_DIR}/${PADDED_PHASE}-REVIEW.md" 2>/dev/null)
+```
 
 **Tier 1 — --files override (highest precedence per D-08):**
 
@@ -140,7 +152,18 @@ if [ -z "$FILES_OVERRIDE" ]; then
   REVIEW_FILES=()
   
   if [ -n "$SUMMARIES" ]; then
-    for summary in $SUMMARIES; do
+    # Rewrapped through unquoted command substitution (gsd-core#4109): a bare
+    # `$VAR` word-splits under bash but not zsh, collapsing every element onto
+    # one iteration there.
+    for summary in $(printf '%s' "$SUMMARIES"); do
+      # #3661: skip a SUMMARY.md unchanged since the phase's last review — this
+      # summary's plan was already reviewed. No-op (every summary is "changed") when
+      # LAST_REVIEW_COMMIT is empty. Fails OPEN on any git error (file stays in scope)
+      # — never silently drop a file because a git command errored.
+      if [ -n "$LAST_REVIEW_COMMIT" ] && git diff --quiet "${LAST_REVIEW_COMMIT}" HEAD -- "$summary" 2>/dev/null; then
+        continue
+      fi
+
       # Extract key_files.created and key_files.modified using node for reliable YAML parsing
       # This avoids fragile awk parsing that breaks on indentation differences
       EXTRACTED=$(node -e "
@@ -222,17 +245,31 @@ surface — so a partial SUMMARY result can no longer silently mask the rest of 
 # #3191: stay POSIX-ERE portable — the boundary is the closing paren + colon,
 # never \b (not a POSIX ERE token; under --extended-regexp it silently matches
 # nothing on macOS regex(3), making this fallback dead on Apple platforms).
-PHASE_SCOPE_NUM="${PADDED_PHASE}"
-case "${PADDED_PHASE}" in
-  0[0-9]*) PHASE_SCOPE_NUM="${PADDED_PHASE#0}|${PADDED_PHASE}" ;;
-esac
-PHASE_COMMITS=$(git log --oneline --all --extended-regexp --grep="^[[:alpha:]]+!?\((phase-)?(${PHASE_SCOPE_NUM})(-[0-9]+)?\)!?:" --format="%H" 2>/dev/null)
+# #3995: a phase number is unique within a MILESTONE, not a repository. The
+# former message grep had no milestone bound, and its tail -1 deliberately
+# selected the OLDEST matching subject — dragging in previous milestones'
+# same-numbered phases and taking a 7-file phase to a 3388-file scope (plus
+# the >50 depth downgrade). The phase's own directory is the unique identity:
+# base = the parent of the first commit that added anything under PHASE_DIR
+# (the same anchor class git-base-branch's phaseStartCommit uses for
+# complexity triggering). Message subjects demonstrably do not carry enough
+# information to identify a phase — this was the grep's fifth failure.
+# KNOWN RESIDUAL: git log -- <dir> does not follow renames, so a LATER
+# milestone that reuses BOTH number and slug re-creates the same literal
+# path and the oldest A-commit is the previous occupant's. Number+slug
+# reuse is the narrow trigger; the reported archived-milestone case (dirs
+# move under milestones/ on archive) is closed.
+PHASE_START=$(git log --format="%H" --diff-filter=A -- "${PHASE_DIR}" 2>/dev/null | tail -1)
 DIFF_BASE=""
-if [ -n "$PHASE_COMMITS" ]; then
-  DIFF_BASE=$(echo "$PHASE_COMMITS" | tail -1)^
-  # Verify the parent commit exists (first commit in repo has no parent)
-  if ! git rev-parse "${DIFF_BASE}" >/dev/null 2>&1; then
-    DIFF_BASE=$(echo "$PHASE_COMMITS" | tail -1)
+if [ -n "$LAST_REVIEW_COMMIT" ]; then
+  # #3661: a prior review exists — narrow the diff base to since that review
+  # (wave-scoped) instead of the whole phase.
+  DIFF_BASE="$LAST_REVIEW_COMMIT"
+elif [ -n "$PHASE_START" ]; then
+  if git rev-parse "${PHASE_START}^" >/dev/null 2>&1; then
+    DIFF_BASE="${PHASE_START}^"
+  else
+    DIFF_BASE="${PHASE_START}"
   fi
 fi
 
@@ -372,7 +409,7 @@ fi
 Determine review depth via the path-scoped depth resolver (`code-review-depth.cjs`). This step runs after `compute_file_scope` because rule matching needs the final `REVIEW_FILES` set.
 
 ```bash
-CONFIG_DEPTH=$(gsd_run query config-get workflow.code_review_depth 2>/dev/null || echo "")
+CONFIG_DEPTH=$(gsd_run query config-get workflow.code_review_depth --raw 2>/dev/null || echo "")
 DEPTH_OVERRIDES=$(gsd_run query config-get workflow.code_review_depth_overrides --default '[]' 2>/dev/null || echo '[]')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 
@@ -517,22 +554,27 @@ Compute the review output path:
 REVIEW_PATH="${PHASE_DIR}/${PADDED_PHASE}-REVIEW.md"
 ```
 
-Compute DIFF_BASE for agent context (in case agent needs it). #3191/#3503: this
-must be the SAME anchored, POSIX-portable conventional-commit-scope derivation
-the Tier-3 scope step uses — the reviewer agent consumes `diff_base` exactly
+Compute DIFF_BASE for agent context (in case agent needs it). #3191/#3995: this
+must be the SAME phase-directory-anchor derivation the Tier-3 scope step uses —
+the reviewer agent consumes `diff_base` exactly
 when `files:` is empty, i.e. the same fail-closed scenario Tier 3 protects, so
 a divergent recomputation here re-arms the mis-scoping one tier down:
 ```bash
-PHASE_SCOPE_NUM="${PADDED_PHASE}"
-case "${PADDED_PHASE}" in
-  0[0-9]*) PHASE_SCOPE_NUM="${PADDED_PHASE#0}|${PADDED_PHASE}" ;;
-esac
-PHASE_COMMITS=$(git log --oneline --all --extended-regexp --grep="^[[:alpha:]]+!?\((phase-)?(${PHASE_SCOPE_NUM})(-[0-9]+)?\)!?:" --format="%H" 2>/dev/null)
-if [ -n "$PHASE_COMMITS" ]; then
-  DIFF_BASE=$(echo "$PHASE_COMMITS" | tail -1)^
-  # Verify the parent commit exists (first commit in repo has no parent)
-  if ! git rev-parse "${DIFF_BASE}" >/dev/null 2>&1; then
-    DIFF_BASE=$(echo "$PHASE_COMMITS" | tail -1)
+# #3995: a phase number is unique within a MILESTONE, not a repository. The
+# former message grep had no milestone bound, and its tail -1 deliberately
+# selected the OLDEST matching subject — dragging in previous milestones'
+# same-numbered phases and taking a 7-file phase to a 3388-file scope (plus
+# the >50 depth downgrade). The phase's own directory is the unique identity:
+# base = the parent of the first commit that added anything under PHASE_DIR
+# (the same anchor class git-base-branch's phaseStartCommit uses for
+# complexity triggering). Message subjects demonstrably do not carry enough
+# information to identify a phase — this was the grep's fifth failure.
+PHASE_START=$(git log --format="%H" --diff-filter=A -- "${PHASE_DIR}" 2>/dev/null | tail -1)
+if [ -n "$PHASE_START" ]; then
+  if git rev-parse "${PHASE_START}^" >/dev/null 2>&1; then
+    DIFF_BASE="${PHASE_START}^"
+  else
+    DIFF_BASE="${PHASE_START}"
   fi
 else
   DIFF_BASE=""
@@ -690,11 +732,11 @@ TOTAL=$(echo "$FRONTMATTER" | grep "total:" | head -1 | cut -d: -f2 | xargs)
 Display inline summary to user:
 
 ```
-═══════════════════════════════════════════════════════════════
+---
 
   Code Review Complete: Phase ${PHASE_NUMBER} (${PHASE_NAME})
 
-───────────────────────────────────────────────────────────────
+---
 
   Depth:           ${REVIEW_DEPTH} (${DEPTH_PROVENANCE})
   Files Reviewed:  ${FILES_REVIEWED}
@@ -703,10 +745,11 @@ Display inline summary to user:
     Critical:  ${CRITICAL}
     Warning:   ${WARNING}
     Info:      ${INFO}
-    ──────────
+
+---
     Total:     ${TOTAL}
 
-───────────────────────────────────────────────────────────────
+---
 ```
 
 If status is "clean":
@@ -735,7 +778,7 @@ grep -A 3 "^### CR-\|^### BL-\|^### WR-" "${REVIEW_PATH}" | head -n 12
 
 **Note on tests:** Automated tests for this command and workflow are planned for Phase 4 (Pipeline Integration & Testing, requirement INFR-03). Phase 2 focuses on correct implementation; Phase 4 adds regression coverage across platforms.
 
-═══════════════════════════════════════════════════════════════
+---
 </step>
 
 </process>
@@ -755,7 +798,7 @@ If `--files` validation fails unexpectedly on macOS, install coreutils or use ab
 
 <success_criteria>
 - [ ] Phase validated before config gate check
-- [ ] Capability gate checked (execute:post code-review hook)
+- [ ] Capability gate checked (`workflow.code_review` config key)
 - [ ] --fix/--all/--auto flags parsed via code-review-flags.cjs typed IR (not ad-hoc bash)
 - [ ] Depth resolved with validation (quick|standard|deep)
 - [ ] File scope computed with 3 tiers: --files > SUMMARY.md > git diff

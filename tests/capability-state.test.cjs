@@ -603,6 +603,63 @@ describe('resolveCapabilityState — hook activation details', () => {
   });
 });
 
+// ─── resolveCapabilityState — pointFrom gate (#3661, 50-test-matrix.md Section C) ──
+
+describe('resolveCapabilityState — pointFrom gate (#3661, matrix Section C)', () => {
+  test('C1: capabilityStateConfiguredTrueWhenBothGatesPass — same fixture as B3', () => {
+    const registry = makeRegistry({
+      steps: [{ point: 'plan:pre', when: 'mytool.on', pointFrom: 'mytool.point' }],
+      configSchema: { 'mytool.point': { type: 'enum', values: ['plan:pre', 'plan:post'], default: 'plan:pre', description: 'x' } },
+    });
+    const result = resolveCapabilityState({
+      registry,
+      installedSkills: '*',
+      surfacedSkills: new Set(),
+      config: { mytool: { on: true } },
+    });
+    const hook = result.capabilities[0].hooks.find((h) => h.kind === 'step');
+    assert.ok(hook, 'step hook should be present');
+    assert.strictEqual(hook.configured, true, 'configured=true when both when and pointFrom pass');
+    assert.strictEqual(hook.active, true, 'active reflects capability-level active AND configured');
+  });
+
+  test('C2: capabilityStateConfiguredFalseOnPointFromMismatch — same fixture as B4', () => {
+    const registry = makeRegistry({
+      steps: [{ point: 'plan:pre', when: 'mytool.on', pointFrom: 'mytool.point' }],
+      configSchema: { 'mytool.point': { type: 'enum', values: ['plan:pre', 'plan:post'], default: 'plan:post', description: 'x' } },
+    });
+    const result = resolveCapabilityState({
+      registry,
+      installedSkills: '*',
+      surfacedSkills: new Set(),
+      config: { mytool: { on: true } },
+    });
+    const hook = result.capabilities[0].hooks.find((h) => h.kind === 'step');
+    assert.ok(hook, 'step hook should be present');
+    assert.strictEqual(hook.configured, false, 'pointFrom mismatch must set configured=false even though when is truthy');
+    assert.strictEqual(hook.active, false);
+  });
+
+  test('C3: capabilityStateCarriesRawWhenThrough — hook.when unchanged even with pointFrom also present', () => {
+    const registry = makeRegistry({
+      steps: [{ point: 'plan:pre', when: 'mytool.on', pointFrom: 'mytool.point' }],
+      configSchema: { 'mytool.point': { type: 'enum', values: ['plan:pre', 'plan:post'], default: 'plan:pre', description: 'x' } },
+    });
+    const result = resolveCapabilityState({
+      registry,
+      installedSkills: '*',
+      surfacedSkills: new Set(),
+      config: { mytool: { on: true } },
+    });
+    const hook = result.capabilities[0].hooks.find((h) => h.kind === 'step');
+    assert.ok(hook, 'step hook should be present');
+    assert.strictEqual(
+      hook.when, 'mytool.on',
+      'raw when value must still be carried through unchanged for diagnostic visibility (pre-existing contract)',
+    );
+  });
+});
+
 // ─── resolveCapabilityState — determinism ─────────────────────────────────────
 
 describe('resolveCapabilityState — determinism', () => {
@@ -1016,14 +1073,18 @@ describe('regressions: flat commands/gsd-<stem>.md layout (#1858)', () => {
     // commands/gsd-<stem>.md in a temp dir, then compare stem sets.
     const tmpFlat = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-parity-flat-'));
     try {
-      const nested = require('../gsd-core/bin/lib/install-profiles.cjs').loadSkillsManifest(realCommandsGsdDir);
+      // #3798: both loaders now union workflow spawn tokens; give them the
+      // SAME workflows dir so the comparison stays apples-to-apples (the flat
+      // mirror dir carries no workflows of its own).
+      const realWorkflowsDir = path.resolve(__dirname, '..', 'gsd-core', 'workflows');
+      const nested = require('../gsd-core/bin/lib/install-profiles.cjs').loadSkillsManifest(realCommandsGsdDir, realWorkflowsDir);
       for (const [stem] of nested) {
         if (stem.startsWith('_calls_agents_')) continue;
         const src = path.join(realCommandsGsdDir, stem + '.md');
         if (!fs.existsSync(src)) continue;
         fs.writeFileSync(path.join(tmpFlat, 'gsd-' + stem + '.md'), fs.readFileSync(src, 'utf8'), 'utf8');
       }
-      const flat = _loadFlatCommandsGsdManifest(tmpFlat);
+      const flat = _loadFlatCommandsGsdManifest(tmpFlat, realWorkflowsDir);
       const nestedStems = [...nested.keys()].filter((k) => !k.startsWith('_calls_agents_')).sort();
       const flatStems = [...flat.keys()].filter((k) => !k.startsWith('_calls_agents_')).sort();
       assert.deepStrictEqual(flatStems, nestedStems,

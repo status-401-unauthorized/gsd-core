@@ -77,6 +77,9 @@ Replace all three with a single coherent mechanism: **AST-based ESLint rules in 
 | `normalize-path-in-content` | `DEFECT.WINDOWS-PATH-LEAK-IN-MARKDOWN-CONTENT` (`RULESET.CONTENT-PATH-NORMALIZATION`) | `src/**/*.cts` |
 | `require-fs-op-fallback` | `DEFECT.WINDOWS-FS-OPS` | `src/**/*.cts`, build/install |
 | `no-private-binary-resolution` | `DEFECT.WINDOWS-PRIVATE-BINARY-RESOLUTION` | `src/**/*.cts`, `gsd-core/bin/**`, `scripts/**`, `hooks/**` |
+| `no-exact-case-env-access` | `DEFECT.WINDOWS-EXACT-CASE-ENV-ACCESS` | `src/**/*.cts`, `gsd-core/bin/**`, `scripts/**`, `hooks/**` |
+| `require-full-tmpdir-triad` | `DEFECT.WINDOWS-TEST-PORTABILITY` (#4220) | tests |
+| `no-unbounded-dirname-walk` | `DEFECT.WINDOWS-TEST-PORTABILITY` (#4020 / #4220) | tests, scripts |
 
 **Amendment (2026-08-18, epic #3411 Phase 3 / #3619).** `no-private-binary-resolution` is the
 first catalog entry added after the original seven, and it extends this architecture to a
@@ -109,6 +112,79 @@ Two scoping consequences worth recording, because both were arrived at rather th
 
 The rule started **green** with nothing suppressed and nothing grandfathered — Phases 1 and 2 had
 already removed every private resolver, which is what made a strict ratchet possible at all.
+
+**Amendment (2026-08-27, epic #3411 Phase 4 / #3624).** `no-exact-case-env-access` extends the
+architecture to a second production-runtime class: PR #3621 (epic #3411 Phase 1) shipped
+`resolveExecutableBinary` reading `env['PATH']` where `env` could be a plain object (`{
+...process.env, ...opts.env }`, which loses `process.env`'s case-insensitive Proxy) — a Windows
+CI-only failure caught and fixed by adding `envGet(env, name)` inside the seam. This rule
+generalizes that fix into a ratchet: it flags a read of any casing of `PATH`, `PATHEXT`,
+`ComSpec`, `USERPROFILE`, `TEMP`, `TMP`, or `APPDATA` (the vocabulary's
+`WINDOWS_CASE_VARYING_ENV_VARS`) off any receiver that is not literally `process.env` — dot or
+bracket notation, or destructuring — using the same seam exemption anchoring as
+`no-private-binary-resolution`.
+
+Matching had to be narrower than "any property access whose name matches the vocabulary,
+case-insensitively": a first pass produced 113 false positives, because ordinary lowercase
+property access (`config.path`, `artifact['path']`) collides with the vocab entry `PATH` under
+case-insensitive comparison. The shipped rule additionally requires the receiver to be
+"env-shaped" — literally `<expr>.env` / `<expr>['env']` or a bare identifier named `env` (any
+casing) — for both notations and for destructuring alike, which is what distinguishes
+`opts.env['PATH']` (flagged) from `artifact['path']` (not flagged) without def-use/scope tracing.
+One real pre-existing violation of the tightened rule was found and fixed in the same PR:
+`src/runtime-hooks-surface.cts`'s `normalizeNodePath` read `env.APPDATA` off a runtime union
+(`(opts && opts.env) || process.env`) that may be a plain object — migrated to `envGet(env,
+'APPDATA')`. `envGet` (formerly the seam-private `_envGet`) is now exported from
+`src/shell-command-projection.cts` specifically so this rule's remediation message ("route
+through `envGet`") names a real, callable helper.
+
+**Amendment (2026-09-03, #4244).** Two rules add author-time coverage for the bug class behind
+two real, hard-evidence Windows CI incidents this week: #4020 (`scripts/run-tests.cjs`'s
+`sweepProtectSet` ancestor walk hung every scoped Windows CI lane) and its follow-on #4220 (the
+regression test written for #4020's own fix masked a second bug — see below). Per Node's own docs,
+`os.tmpdir()` on Windows reads only `TEMP` then `TMP`; `TMPDIR` is never consulted there at all
+(on every other platform, `TMPDIR` is checked first). Per empirical verification this session,
+`path.dirname()` is a fixed point at the platform root on both OSes, but the fixed-point VALUE
+differs: `path.posix.dirname('/') === '/'` (length 1) vs. `path.win32.dirname('C:\\') === 'C:\\'`
+(length 3) — so a root check written as a POSIX-shaped length heuristic (`cur.length > 1`) never
+fires on Windows.
+
+- `require-full-tmpdir-triad` flags a `TMPDIR` environment override — `process.env.TMPDIR = …`,
+  or a `TMPDIR` property in an object literal passed as a spawn-like call's `env:` option — that
+  is not accompanied by `TEMP` and `TMP` in the same scope. Anti-pattern: `runNode(['-e', probe],
+  { env: { ...process.env, TMPDIR: outer } })` — on Windows the child inherits the parent's
+  ambient `TEMP`/`TMP` and its `os.tmpdir()` silently resolves to the wrong place. Fix: set all
+  three to the same value. This is the exact shape #4220 found already shipped in
+  `tests/run-tests-temp-root.test.cjs`'s own #4020 regression test, masked because Windows died in
+  the unrelated dirname-walk hang before ever reaching it. The same #4244 sweep additionally found
+  and fixed one more live instance in `tests/config-schema.property.test.cjs`'s
+  `config-set accepts code_quality.fallow keys` test (direct `process.env.TMPDIR = writableTmp`
+  assignment with no TEMP/TMP counterpart).
+- `no-unbounded-dirname-walk` flags a `while`/`do-while` loop that reassigns its condition
+  variable from `dirname()` (bare, `path.`, `.posix.`/`.win32.`) without a fixed-point termination
+  guard (`dirname(cur) !== cur`, or `path.parse(cur).root`) in the loop condition. Anti-pattern:
+  `while (cur && cur !== root && cur.length > 1) cur = dirname(cur);` — on a Windows runner where
+  `cur` can never equal `root` (e.g. repo on `D:\`, temp root on `C:\`), the walk reaches the
+  drive root and spins there at 100% CPU forever, since `cur.length` stays 3 (`> 1`) at the fixed
+  point. Fix: add the `dirname(cur) !== cur` conjunct. The same #4244 sweep found this exact,
+  still-unfixed shape live in `scripts/run-tests.cjs`'s `sweepProtectSet` block (the original
+  #4020 site) and fixed it in the same change by extracting a pure `computeSweepProtectSet`
+  helper with the fixed-point check, mirroring the shape of the (at-authoring-time separately
+  in-flight, not yet merged) #4220 fix.
+
+Both rules join the catalog's **zero-escape-hatch** discipline (rule 3 above): neither carries a
+bespoke `// allow-*` comment marker, and both are added to `tests/portability-rule-disable-ban.test.cjs`'s
+`PROTECTED_RULES` list so an `eslint-disable` naming them is independently banned outside ESLint
+too. `no-unbounded-dirname-walk` is registered on **both** `tests/**/*.cjs` and `scripts/**/*.cjs`
+(the narrower `scripts/**/*.cjs`-only block, alongside `no-private-binary-resolution`) — the
+production surface registration is load-bearing, since the real #4020 bug lived in `scripts/`, not
+`tests/`. `require-full-tmpdir-triad` follows the established test-portability convention
+(`no-hardcoded-tmp`, `require-userprofile-with-home`) and is registered on `tests/**/*.cjs` only,
+matching both real incident sites.
+
+A repo-wide sweep for other instances of either pattern (beyond the incident sites above) found
+none: `require-full-tmpdir-triad` and `no-unbounded-dirname-walk` both ran clean against the rest
+of the tree once the three live sites were fixed.
 
 **Taxonomy coverage.** This catalog addresses every `DEFECT.WINDOWS-*` class plus
 `DEFECT.TEST-SHELL-PIPELINE-NONPORTABLE` in `CONTEXT.md`, to the extent each is *statically*

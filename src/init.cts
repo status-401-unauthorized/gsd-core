@@ -31,6 +31,10 @@ import phaseId = require('./phase-id.cjs');
 import worktreeSafety = require('./worktree-safety.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- planning-workspace.cjs is an export= CommonJS module
 import planningWorkspace = require('./planning-workspace.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import planningScopeMod = require('./planning-scope.cjs');
+const { SCOPE } = planningScopeMod;
+type Scope = planningScopeMod.Scope;
 import { maskIfSecret } from './secrets.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- plan-scan.cjs is an export= CommonJS module
 import scanPhasePlans = require('./plan-scan.cjs');
@@ -81,10 +85,10 @@ const {
 import verifyCommandGrounding = require('./verify-command-grounding.cjs');
 const { harvestPriorVerifyCommands } = verifyCommandGrounding;
 
-const { output, error, ERROR_REASON } = io;
+const { output, error, ERROR_REASON, formatDiagnosticToken } = io;
 const { loadConfig, loadConfigResolved } = configLoader;
 const { resolveModelInternal, resolveGranularityInternal, assertValidGranularityOverride } = modelResolver;
-const { findPhaseInternal, listMilestonePhaseDirs } = phaseLocator;
+const { findPhaseInternal, listMilestonePhaseDirs, listAllPhaseDirs } = phaseLocator;
 const {
   getRoadmapPhaseInternal,
   getMilestoneInfo,
@@ -92,7 +96,7 @@ const {
   extractCurrentMilestone,
 } = roadmapParser;
 const { pathExistsInternal, generateSlugInternal, toPosixPath } = coreUtils;
-const { normalizePhaseName, matchPhaseDirs, stripProjectCodePrefix, PHASE_NUMBER_TOKEN_SOURCE, isForeignPrefixedPhaseQuery, isSentinelPhaseId, extractPhaseToken, scopeToPhase } = phaseId;
+const { comparePhaseNum, normalizePhaseName, matchPhaseDirs, stripProjectCodePrefix, PHASE_NUMBER_TOKEN_SOURCE, isForeignPrefixedPhaseQuery, isSentinelPhaseId, extractPhaseToken, scopeToPhase } = phaseId;
 const { pruneOrphanedWorktrees } = worktreeSafety;
 
 const {
@@ -174,9 +178,12 @@ function guardedGetRoadmapPhase(
 // directory exists yet) identically at every synthetic-fallback call site
 // below — factored out once so the slugification formula itself cannot drift.
 function slugifyPhaseName(phaseName: string | null): string | null {
-  return phaseName
-    ? phaseName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
-    : null;
+  // #3883 (ADR-3473 §8.3): delegate to the canonical slug formula
+  // (generateSlugInternal, core-utils.cts) rather than re-implementing it.
+  // `maxLen: null` preserves this site's pre-migration untruncated contract —
+  // the 60-char default would collapse two distinct >60-char phase names onto
+  // the same reported phase_slug.
+  return phaseName ? coreUtils.generateSlugInternal(phaseName, null) : null;
 }
 
 /**
@@ -901,8 +908,6 @@ function cmdInitExecutePhase(
     : null;
   const phase_req_ids = reqExtracted && reqExtracted !== 'TBD' ? reqExtracted : null;
 
-  const wf = (config.workflow ?? {}) as Record<string, unknown>;
-
   // #3188: these paths are null when the file is absent, matching the contract
   // the conditional sibling fields (context_path, patterns_path, ...) already
   // honour and that ultraplan-phase.md / execute-phase.md gate on. Hoisted so
@@ -915,7 +920,7 @@ function cmdInitExecutePhase(
     executor_model: resolveModelInternal(cwd, 'gsd-executor'),
     verifier_model: resolveModelInternal(cwd, 'gsd-verifier'),
 
-    tdd_mode: options['tdd'] || Boolean(wf['tdd_mode']) || false,
+    tdd_mode: options['tdd'] || Boolean(config.tdd_mode) || false,
     commit_docs: config.commit_docs,
     sub_repos: config.sub_repos,
     parallelization: config.parallelization,
@@ -1081,8 +1086,6 @@ function cmdInitPlanPhase(
   assertValidGranularityOverride(granularityOverride, error);
   const granularity = resolveGranularityInternal(cwd, 'planning', granularityOverride || undefined);
 
-  const wf = (config.workflow ?? {}) as Record<string, unknown>;
-
   // #3188: see cmdInitExecutePhase — null when absent, parity with the
   // conditional sibling fields in this same result object.
   const statePath = path.join(planningDir(cwd), 'STATE.md');
@@ -1094,11 +1097,11 @@ function cmdInitPlanPhase(
     planner_model: resolveModelInternal(cwd, 'gsd-planner'),
     checker_model: resolveModelInternal(cwd, 'gsd-plan-checker'),
 
-    tdd_mode: options['tdd'] || Boolean(wf['tdd_mode']) || false,
+    tdd_mode: options['tdd'] || Boolean(config.tdd_mode) || false,
     granularity,
-    research_enabled: wf['research'],
+    research_enabled: config.research,
     plan_checker_enabled: config.plan_checker,
-    nyquist_validation_enabled: wf['nyquist_validation'],
+    nyquist_validation_enabled: config.nyquist_validation,
     commit_docs: config.commit_docs,
     text_mode: config.text_mode,
     auto_advance: !!(config.auto_advance),
@@ -1128,6 +1131,11 @@ function cmdInitPlanPhase(
 
     has_research: phaseInfo?.['has_research'] || false,
     has_context: phaseInfo?.['has_context'] || false,
+    // #4014 (epic #3473 B4-unreadable): additive scope signal adjacent to
+    // has_context — SCOPE.COMPLETE by default (no phase directory to read is
+    // a genuine, not-unreadable answer), overwritten below to whatever
+    // findContextMdIn(phaseDirFull) reports once a directory is known.
+    context_scope: SCOPE.COMPLETE,
     has_reviews: phaseInfo?.['has_reviews'] || false,
     has_plans: ((phaseInfo?.['plans'] as unknown[] | undefined)?.length || 0) > 0,
     plan_count: (phaseInfo?.['plans'] as unknown[] | undefined)?.length || 0,
@@ -1146,6 +1154,13 @@ function cmdInitPlanPhase(
 
   if (phaseInfo?.['directory']) {
     const phaseDirFull = path.join(cwd, phaseInfo['directory'] as string);
+    // #4014 (epic #3473 B4-unreadable): findContextMdIn's directory-string
+    // form never throws, so this can record the real scope BEFORE the
+    // pre-existing `fs.readdirSync(phaseDirFull)` immediately below
+    // (unchanged) throws on the same unreadable directory and is caught
+    // exactly as before — additive only, the failure control-flow for
+    // context_path/research_path/etc. is untouched.
+    result['context_scope'] = findContextMdIn(phaseDirFull).scope;
     try {
       const files = fs.readdirSync(phaseDirFull);
       const phaseDirName = path.basename(phaseDirFull);
@@ -1211,8 +1226,21 @@ function cmdInitPlanPhase(
       if (patternsFile) {
         result['patterns_path'] = toPosixPath(path.join(phaseDirFull, patternsFile));
       }
-    } catch {
-      /* intentionally empty */
+    } catch (err) {
+      // #3885 (ADR-3473 §8.5): this branch means `phaseInfo['directory']` was
+      // set (the phase was already resolved to an on-disk directory) yet
+      // `readdirSync` still failed — ENOENT here would be a genuine race
+      // (the directory vanished between resolution and this read) and stays
+      // a silent degrade like the prior behavior; any other errno
+      // (EACCES/EIO/...) is an unreadable-not-absent directory and must be
+      // named, or every conditional field this block sets (context_path,
+      // research_path, verification_path, uat_path, reviews_path,
+      // patterns_path) silently reads as "none of these exist".
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT') {
+        result['context_read_error'] =
+          `Could not read phase directory ${formatDiagnosticToken(phaseDirFull)}: ${formatDiagnosticToken((err as Error)?.message ?? String(err))}`;
+      }
     }
   }
 
@@ -1271,6 +1299,36 @@ function cmdInitPlanPhase(
   output(withProjectRoot(cwd, result), raw);
 }
 
+// #4040: shared partial-init discriminator for the init.progress / init.resume /
+// init.new-project payloads. A bootstrap interrupted before the core quartet
+// (PROJECT.md / REQUIREMENTS.md / ROADMAP.md / STATE.md) all landed is a
+// DISTINCT routing state from "new project" and from "between milestones";
+// pre-#4040 the payloads could not express it, so progress.md mis-routed it to
+// Route F and resume-project.md offered STATE.md reconstruction.
+//
+// Negative-space guard: `milestone.complete` archives ROADMAP.md (and
+// REQUIREMENTS.md) but always leaves MILESTONES.md behind — so MILESTONES.md
+// present proves missing core files are archival (between-milestones), never an
+// unfinished bootstrap. REQUIREMENTS.md is written by new-project BEFORE
+// ROADMAP/STATE, so its absence also proves init never finished.
+function buildInitCompletenessFields(cwd: string): Record<string, boolean> {
+  const dir = planningDir(cwd);
+  const planningExists = fs.existsSync(dir);
+  const requirementsExists = fs.existsSync(path.join(dir, 'REQUIREMENTS.md'));
+  const milestonesExists = fs.existsSync(path.join(dir, 'MILESTONES.md'));
+  const coreComplete =
+    fs.existsSync(path.join(dir, 'PROJECT.md')) &&
+    requirementsExists &&
+    fs.existsSync(path.join(dir, 'ROADMAP.md')) &&
+    fs.existsSync(path.join(dir, 'STATE.md'));
+  return {
+    planning_exists: planningExists,
+    requirements_exists: requirementsExists,
+    milestones_exists: milestonesExists,
+    init_incomplete: planningExists && !coreComplete && !milestonesExists,
+  };
+}
+
 function cmdInitNewProject(cwd: string, raw: boolean, options: Record<string, unknown> = {}): void {
   const config = loadConfig(cwd);
 
@@ -1297,7 +1355,13 @@ function cmdInitNewProject(cwd: string, raw: boolean, options: Record<string, un
 
     commit_docs: config.commit_docs,
 
-    project_exists: pathExistsInternal(cwd, '.planning/PROJECT.md'),
+    // #4040: partial-init discriminator (see buildInitCompletenessFields).
+    // Spread BEFORE this literal's own planning_exists so the existing
+    // root-scoped (`pathExistsInternal(cwd, '.planning')`) semantics for that
+    // one key stay byte-identical for existing consumers.
+    ...buildInitCompletenessFields(cwd),
+
+    project_exists: pathExistsInternal(cwd, toPosixPath(path.relative(cwd, path.join(planningDir(cwd), 'PROJECT.md')))),
     has_codebase_map: hasCodebaseMap,
     planning_exists: pathExistsInternal(cwd, '.planning'),
 
@@ -1344,15 +1408,13 @@ function cmdInitNewMilestone(cwd: string, raw: boolean, options: Record<string, 
   // window filter (which also never excluded sentinels, unlike the owner).
   const phaseDirCount = listMilestonePhaseDirs(phasesDir, { cwd }).value.length;
 
-  const wf = (config.workflow ?? {}) as Record<string, unknown>;
-
   const result: Record<string, unknown> = {
     researcher_model: resolveModelInternal(cwd, 'gsd-project-researcher'),
     synthesizer_model: resolveModelInternal(cwd, 'gsd-research-synthesizer'),
     roadmapper_model: resolveModelInternal(cwd, 'gsd-roadmapper'),
 
     commit_docs: config.commit_docs,
-    research_enabled: wf['research'],
+    research_enabled: config.research,
 
     // #3216 review Finding 2: `?? null` so an unresolved milestone still emits
     // the key with an explicit `null` rather than letting JSON.stringify drop
@@ -1370,7 +1432,7 @@ function cmdInitNewMilestone(cwd: string, raw: boolean, options: Record<string, 
         )
       : null,
 
-    project_exists: pathExistsInternal(cwd, '.planning/PROJECT.md'),
+    project_exists: pathExistsInternal(cwd, toPosixPath(path.relative(cwd, path.join(planningDir(cwd), 'PROJECT.md')))),
     roadmap_exists: fs.existsSync(path.join(planningDir(cwd), 'ROADMAP.md')),
     state_exists: fs.existsSync(path.join(planningDir(cwd), 'STATE.md')),
 
@@ -1451,6 +1513,10 @@ function cmdInitQuick(
     executor_model: resolveModelInternal(cwd, 'gsd-executor'),
     checker_model: resolveModelInternal(cwd, 'gsd-plan-checker'),
     verifier_model: resolveModelInternal(cwd, 'gsd-verifier'),
+    // #3936: Step 4.75 dispatches gsd-phase-researcher; resolve its own tier
+    // (parity with cmdInitPlanPhase) so the research spawn stops pinning
+    // planner_model.
+    researcher_model: resolveModelInternal(cwd, 'gsd-phase-researcher'),
     // #2072: the quick review step spawns gsd-code-reviewer; resolve its own model
     // so model_overrides / models.verification apply (was reusing executor_model).
     reviewer_model: resolveModelInternal(cwd, 'gsd-code-reviewer'),
@@ -1495,10 +1561,60 @@ function cmdInitQuick(
   output(withProjectRoot(cwd, result), raw);
 }
 
+/**
+ * `init.quick-batch` (#3676, Phase 4 of epic #3344, ADR-1239 "Quick-batch
+ * binding"). Unlike `cmdInitQuick`, this init bundle does NOT allocate a
+ * quick id / slug / task directory itself — batch-level id allocation and
+ * `BATCH.json` creation is the job of the `quick-batch create` CLI verb
+ * (`src/quick-batch-command-router.cts`, wrapping `createBatch` in
+ * `src/quick-batch.cts`). This bundle supplies the per-role model profiles,
+ * `commit_docs`, the roadmap/planning existence checks `quick-batch.md`'s
+ * ROADMAP.md gate needs (same check `cmdInitQuick` runs), the `.planning/quick`
+ * directory path, and the `section_manifest` field gating the optional
+ * `--research`/`--validate` step fragments — the same `flag:--research`/
+ * `flag:--validate` atoms `quick`'s own section manifest already uses
+ * (`WHEN_VOCABULARY` is workflow-agnostic; no new atom is needed). `--discuss`/
+ * `--full` are rejected by `quick-batch-dispatch.cts`'s `parseQuickBatchArgs`
+ * before this init bundle is ever reached, so no `discuss`/`full` flag key is
+ * accepted here (unlike `cmdInitQuick`, which still supports both).
+ */
+function cmdInitQuickBatch(
+  cwd: string,
+  raw: boolean,
+  options: Record<string, unknown> = {},
+): void {
+  const config = loadConfig(cwd);
+
+  const result: Record<string, unknown> = {
+    planner_model: resolveModelInternal(cwd, 'gsd-planner'),
+    executor_model: resolveModelInternal(cwd, 'gsd-executor'),
+    checker_model: resolveModelInternal(cwd, 'gsd-plan-checker'),
+    verifier_model: resolveModelInternal(cwd, 'gsd-verifier'),
+    researcher_model: resolveModelInternal(cwd, 'gsd-phase-researcher'),
+    reviewer_model: resolveModelInternal(cwd, 'gsd-code-reviewer'),
+
+    commit_docs: config.commit_docs,
+
+    // #2376: absolute — see comment on phase_dir in cmdInitExecutePhase; a
+    // per-item task_dir is re-derived by the workflow itself (quick_id +
+    // generate-slug over that item's description), never allocated here.
+    quick_dir: toPosixPath(path.join(planningDir(cwd), 'quick')),
+    quick_batches_dir: toPosixPath(path.join(planningDir(cwd), 'quick-batches')),
+
+    roadmap_exists: fs.existsSync(path.join(planningDir(cwd), 'ROADMAP.md')),
+    planning_exists: fs.existsSync(planningRoot(cwd)),
+  };
+
+  // #2992 (Phase 6.1): additive, optional field — degrades to null, never throws.
+  result['section_manifest'] = buildSectionManifestField(cwd, null, options, 'quick-batch');
+
+  output(withProjectRoot(cwd, result), raw);
+}
+
 function cmdInitIngestDocs(cwd: string, raw: boolean): void {
   const config = loadConfig(cwd);
   const result: Record<string, unknown> = {
-    project_exists: pathExistsInternal(cwd, '.planning/PROJECT.md'),
+    project_exists: pathExistsInternal(cwd, toPosixPath(path.relative(cwd, path.join(planningDir(cwd), 'PROJECT.md')))),
     planning_exists: fs.existsSync(planningRoot(cwd)),
     ...getInitGitState(cwd),
     // #2376: absolute — see comment on phase_dir in cmdInitExecutePhase. The
@@ -1524,12 +1640,11 @@ function cmdInitOnboard(
   options: Record<string, unknown> = {},
 ): void {
   const config = loadConfig(cwd);
-  const workflowConfig = (config.workflow ?? {}) as Record<string, unknown>;
   const result = {
     ...buildOnboardProjection(cwd, {
       commitDocs: !!config.commit_docs,
       fast: options['fast'] === true,
-      textMode: options['text'] === true || !!config.text_mode || !!workflowConfig['text_mode'],
+      textMode: options['text'] === true || !!config.text_mode,
     }),
     ...getInitGitState(cwd),
   };
@@ -1547,9 +1662,15 @@ function cmdInitResume(cwd: string, raw: boolean): void {
   if (agentIdRaw !== null) interruptedAgentId = agentIdRaw.trim();
 
   const result: Record<string, unknown> = {
+    // #4040: partial-init discriminator (see buildInitCompletenessFields).
+    // Spread FIRST so this literal's own root-scoped planning_exists
+    // (planningRoot) keeps its existing semantics; init_incomplete itself
+    // keys off the artifact dir (planningDir) where the core docs live.
+    ...buildInitCompletenessFields(cwd),
+
     state_exists: fs.existsSync(path.join(planningDir(cwd), 'STATE.md')),
     roadmap_exists: fs.existsSync(path.join(planningDir(cwd), 'ROADMAP.md')),
-    project_exists: pathExistsInternal(cwd, '.planning/PROJECT.md'),
+    project_exists: pathExistsInternal(cwd, toPosixPath(path.relative(cwd, path.join(planningDir(cwd), 'PROJECT.md')))),
     planning_exists: fs.existsSync(planningRoot(cwd)),
 
     // #2376: absolute — see comment on phase_dir in cmdInitExecutePhase.
@@ -1931,9 +2052,11 @@ function cmdInitPhaseOp(cwd: string, phase: string, raw: boolean): void {
         directory: null,
         phase_number: roadmapPhase['phase_number'],
         phase_name: phaseName,
-        phase_slug: phaseName
-          ? phaseName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
-          : null,
+        // #3883 (ADR-3473 §8.3): delegate to the canonical slug formula
+        // (generateSlugInternal, core-utils.cts) rather than re-implementing
+        // it. `maxLen: null` preserves this site's pre-migration untruncated
+        // contract.
+        phase_slug: phaseName ? coreUtils.generateSlugInternal(phaseName, null) : null,
         plans: [],
         summaries: [],
         incomplete_plans: [],
@@ -1953,9 +2076,11 @@ function cmdInitPhaseOp(cwd: string, phase: string, raw: boolean): void {
         directory: null,
         phase_number: roadmapPhase['phase_number'],
         phase_name: phaseName,
-        phase_slug: phaseName
-          ? phaseName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
-          : null,
+        // #3883 (ADR-3473 §8.3): delegate to the canonical slug formula
+        // (generateSlugInternal, core-utils.cts) rather than re-implementing
+        // it. `maxLen: null` preserves this site's pre-migration untruncated
+        // contract.
+        phase_slug: phaseName ? coreUtils.generateSlugInternal(phaseName, null) : null,
         plans: [],
         summaries: [],
         incomplete_plans: [],
@@ -2014,6 +2139,9 @@ function cmdInitPhaseOp(cwd: string, phase: string, raw: boolean): void {
 
     has_research: phaseInfo?.['has_research'] || false,
     has_context: phaseInfo?.['has_context'] || false,
+    // #4014 (epic #3473 B4-unreadable): see the parallel field in
+    // cmdInitPlanPhase — additive scope signal adjacent to has_context.
+    context_scope: SCOPE.COMPLETE,
     has_plans: ((phaseInfo?.['plans'] as unknown[] | undefined)?.length || 0) > 0,
     has_verification: phaseInfo?.['has_verification'] || false,
     has_reviews: phaseInfo?.['has_reviews'] || false,
@@ -2031,6 +2159,9 @@ function cmdInitPhaseOp(cwd: string, phase: string, raw: boolean): void {
 
   if (phaseInfo?.['directory']) {
     const phaseDirFull = path.join(cwd, phaseInfo['directory'] as string);
+    // #4014 (epic #3473 B4-unreadable): see the parallel site in
+    // cmdInitPlanPhase — additive only, failure control-flow below unchanged.
+    result['context_scope'] = findContextMdIn(phaseDirFull).scope;
     try {
       const files = fs.readdirSync(phaseDirFull);
       const phaseDirName = path.basename(phaseDirFull);
@@ -2084,8 +2215,18 @@ function cmdInitPhaseOp(cwd: string, phase: string, raw: boolean): void {
       if (reviewsFile) {
         result['reviews_path'] = toPosixPath(path.join(phaseDirFull, reviewsFile));
       }
-    } catch {
-      /* intentionally empty */
+    } catch (err) {
+      // #3885 (ADR-3473 §8.5): see the parallel site in cmdInitPlanPhase —
+      // ENOENT here is a genuine race (directory vanished after resolution)
+      // and stays a silent degrade; any other errno (EACCES/EIO/...) means
+      // the directory exists but could not be read, and must be named rather
+      // than silently reported the same as "none of context_path/
+      // research_path/verification_path/uat_path/reviews_path exist".
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT') {
+        result['context_read_error'] =
+          `Could not read phase directory ${formatDiagnosticToken(phaseDirFull)}: ${formatDiagnosticToken((err as Error)?.message ?? String(err))}`;
+      }
     }
   }
 
@@ -2184,17 +2325,22 @@ function cmdInitMilestoneOp(cwd: string, raw: boolean): void {
     const m = tok.match(/^(\d+)([A-Z]?(?:\.\d+)*)$/);
     return m ? String(parseInt(m[1], 10)) + m[2] : tok;
   };
+  // #3882 (ADR-3473 §8.2): this used to hand-roll a readdirSync over the
+  // phases directory (a heading->directory LOOKUP INDEX, same role as
+  // cmdRoadmapAnalyze's `_phaseDirNames` — `roadmapPhaseNumbers` above is
+  // already scoped/sentinel-excluded, so this map must see the PHYSICAL set
+  // to resolve each heading's phase number to its actual directory name;
+  // scoping it again would look up inside an already-scoped set for no
+  // benefit). Routed through the named "physical set, sentinels included"
+  // axis instead: every `num` looked up below came from `roadmapPhaseNumbers`
+  // (sentinels already excluded there), so a sentinel entry surviving in
+  // this map is never read — inclusion is output-invariant, this only
+  // removes the re-derivation.
   const diskPhaseDirs = new Map<string, string>();
-  try {
-    const entries = fs.readdirSync(phasesDir, { withFileTypes: true });
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      const m = stripProjectCodePrefix(e.name).match(new RegExp(`^(${PHASE_NUMBER_TOKEN_SOURCE})`));
-      if (!m) continue;
-      diskPhaseDirs.set(canonicalizePhase(m[1]), e.name);
-    }
-  } catch {
-    /* intentionally empty */
+  for (const name of listAllPhaseDirs(phasesDir, { includeSentinels: true }).value) {
+    const m = stripProjectCodePrefix(name).match(new RegExp(`^(${PHASE_NUMBER_TOKEN_SOURCE})`));
+    if (!m) continue;
+    diskPhaseDirs.set(canonicalizePhase(m[1]), name);
   }
 
   if (roadmapPhaseNumbers.length > 0) {
@@ -2260,7 +2406,7 @@ function cmdInitMilestoneOp(cwd: string, raw: boolean): void {
     archived_milestones: archivedMilestones,
     archive_count: archivedMilestones.length,
 
-    project_exists: pathExistsInternal(cwd, '.planning/PROJECT.md'),
+    project_exists: pathExistsInternal(cwd, toPosixPath(path.relative(cwd, path.join(planningDir(cwd), 'PROJECT.md')))),
     roadmap_exists: fs.existsSync(path.join(planningDir(cwd), 'ROADMAP.md')),
     state_exists: fs.existsSync(path.join(planningDir(cwd), 'STATE.md')),
     archive_exists: fs.existsSync(path.join(planningRoot(cwd), 'archive')),
@@ -2273,7 +2419,12 @@ function cmdInitMilestoneOp(cwd: string, raw: boolean): void {
 function cmdInitMapCodebase(cwd: string, raw: boolean): void {
   const config = loadConfig(cwd);
 
-  const codebaseDir = path.join(planningRoot(cwd), 'codebase');
+  // #3964: scoped like the payload's own codebase_dir/codebase_dir_exists
+  // below (and verify.cts's codebase drift check) — has_maps/existing_maps
+  // reading the flat root made the same payload claim a scoped codebase dir
+  // exists while reporting zero maps, so map-codebase's Refresh/Skip gate
+  // always forced a re-map under GSD_PROJECT.
+  const codebaseDir = path.join(planningDir(cwd), 'codebase');
   let existingMaps: string[] = [];
   try {
     existingMaps = fs.readdirSync(codebaseDir).filter((f) => f.endsWith('.md'));
@@ -2293,13 +2444,16 @@ function cmdInitMapCodebase(cwd: string, raw: boolean): void {
     timestamp: realClock.nowIso(),
 
     // #2376: absolute — see comment on phase_dir in cmdInitExecutePhase.
-    codebase_dir: toPosixPath(path.join(planningRoot(cwd), 'codebase')),
+    // #3964: scoped like verify.cts's codebase drift check (planningDir, not
+    // the flat planningRoot) so the two surfaces cannot disagree under
+    // GSD_PROJECT.
+    codebase_dir: toPosixPath(path.join(planningDir(cwd), 'codebase')),
 
     existing_maps: existingMaps,
     has_maps: existingMaps.length > 0,
 
     planning_exists: pathExistsInternal(cwd, '.planning'),
-    codebase_dir_exists: pathExistsInternal(cwd, '.planning/codebase'),
+    codebase_dir_exists: pathExistsInternal(cwd, toPosixPath(path.relative(cwd, path.join(planningDir(cwd), 'codebase')))),
   };
 
   output(withProjectRoot(cwd, result), raw);
@@ -2367,6 +2521,9 @@ function cmdInitManager(cwd: string, raw: boolean): void {
     let hasResearch = false;
     let lastActivity: string | null = null;
     let isActive = false;
+    // #4014 (epic #3473 B4-unreadable): default COMPLETE — no directory at
+    // all (dirMatch not found) is a genuine, not-unreadable answer.
+    let contextScope: Scope = SCOPE.COMPLETE;
     let completion = buildPhaseCompletionProjection(
       cwd,
       phaseNum,
@@ -2386,6 +2543,17 @@ function cmdInitManager(cwd: string, raw: boolean): void {
       if (dirMatch) {
         const fullDir = path.join(phasesDir, dirMatch);
         const phaseDirRel = toPosixPath(path.relative(cwd, fullDir));
+        // #4014 (epic #3473 B4-unreadable): this whole block used to swallow
+        // ANY readdirSync failure below into the bare `catch { /* empty */ }`
+        // at the bottom — an unreadable phase directory reported the exact
+        // same `has_context: false` / `disk_status: 'no_directory'` as a
+        // directory that never existed. findContextMdIn's directory-string
+        // form never throws, so it can record the real scope (COMPLETE vs
+        // UNREADABLE) here, BEFORE the pre-existing `fs.readdirSync(fullDir)`
+        // immediately below (unchanged) throws on the exact same unreadable
+        // directory and is caught exactly as before — this line is additive
+        // only, the failure control-flow is untouched.
+        contextScope = findContextMdIn(fullDir).scope;
         const phaseFiles = fs.readdirSync(fullDir);
         planCount = listPhasePlanFiles(fullDir).length;
         summaryCount = listPhaseSummaryFiles(fullDir).length;
@@ -2463,6 +2631,7 @@ function cmdInitManager(cwd: string, raw: boolean): void {
       ...completion,
       last_activity: lastActivity,
       is_active: isActive,
+      context_scope: contextScope,
     });
   }
 
@@ -2549,7 +2718,13 @@ function cmdInitManager(cwd: string, raw: boolean): void {
 
   let waitingSignal: unknown = null;
   try {
-    const waitingPath = path.join(cwd, '.planning', 'WAITING.json');
+    // #3964: mirror cmdSignalWaiting's write locations exactly — `.gsd/`
+    // first when it exists, else the project-aware planning dir — so the
+    // signal is read from the project (and location) it is written to.
+    const gsdWaiting = path.join(cwd, '.gsd', 'WAITING.json');
+    const waitingPath = fs.existsSync(path.join(cwd, '.gsd'))
+      ? gsdWaiting
+      : path.join(planningDir(cwd), 'WAITING.json');
     const waitingRaw = platformReadSync(waitingPath);
     if (waitingRaw !== null) {
       waitingSignal = JSON.parse(waitingRaw);
@@ -2676,7 +2851,7 @@ function cmdInitManager(cwd: string, raw: boolean): void {
     waiting_signal: waitingSignal,
     all_complete:
       completedCount === nonBacklogPhases.length && nonBacklogPhases.length > 0,
-    project_exists: pathExistsInternal(cwd, '.planning/PROJECT.md'),
+    project_exists: pathExistsInternal(cwd, toPosixPath(path.relative(cwd, path.join(planningDir(cwd), 'PROJECT.md')))),
     roadmap_exists: true,
     state_exists: true,
     manager_flags: managerFlags,
@@ -2894,7 +3069,7 @@ function cmdInitTransition(cwd: string, raw: boolean, options: Record<string, un
  *   location has one source instead of two kept in sync by hand.
  * - `debugger_model` — `resolveModelInternal`, which IS what `query
  *   resolve-model --pick model` returns (`cmdResolveModel`, src/commands.cts).
- * - `tdd_mode` — the `Boolean(wf['tdd_mode'])` idiom `cmdInitExecutePhase` and
+ * - `tdd_mode` — the `Boolean(config.tdd_mode)` idiom `cmdInitExecutePhase` and
  *   `cmdInitPlanPhase` already use. `/gsd:debug` has no `--tdd` flag, so the
  *   sibling handlers' `options['tdd'] ||` disjunct is deliberately omitted
  *   rather than carried as a phantom.
@@ -2912,7 +3087,6 @@ function cmdInitTransition(cwd: string, raw: boolean, options: Record<string, un
  */
 function cmdInitDebug(cwd: string, raw: boolean, options: Record<string, unknown> = {}): void {
   const config = loadConfig(cwd);
-  const wf = (config.workflow ?? {}) as Record<string, unknown>;
 
   const result: Record<string, unknown> = {
     commit_docs: config.commit_docs,
@@ -2921,7 +3095,7 @@ function cmdInitDebug(cwd: string, raw: boolean, options: Record<string, unknown
     // own cwd may differ from the orchestrator's.
     debug_dir: toPosixPath(planningPaths(cwd).debug),
     debugger_model: resolveModelInternal(cwd, 'gsd-debugger'),
-    tdd_mode: Boolean(wf['tdd_mode']),
+    tdd_mode: Boolean(config.tdd_mode),
     diagnose: options['diagnose'] === true,
   };
 
@@ -3106,7 +3280,11 @@ function cmdInitProgress(cwd: string, raw: boolean, options: Record<string, unkn
       const status = 'not_started';
       const phaseInfo: Record<string, unknown> = {
         number: num,
-        name: name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, ''),
+        // #3883 (ADR-3473 §8.3): delegate to the canonical slug formula
+        // (generateSlugInternal, core-utils.cts) rather than re-implementing
+        // it. `maxLen: null` preserves this site's pre-migration untruncated
+        // contract.
+        name: coreUtils.generateSlugInternal(name, null) ?? '',
         directory: null,
         status,
         plan_count: 0,
@@ -3122,9 +3300,7 @@ function cmdInitProgress(cwd: string, raw: boolean, options: Record<string, unkn
     }
   }
 
-  phases.sort(
-    (a, b) => parseInt(a['number'] as string, 10) - parseInt(b['number'] as string, 10),
-  );
+  phases.sort((a, b) => comparePhaseNum(a['number'], b['number']));
 
   // #3581: the frontier is ROADMAP ORDER, not artifact presence. The disk loop
   // above could claim nextPhase from a stray out-of-order artifact directory
@@ -3192,9 +3368,13 @@ function cmdInitProgress(cwd: string, raw: boolean, options: Record<string, unkn
     has_work_in_progress: !!currentPhase,
     phase_mvp_mode: phaseMvpMode,
 
-    project_exists: pathExistsInternal(cwd, '.planning/PROJECT.md'),
+    project_exists: pathExistsInternal(cwd, toPosixPath(path.relative(cwd, path.join(planningDir(cwd), 'PROJECT.md')))),
     roadmap_exists: fs.existsSync(path.join(planningDir(cwd), 'ROADMAP.md')),
     state_exists: fs.existsSync(path.join(planningDir(cwd), 'STATE.md')),
+    // #4040: partial-init discriminator (see buildInitCompletenessFields) —
+    // also adds planning_exists / requirements_exists / milestones_exists so
+    // progress.md's init_context routing never has to fall back to Glob.
+    ...buildInitCompletenessFields(cwd),
     // #2376: absolute — see comment on phase_dir in cmdInitExecutePhase.
     state_path: toPosixPath(path.join(planningDir(cwd), 'STATE.md')),
     roadmap_path: toPosixPath(path.join(planningDir(cwd), 'ROADMAP.md')),
@@ -3962,7 +4142,9 @@ function cmdSkillManifest(cwd: string, args: string[], raw: boolean): void {
   const manifest = buildSkillManifest(cwd, skillsDir);
 
   if (args.includes('--write')) {
-    const planDir = path.join(cwd, '.planning');
+    // #3964: write beside the project's own artifacts (planningDir is
+    // project- and workstream-aware), not the flat root.
+    const planDir = planningDir(cwd);
     if (fs.existsSync(planDir)) {
       const manifestPath = path.join(planDir, 'skill-manifest.json');
       platformWriteSync(manifestPath, JSON.stringify(manifest, null, 2));
@@ -3978,6 +4160,7 @@ export = {
   cmdInitNewProject,
   cmdInitNewMilestone,
   cmdInitQuick,
+  cmdInitQuickBatch,
   cmdInitIngestDocs,
   cmdInitOnboard,
   cmdInitResume,

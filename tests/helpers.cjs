@@ -544,6 +544,103 @@ function readFileNormalized(filePath) {
 }
 
 /**
+ * Fault-injection helper for durable-write tests (#1874): monkeypatches
+ * `fsModule.writeFileSync` so any call matching `matches(target)` writes
+ * only the first `bytesBeforeThrow` bytes of `data` (a faithful crash
+ * window — the partial bytes DO land on disk, mirroring a real ENOSPC/EIO
+ * mid-write) and then throws. Calls not matching `matches` pass through to
+ * the real implementation unchanged.
+ *
+ * fs-method override rather than chmod: root bypasses mode bits, so a
+ * permission-based fault injection silently passes with zero coverage in
+ * root CI (CLAUDE.md §4 / CONTRIBUTING.md).
+ *
+ * Returns a restore function — call it via `t.after(...)`, never a manual
+ * try/finally in the test body.
+ *
+ * @param {typeof import('fs')} fsModule
+ * @param {(target: unknown) => boolean} matches - defaults to matching every write
+ * @param {number} bytesBeforeThrow - byte count of `data` that lands before the throw
+ * @param {{code?: string, message?: string}} [options]
+ * @returns {() => void} restore function
+ */
+function mockPartialWriteThenThrow(fsModule, matches, bytesBeforeThrow, options = {}) {
+  const { code = 'ENOSPC', message = `${code}: simulated partial write failure` } = options;
+  const shouldMatch = typeof matches === 'function' ? matches : () => true;
+  const origWriteFileSync = fsModule.writeFileSync;
+  fsModule.writeFileSync = (target, data, writeOptions) => {
+    if (!shouldMatch(target)) {
+      return origWriteFileSync.call(fsModule, target, data, writeOptions);
+    }
+    origWriteFileSync.call(fsModule, target, String(data).slice(0, bytesBeforeThrow), writeOptions);
+    throw Object.assign(new Error(message), { code });
+  };
+  return () => { fsModule.writeFileSync = origWriteFileSync; };
+}
+
+/**
+ * Capture the bytes written to `captureFd` while `fn()` runs, WITHOUT ever
+ * fabricating a byte count for any fd (#4306).
+ *
+ * Every previous hand-rolled version of this idiom across the test suite
+ * mocked `fs.writeSync`, and on its "success" arm returned a fabricated byte
+ * count while pushing the bytes into a local array instead of ever calling
+ * the real `fs.writeSync` — the data reached nowhere but that array. That is
+ * unsafe: Node's `node:test` runner defaults to `--test-isolation=process`
+ * (Node >= 22), so each test file's own real stdout is what the PARENT
+ * runner reads to parse its child-to-parent result/TAP protocol. If the
+ * runner's own reporter write for an adjacent test lands on the mocked fd
+ * during this window, a mock that fabricates success without delivering the
+ * bytes silently swallows that write instead of letting it reach the real
+ * pipe — the parent then tries to parse a truncated stream, observed in CI
+ * as "Unable to deserialize cloned data" (Node's generic corrupted/truncated
+ * v8.deserialize error), not as a thrown exception.
+ *
+ * This helper always forwards every write, on every fd, to the real
+ * `fs.writeSync` first — so nothing is ever swallowed, regardless of what
+ * else shares the fd during the mocked window — and returns the REAL
+ * result. Only `captureFd`'s traffic is additionally recorded and returned
+ * to the caller as a joined UTF-8 string; every other fd's bytes still
+ * reach their real destination (e.g. a test's own stderr diagnostics still
+ * physically write to stderr, just outside the returned capture), they are
+ * simply not included in the returned string.
+ *
+ * Standalone — no node:test context required; save/restore in a `finally`
+ * so a thrown assertion still restores the real `fs.writeSync`.
+ *
+ * @param {number} captureFd - the fd to capture and return (1 for stdout, 2 for stderr).
+ * @param {() => void} fn - synchronous function to run while capturing.
+ * @returns {string} every byte actually written to `captureFd` during `fn()`.
+ */
+function captureFdSync(captureFd, fn) {
+  const chunks = [];
+  const orig = fs.writeSync;
+  fs.writeSync = (fd, data, ...rest) => {
+    const n = orig.call(fs, fd, data, ...rest);
+    if (fd === captureFd) {
+      // rest[0] is `offset` only for the buffer-form overload; the
+      // string-form overload's 2nd arg is `position`, which is irrelevant
+      // here since a string write has no byte offset into `data` itself.
+      const offset = Buffer.isBuffer(data) && typeof rest[0] === 'number' ? rest[0] : 0;
+      const buf = Buffer.isBuffer(data)
+        ? data.subarray(offset, offset + n)
+        : Buffer.from(String(data), 'utf8').subarray(0, n);
+      // Buffered, not decoded per-call: a real short write can split a
+      // multi-byte UTF-8 codepoint across two writeSync calls, and decoding
+      // each half separately would corrupt it. Decode once, after joining.
+      chunks.push(buf);
+}
+    return n;
+};
+  try {
+    fn();
+  } finally {
+    fs.writeSync = orig;
+}
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
  * Read a workflow .md file plus every .md file under its sibling
  * `<workflow-basename>/steps/` directory, concatenated in document order
  * (host file first, then step files sorted by filename).
@@ -997,10 +1094,95 @@ function installSpawnHome() {
 
 function installSpawnEnv(overrides = {}) {
   const home = installSpawnHome();
-  return { ...process.env, ...testEnvBase(), HOME: home, USERPROFILE: home, ...overrides };
+  // #3712 — carry the sandbox marker too, not just HOME. The guard falls back to
+  // the marker on hosts with no readable passwd entry (some CI images) and
+  // otherwise REFUSES. A spawned installer inherits NODE_TEST_CONTEXT and has a
+  // legitimately redirected HOME, so without this it is refused on exactly the
+  // environment the fallback exists to serve. The name is the same constant
+  // sandboxHome() writes; see the note there on why it is a bare string.
+  const env = {
+    ...process.env,
+    ...testEnvBase(),
+    HOME: home,
+    USERPROFILE: home,
+    [TEST_HOME_SANDBOX_MARKER]: home,
+    ...overrides,
+  };
+  // The marker attests to the home ACTUALLY in effect, so it has to follow an
+  // overridden HOME rather than keep naming this helper's default one. Spreading
+  // `overrides` last is deliberate (an explicit HOME must win — see the docblock's
+  // "A test needing that passes its own { HOME, USERPROFILE }"), but it left the
+  // marker stale: a caller supplying its own HOME got HOME=<theirs> and
+  // marker=<helper default>. On a passwd-less host the guard compares the two and
+  // REFUSES a legitimately sandboxed spawn — tests/install.test.cjs:7143 and
+  // install-shared.cjs's own runInstaller both take that path. An explicitly
+  // supplied marker still wins over both. Reported in Codex review of #3725.
+  if (!(TEST_HOME_SANDBOX_MARKER in overrides)) env[TEST_HOME_SANDBOX_MARKER] = env.HOME;
+  return env;
 }
 
-module.exports = { runGsdTools, createTempDir, createTempProject, createTempGitProject, cleanup, tmpRootCandidates, readFileNormalized, readWorkflowCombined, parseFrontmatter, isUsageOutput, captureConsole, toPosixPath, absPlanningPath, runNpm, isolatedNpmEnv, withIsolatedProcessState, delay, waitFor, resetRuntimeWarningCaches, SESSION_ENV_KEYS, saveSessionEnv, restoreSessionEnv, clearSessionEnv, isolateWorkstreamEnv, restoreWorkstreamEnv, TOOLS_PATH, SESSION_IDENTITY_ENV_KEYS, scrubConfigLocationEnv, installSpawnEnv, installSpawnHome };
+/**
+ * #3712 — sandbox HOME/USERPROFILE for the duration of ONE test.
+ *
+ * The spawn-side helpers above (#3156) cover CHILD processes only. A test that
+ * calls the installer IN-PROCESS gets no protection from them, and a runtime kind
+ * may declare a global `home` override that resolves from `os.homedir()` rather
+ * than from the sandboxed configDir — codex's skills kind (`.agents`, ADR-1239 /
+ * #2088) is the live case. Without this, such a call writes to, and prunes
+ * `gsd-*` entries from, the developer's REAL ~/.agents/skills.
+ *
+ * Promoted here from the identical private copies in executed-plan.test.cjs and
+ * install-runtime-artifacts.test.cjs so new in-process callers have one obvious
+ * helper to reach for instead of re-deriving it (or forgetting it).
+ *
+ * Pass the test's own temp configDir as `dir` where possible: codex's skills dir
+ * then resolves to `<configDir>/.agents/skills`, keeping every artifact the call
+ * writes inside the directory the test already cleans up.
+ *
+ * @param {{ after: (fn: () => void) => void }} t - node:test context.
+ * @param {string} dir - directory to use as HOME for the duration of the test.
+ */
+// #3712: the marker NAME is a constant, duplicated here deliberately rather than
+// required from the compiled guard. helpers.cjs is imported by ~370 test files and
+// documents (see builtLib above) that it must NOT load gsd-core/bin/lib at module
+// scope — an unbuilt tree would then fail on import alone, turning a missing
+// `npm run build:lib` into a whole-suite crash. A lazy require inside sandboxHome
+// would satisfy that too, but a bare string needs no build at all. The pairing is
+// pinned by a test so the two cannot drift.
+const TEST_HOME_SANDBOX_MARKER = 'GSD_TEST_HOME_SANDBOX';
+
+function sandboxHome(t, dir) {
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  const savedMarker = process.env[TEST_HOME_SANDBOX_MARKER];
+  process.env.HOME = dir;
+  process.env.USERPROFILE = dir;
+  // Records WHICH directory this call sandboxed to. src/real-home-guard.cts fails
+  // CLOSED when it cannot read a passwd entry to compare HOME against (some CI
+  // images), and consults this only in that branch, accepting it only when it
+  // names the home actually in effect — so a stale marker cannot vouch for a
+  // later, un-sandboxed call.
+  process.env[TEST_HOME_SANDBOX_MARKER] = dir;
+  t.after(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    if (savedMarker === undefined) delete process.env[TEST_HOME_SANDBOX_MARKER];
+    else process.env[TEST_HOME_SANDBOX_MARKER] = savedMarker;
+  });
+}
+
+function writePackageSourceMarkerFixture(configDir) {
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, '.gsd-source'),
+    path.join(__dirname, '..', 'commands', 'gsd') + '\n',
+  );
+  return configDir;
+}
+
+module.exports = { runGsdTools, createTempDir, createTempProject, createTempGitProject, cleanup, tmpRootCandidates, readFileNormalized, readWorkflowCombined, parseFrontmatter, isUsageOutput, captureConsole, toPosixPath, absPlanningPath, runNpm, isolatedNpmEnv, withIsolatedProcessState, delay, waitFor, resetRuntimeWarningCaches, SESSION_ENV_KEYS, saveSessionEnv, restoreSessionEnv, clearSessionEnv, isolateWorkstreamEnv, restoreWorkstreamEnv, TOOLS_PATH, SESSION_IDENTITY_ENV_KEYS, scrubConfigLocationEnv, installSpawnEnv, installSpawnHome, sandboxHome, writePackageSourceMarkerFixture, TEST_HOME_SANDBOX_MARKER, mockPartialWriteThenThrow, captureFdSync };
 
 // Lazy, for the reason builtLib() is lazy: reading either of these is what
 // forces the built-lib require, so a test file that needs neither can still

@@ -105,9 +105,19 @@ test('#2711: the guarded set is derived from dispatch sites, not hand-maintained
     'a workflow with 10 dispatch sites must be derived exactly once',
   );
   // limit-1: a workflow that never emits model= must NOT be dragged in.
+  // #3676: must use the SAME readWorkflowCombined (host + steps/*.md) read
+  // `workflowsThatDispatchWithAModel()` itself uses (per that function's own
+  // #2994 doc comment above) — a bare-host-only read here was inconsistent
+  // with `derived`'s combined read, and a workflow whose EVERY model="{...}"
+  // dispatch site lives in a mandatory (never gated) steps/ fragment — true
+  // for quick-batch.md, which extracts even its non-optional planner/executor
+  // dispatch to stay under ADR-1610's tighter NEW_FILE_CAP for a brand-new
+  // file — has zero model="{" occurrences in its bare host text while still
+  // correctly appearing in `derived`. The mismatch made this limit-1 check
+  // wrongly flag a genuinely-dispatching workflow as "must not be derived in".
   const nonDispatching = fs
     .readdirSync(WORKFLOWS)
-    .filter((f) => f.endsWith('.md') && !/model="\{/.test(fs.readFileSync(path.join(WORKFLOWS, f), 'utf8')));
+    .filter((f) => f.endsWith('.md') && !/model="\{/.test(readWorkflowCombined(path.join(WORKFLOWS, f))));
   assert.ok(nonDispatching.length > 0, 'expected some workflows to dispatch no model= at all');
   for (const f of nonDispatching) {
     assert.ok(!derived.includes(f), `${f} emits no model= and must not be required to carry the rule`);
@@ -359,7 +369,9 @@ test('#2684: ship.md validates capability-supplied ref.agent before it reaches a
       'assignment IS the injection point (#2684 isolated review).',
   );
 
-  const shape = new RegExp(gate[1]);
+  // Pattern extracted verbatim from ship.md's validation gate — the shipped
+  // regex IS the product under test (#3951).
+  const shape = new RegExp(gate[1]); // allow-adhoc-regex-escape: runtime-contract-is-the-product
 
   // Legitimate agent names the capability system actually dispatches.
   for (const ok of ['gsd-mempalace-curator', 'gsd-code-reviewer', 'my.agent_v2', 'a']) {

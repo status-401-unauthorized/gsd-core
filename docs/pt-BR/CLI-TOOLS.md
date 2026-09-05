@@ -325,7 +325,7 @@ if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
 
 ```bash
 # Arquiva milestone
-node gsd-tools.cjs milestone complete <version> [--name <name>] [--no-archive-phases]
+node gsd-tools.cjs milestone complete <version> (--confirm | --dry-run) [--name <name>] [--no-archive-phases] [--force] [--archive-quick]
 
 # Marca requisitos como concluídos
 node gsd-tools.cjs requirements mark-complete <ids>
@@ -398,7 +398,7 @@ node gsd-tools.cjs progress [json|table|bar]
 node gsd-tools.cjs progress --json
 
 # Conclui uma tarefa
-node gsd-tools.cjs todo complete <filename>
+node gsd-tools.cjs todo complete <filename> [--dry-run]
 
 # Auditoria UAT — verifica todas as fases em busca de itens não resolvidos
 node gsd-tools.cjs audit-uat

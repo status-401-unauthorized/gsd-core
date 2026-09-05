@@ -2,9 +2,10 @@
  * Plan Document Module — the single parser for a `*-PLAN.md` document BODY.
  *
  * Owns: objective extraction, the task-block grammar (`<task>` elements, with
- * the legacy `## Task N` heading fallback), planned-file extraction, and the
- * frontmatter-derived scheduling metadata (`wave`, `depends_on`, `autonomous`,
- * `agent_hint`, `files_modified`).
+ * the legacy `## Task N` heading fallback — including the optional `tracker-id`
+ * attribute, ADR-3646 Phase 1, read verbatim and never split here), planned-file
+ * extraction, and the frontmatter-derived scheduling metadata (`wave`,
+ * `depends_on`, `autonomous`, `agent_hint`, `files_modified`).
  *
  * WHY THIS IS A LEAF MODULE. This logic was written inline inside
  * `cmdPhasePlanIndex` (`src/phase.cts`). Two commands in two different families
@@ -67,11 +68,28 @@ interface PlanTask {
   acceptanceCriteria: string[];
   /** `<done>` text, or null. */
   done: string | null;
+  /**
+   * Verbatim `tracker-id` attribute value (e.g. `beads:GSD-42`), or null.
+   * Never split or parsed here — that belongs to the resolution seam
+   * (ADR-3646), not this grammar layer. Null for a checkpoint task (never
+   * read), an absent attribute, or an empty-string value (`tracker-id=""`
+   * normalises to null, same as every other optional attribute here).
+   */
+  trackerId: string | null;
+  /**
+   * Verbatim `tdd` attribute value on a `<task>` opening tag (e.g. `"true"`),
+   * or null. Never coerced to boolean — read exactly like `trackerId`. Null
+   * for a checkpoint task (never read), an absent attribute, or an
+   * empty-string value. #4273 (epic #4272, ADR-3473's 4th application).
+   */
+  tdd: string | null;
 }
 
 interface PlanDocument {
   /** `<objective>` body, else frontmatter `objective`, else null. */
   objective: string | null;
+  /** Frontmatter `type` value, read verbatim (e.g. `"tdd"`, `"standard"`), or null when absent. #4273. */
+  type: string | null;
   /** Frontmatter `wave` as an integer, or null when absent/unparseable. */
   declaredWave: number | null;
   dependsOn: string[];
@@ -79,6 +97,14 @@ interface PlanDocument {
   agentHint: string | null;
   /** Frontmatter `files_modified` / `files-modified`, normalised to an array. */
   filesModified: string[];
+  /**
+   * #3003: frontmatter `files_deleted` / `files-deleted`, normalised to an array.
+   * Paths the plan declares it will REMOVE, so `worktree cleanup-wave`'s deletions
+   * guard can authorize exactly those and keep blocking anything undeclared.
+   * OPTIONAL — a plan that omits it declares nothing and keeps the guard's original
+   * unconditional block.
+   */
+  filesDeleted: string[];
   tasks: PlanTask[];
   /**
    * Legacy count. Invariant: `taskCount === tasks.length`, always. Exposed as
@@ -188,6 +214,8 @@ function parseXmlTasks(content: string): PlanTask[] {
         plannedFiles: [],
         acceptanceCriteria: [],
         done: null,
+        trackerId: null,
+        tdd: null,
       };
     }
 
@@ -199,6 +227,8 @@ function parseXmlTasks(content: string): PlanTask[] {
       plannedFiles: splitFileList(elementBody(block, 'files')),
       acceptanceCriteria: splitCriteria(elementBody(block, 'acceptance_criteria')),
       done: collapseWhitespace(elementBody(block, 'done')),
+      trackerId: tagAttribute(openTag, 'tracker-id'),
+      tdd: tagAttribute(openTag, 'tdd'),
     };
   });
 }
@@ -217,6 +247,8 @@ function parseMarkdownTasks(content: string): PlanTask[] {
     plannedFiles: [],
     acceptanceCriteria: [],
     done: null,
+    trackerId: null,
+    tdd: null,
   }));
 }
 
@@ -289,6 +321,13 @@ function parsePlanDocument(content: string, planPath = ''): PlanDocument {
     filesModified = Array.isArray(fmFiles) ? fmFiles.map(String) : [String(fmFiles)];
   }
 
+  let filesDeleted: string[] = [];
+  const fmDeleted = fm['files_deleted'] || fm['files-deleted'];
+  if (fmDeleted) {
+    // eslint-disable-next-line @typescript-eslint/no-base-to-string -- FrontmatterValue scalar-to-string
+    filesDeleted = Array.isArray(fmDeleted) ? fmDeleted.map(String) : [String(fmDeleted)];
+  }
+
   let agentHint: string | null = null;
   const fmAgentHint = fm['agent_hint'];
   if (fmAgentHint !== undefined) {
@@ -297,13 +336,22 @@ function parsePlanDocument(content: string, planPath = ''): PlanDocument {
     agentHint = hintStr !== '' ? hintStr : null;
   }
 
+  let planType: string | null = null;
+  const fmType = fm['type'];
+  if (fmType !== undefined) {
+    // eslint-disable-next-line @typescript-eslint/no-base-to-string -- FrontmatterValue scalar-to-string
+    planType = String(fmType);
+  }
+
   return {
     objective: extractObjective(content) || (fm['objective'] as string | null) || null,
+    type: planType,
     declaredWave,
     dependsOn,
     autonomous,
     agentHint,
     filesModified,
+    filesDeleted,
     tasks,
     taskCount: tasks.length,
   };

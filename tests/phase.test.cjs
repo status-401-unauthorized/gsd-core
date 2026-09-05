@@ -1,3 +1,4 @@
+// docs-guard-exempt: docs/adr/3524-...md is cited only in a References comment; never read.
 // allow-test-rule: source-text-is-the-product
 // Reads .md/.json/.yml product files whose deployed text IS what the
 // runtime loads — testing text content tests the deployed contract.
@@ -24,6 +25,7 @@ const { toLegacyResult } = require('./helpers/git-fixture.cjs');
 // above, and `run()` below at 15000ms for a lighter query-only call).
 const PHASE_COMPLETE_TIMEOUT_MS = 60000;
 const { runGsdTools, createTempProject, cleanup } = require('./helpers.cjs');
+const { splitTableRow } = require('../gsd-core/bin/lib/markdown-table.cjs');
 
 const GSD_TOOLS_BIN = path.resolve(__dirname, '..', 'gsd-core', 'bin', 'gsd-tools.cjs');
 
@@ -1104,6 +1106,386 @@ objective: Manual review needed
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #3885 (ADR-3473 §8.5) / #3427 — phase-plan-index must NAME a dropped
+// depends_on token instead of manufacturing a wave-mismatch verdict from it.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Mechanism: resolveDependencyId (phase.cts) returns null for a depends_on
+// token that resolves via neither planMap nor canonicalToId;
+// computeDependencyLevels silently `continue`s past it, making the dependent
+// plan a DAG root. cmdPhasePlanIndex then compares that damaged wave against
+// the plan's declared `wave:` and emits a "declared wave: N but depends_on
+// DAG places it in wave M" warning — a verdict manufactured from the dropped
+// edge, not from an author error.
+//
+// VERBATIM CURRENT OUTPUT (measured on this tree, e20744eac, via the real CLI
+// `gsd-tools phase-plan-index 03` against a phase dir with 03-01 (wave: 1, no
+// deps) and 03-02 (wave: 2, depends_on: [nonexistent-token-3427])):
+//
+//   "warnings": [
+//     "Plan 03-02: declared wave: 2 but depends_on DAG places it in wave 1"
+//   ]
+//
+// Note: NO mention of "nonexistent-token-3427" anywhere in `warnings` — the
+// dropped token is invisible, and the manufactured wave-mismatch warning
+// fires in its place. That is exactly the #3427 defect this block pins.
+describe('#3885 (ADR-3473 §8.5): phase-plan-index names a dropped depends_on token instead of manufacturing a wave-mismatch verdict', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  // T31 — RED today (consumer-output identity, §8.9): the emitted `warnings`
+  // must name the unresolved token together with its owning plan.
+  test('T31: planIndexJsonNamesTheDroppedToken_3427', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(phaseDir, '03-01-PLAN.md'),
+      '---\nwave: 1\nautonomous: true\ndepends_on: []\n---\n<objective>Plan A.</objective>\n',
+    );
+    fs.writeFileSync(
+      path.join(phaseDir, '03-02-PLAN.md'),
+      '---\nwave: 2\nautonomous: true\ndepends_on:\n  - nonexistent-token-3427\n---\n<objective>Plan B.</objective>\n',
+    );
+
+    const result = runGsdTools('phase-plan-index 03', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const warnings = output.warnings ?? [];
+
+    assert.ok(
+      warnings.some((w) => w.includes('nonexistent-token-3427') && w.includes('03-02')),
+      `warnings must name plan 03-02 and its unresolved token "nonexistent-token-3427"; got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  // T24 — RED today: the manufactured "declared wave:" verdict for 03-02 must
+  // be suppressed once its dropped edge is named (T31's warning stands in its
+  // place). Currently it fires (measured above):
+  // "Plan 03-02: declared wave: 2 but depends_on DAG places it in wave 1".
+  test('T24: droppedEdgeSuppressesTheManufacturedWaveVerdict_3427', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(phaseDir, '03-01-PLAN.md'),
+      '---\nwave: 1\nautonomous: true\ndepends_on: []\n---\n<objective>Plan A.</objective>\n',
+    );
+    fs.writeFileSync(
+      path.join(phaseDir, '03-02-PLAN.md'),
+      '---\nwave: 2\nautonomous: true\ndepends_on:\n  - nonexistent-token-3427\n---\n<objective>Plan B.</objective>\n',
+    );
+
+    const result = runGsdTools('phase-plan-index 03', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const warnings = output.warnings ?? [];
+
+    assert.ok(
+      !warnings.some((w) => /declared wave:/.test(w) && w.includes('03-02')),
+      `the manufactured wave-mismatch warning for 03-02 must be suppressed once its dropped edge is named; got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  // T25 — MUST STAY GREEN (N3): a fully-resolvable DAG with a genuinely wrong
+  // declared wave must still warn. Stops T24's fix from becoming a blanket
+  // suppression. Confirmed passing today (measured via the real CLI: Plan B
+  // fully resolves 03-01 and the DAG places it at wave 2, but it declares
+  // wave: 5, and the mismatch warning fires exactly as expected).
+  test('T25: genuineWaveMismatchStillWarns', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(phaseDir, '03-01-PLAN.md'),
+      '---\nwave: 1\nautonomous: true\ndepends_on: []\n---\n<objective>Plan A.</objective>\n',
+    );
+    // Plan B fully resolves its dependency (03-01) — no dropped edge — so its
+    // declared wave (5) is a genuine authoring mistake (correct DAG wave is 2).
+    fs.writeFileSync(
+      path.join(phaseDir, '03-02-PLAN.md'),
+      '---\nwave: 5\nautonomous: true\ndepends_on:\n  - 03-01\n---\n<objective>Plan B.</objective>\n',
+    );
+
+    const result = runGsdTools('phase-plan-index 03', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const warnings = output.warnings ?? [];
+
+    assert.ok(
+      warnings.some((w) => w.includes('declared wave: 5') && w.includes('wave 2') && w.includes('03-02')),
+      `a genuinely wrong declared wave (no dropped edge) must still warn; got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  // T29 (N4, #3785) is already pinned by the existing test above in this file,
+  // '#3785: external cross-phase depends_on ref is preserved as-is in output'
+  // (an unresolved cross-phase depends_on token IS exactly the #3785
+  // scenario) — it already asserts the DISPLAY `depends_on` field passes an
+  // unresolved token through verbatim. No new test added here; this phase's
+  // fix must leave that test green (design N4: the display mapping stays
+  // unresolved-passthrough, never routed through resolveDependencyId).
+
+  // #3885 follow-up: the unresolved-depends_on warning embeds the token
+  // VERBATIM before this fix — an attacker-authored (YAML-frontmatter)
+  // token containing a newline can forge a second, fabricated warning line
+  // once a consumer prints `warnings[]` one-per-line. `formatDiagnosticToken`
+  // (src/io.cts, introduced for the same class in #3884) must be used to
+  // escape the token so the warning stays on ONE line and the token is still
+  // named (escaped), never dropped — a fix that deleted the token would also
+  // pass a naive "one line" check, so each case below also asserts the
+  // (escaped) token text is present.
+  test('unresolved depends_on token containing a newline cannot forge a second warning line', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(phaseDir, '03-01-PLAN.md'),
+      '---\nwave: 1\nautonomous: true\ndepends_on: []\n---\n<objective>Plan A.</objective>\n',
+    );
+    fs.writeFileSync(
+      path.join(phaseDir, '03-02-PLAN.md'),
+      '---\nwave: 2\nautonomous: true\ndepends_on:\n  - "evil\\nPlan 03-01: FORGED WARNING"\n---\n<objective>Plan B.</objective>\n',
+    );
+
+    const result = runGsdTools('phase-plan-index 03', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const warnings = output.warnings ?? [];
+
+    assert.strictEqual(warnings.length, 1, `expected exactly one warning; got: ${JSON.stringify(warnings)}`);
+    const [warning] = warnings;
+    // Raw string (not trimmed): the embedded newline must be ESCAPED
+    // (literal backslash-n), not a real line break — a real line break here
+    // would let the attacker-authored suffix render as a forged second entry.
+    assert.strictEqual(
+      warning.split('\n').length,
+      1,
+      `warning must occupy a single line; got raw string: ${JSON.stringify(warning)}`,
+    );
+    assert.ok(!/^Plan 03-01: FORGED WARNING/m.test(warning), 'forged second line must not appear as its own line');
+    // The token must still be NAMED — escaped, not dropped.
+    assert.ok(
+      warning.includes('evil\\nPlan 03-01: FORGED WARNING'),
+      `escaped token must still be named in the warning; got: ${JSON.stringify(warning)}`,
+    );
+    assert.ok(warning.includes('03-02'), 'warning must name the owning plan');
+  });
+
+  test('unresolved depends_on token containing a double quote cannot break out of its quoting', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(phaseDir, '03-01-PLAN.md'),
+      '---\nwave: 1\nautonomous: true\ndepends_on: []\n---\n<objective>Plan A.</objective>\n',
+    );
+    fs.writeFileSync(
+      path.join(phaseDir, '03-02-PLAN.md'),
+      '---\nwave: 2\nautonomous: true\ndepends_on:\n  - "evil\\"quote"\n---\n<objective>Plan B.</objective>\n',
+    );
+
+    const result = runGsdTools('phase-plan-index 03', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const warnings = output.warnings ?? [];
+
+    assert.strictEqual(warnings.length, 1, `expected exactly one warning; got: ${JSON.stringify(warnings)}`);
+    const [warning] = warnings;
+    assert.strictEqual(
+      warning.split('\n').length,
+      1,
+      `warning must occupy a single line; got raw string: ${JSON.stringify(warning)}`,
+    );
+    // The embedded quote must be ESCAPED, not left free to close the
+    // surrounding quoting early.
+    assert.ok(
+      warning.includes('evil\\"quote'),
+      `escaped token must still be named in the warning; got: ${JSON.stringify(warning)}`,
+    );
+    assert.ok(warning.includes('03-02'), 'warning must name the owning plan');
+  });
+
+  test('unresolved depends_on token containing a C0 control char is escaped, not passed through raw', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(phaseDir, '03-01-PLAN.md'),
+      '---\nwave: 1\nautonomous: true\ndepends_on: []\n---\n<objective>Plan A.</objective>\n',
+    );
+    fs.writeFileSync(
+      path.join(phaseDir, '03-02-PLAN.md'),
+      '---\nwave: 2\nautonomous: true\ndepends_on:\n  - "evil\\x07bell"\n---\n<objective>Plan B.</objective>\n',
+    );
+
+    const result = runGsdTools('phase-plan-index 03', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const warnings = output.warnings ?? [];
+
+    assert.strictEqual(warnings.length, 1, `expected exactly one warning; got: ${JSON.stringify(warnings)}`);
+    const [warning] = warnings;
+    assert.strictEqual(
+      warning.split('\n').length,
+      1,
+      `warning must occupy a single line; got raw string: ${JSON.stringify(warning)}`,
+    );
+    // No raw C0 control byte may survive into the warning string.
+    // eslint-disable-next-line no-control-regex
+    assert.ok(!/[\x00-\x1f]/.test(warning), `no raw control character may survive; got: ${JSON.stringify(warning)}`);
+    assert.ok(
+      warning.includes('evil\\u0007bell'),
+      `escaped token must still be named in the warning; got: ${JSON.stringify(warning)}`,
+    );
+    assert.ok(warning.includes('03-02'), 'warning must name the owning plan');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #3897 rung 4 (ADR-3473 §8.9) — shortFormToId, the recovered third
+// depends_on resolution tier (D3). Today `resolveDependencyId`
+// (gsd-core/bin/lib/phase.cjs) has exactly two tiers — planMap (full id) and
+// canonicalToId (canonical prefix, e.g. `24-01`) — so a bare plan-number
+// short form (`depends_on: ["01"]`) resolves via NEITHER and is silently
+// dropped: the dependent plan collapses to a DAG root (wave 1) instead of its
+// declared wave.
+//
+// T43 is the CONSUMER-OUTPUT identity row (ADR-3180 Decision 4(b)): it
+// asserts on `phase-plan-index`'s emitted `waves` map through the REAL CLI,
+// never on `resolveDependencyId`/`computeDependencyLevels` in isolation — a
+// unit assertion on the resolver alone would have passed throughout this
+// defect's entire life, since nothing forces a unit test to reflect what the
+// consumer (execute-phase.md, partial-wave.md) actually reads.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('#3897 rung 4 (ADR-3473 §8.9): shortFormToId, the bare plan-number depends_on tier', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  // T43 — RED today: the CONSUMER-OUTPUT identity row. 26-02 depends on the
+  // bare short form '01'; today that edge is dropped, so 26-02 collapses into
+  // wave 1 alongside 26-01 instead of its own, later wave.
+  test('T43 shortFormDependencyProducesRealWaves_3427: a bare plan-number depends_on produces REAL waves, not one collapsed wave 1', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '26-shortform');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(phaseDir, '26-01-auth-hardening-PLAN.md'),
+      '---\nwave: 1\nautonomous: true\ndepends_on: []\n---\n<objective>Plan A.</objective>\n',
+    );
+    // Bare plan-number short form — NOT a full id, NOT a canonical prefix.
+    fs.writeFileSync(
+      path.join(phaseDir, '26-02-followup-PLAN.md'),
+      "---\nwave: 2\nautonomous: true\ndepends_on:\n  - '01'\n---\n<objective>Plan B.</objective>\n",
+    );
+
+    const result = runGsdTools('phase-plan-index 26', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const waves = output.waves;
+
+    const wave01 = Object.keys(waves).find((w) => waves[w].some((id) => id.startsWith('26-01')));
+    const wave02 = Object.keys(waves).find((w) => waves[w].some((id) => id.startsWith('26-02')));
+    assert.ok(wave01 !== undefined, '26-01-auth-hardening should appear in waves');
+    assert.ok(wave02 !== undefined, '26-02-followup should appear in waves');
+    assert.ok(
+      Number(wave01) < Number(wave02),
+      `the bare short form '01' must resolve to 26-01-auth-hardening and place 26-02-followup in a LATER wave — today the edge is dropped and both plans collapse into the same wave (got wave01=${wave01}, wave02=${wave02})`,
+    );
+    // Today's defect also manufactures a wave-mismatch warning from the
+    // dropped edge (declared wave: 2 but DAG places it in wave 1) — once the
+    // short form resolves, that warning must be gone too.
+    const warnings = output.warnings ?? [];
+    assert.ok(
+      !warnings.some((w) => /declared wave:/.test(w) && w.includes('26-02')),
+      `no manufactured wave-mismatch warning should remain once the short form resolves; got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  // T49 — the short form must resolve IN-PHASE ONLY. A plan '01' living in a
+  // DIFFERENT phase must never satisfy a same-named short-form dependency in
+  // this phase — resolution is scoped per phase-plan-index invocation, never
+  // global across the project.
+  //
+  // #3897 rung 4 (isolated correctness review, MINOR finding 5): the
+  // ORIGINAL version of this test gave the target phase its OWN plan '01'
+  // (27-01-real) alongside the decoy (99-01-decoy). That construction cannot
+  // actually falsify a globally-scoped map: sorted plan-file order always
+  // resolves '01' to whichever phase's own plan sorts first among ALL
+  // candidates, and phase 27 sorts before phase 99 either way — so a
+  // GLOBALLY-scoped shortFormToId would have produced the exact same
+  // wave01 < wave02 result this test asserted, passing for the wrong reason.
+  // Verified empirically (see the isolated review's probe): building
+  // shortFormToId from the phase-scoped rawPlans vs. from the UNION of both
+  // phases' rawPlans produces byte-identical `unresolved`/`level` results for
+  // the original fixture shape.
+  //
+  // Fixed per the reviewer's own working construction: the TARGET phase has
+  // NO plan of its own numbered '01' at all (only '27-05-followup'), and the
+  // decoy phase's plan IS numbered '01' (11-01-decoy). Correct (per-phase)
+  // behavior is that '01' does NOT resolve — the edge is dropped with the
+  // existing #3427 unresolved-token warning, and 27-05 collapses to wave 1.
+  // A globally-scoped map would instead let '01' resolve to 11-01-decoy, a
+  // node outside this phase's rawPlans — which computeDependencyLevels can
+  // never satisfy, so it manufactures a false depends_on CYCLE report
+  // instead of a clean wave assignment. This construction was confirmed,
+  // by direct unit probe against the real exported `buildShortFormToId` and
+  // `computeDependencyLevels`, to distinguish the correct from the buggy
+  // scoping — the ORIGINAL fixture shape above did not.
+  test('T49 shortFormDoesNotReachAcrossPhases: a phase with NO plan of its own numbered "01" must NOT resolve depends_on: ["01"] via a same-numbered plan in a different phase', () => {
+    // A decoy phase whose OWN plan is numbered '01' — the only '01' anywhere
+    // in the project is in THIS phase, not phase 27.
+    const decoyPhaseDir = path.join(tmpDir, '.planning', 'phases', '11-decoy');
+    fs.mkdirSync(decoyPhaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(decoyPhaseDir, '11-01-decoy-PLAN.md'),
+      '---\nwave: 1\nautonomous: true\ndepends_on: []\n---\n<objective>Decoy plan in a different phase.</objective>\n',
+    );
+
+    // Target phase has NO plan of its own numbered '01' — only '05'.
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '27-inphase-only');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(phaseDir, '27-05-followup-PLAN.md'),
+      "---\nwave: 2\nautonomous: true\ndepends_on:\n  - '01'\n---\n<objective>Plan with a dangling short-form dependency.</objective>\n",
+    );
+
+    const result = runGsdTools('phase-plan-index 27', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+
+    // The decoy phase's plan must never even appear in THIS phase's output.
+    assert.ok(
+      !output.plans.some((p) => p.id.startsWith('11-')),
+      'a different phase\'s plan must never appear in this phase\'s plan-index output at all',
+    );
+
+    // Correct behavior: the token does not resolve in-phase, so the edge is
+    // DROPPED — the #3427 unresolved-token warning fires by name, and
+    // 27-05-followup collapses to wave 1 rather than being scheduled behind
+    // a cross-phase phantom edge (which, per the probe above, would instead
+    // surface as a manufactured depends_on cycle error, not a clean pass).
+    const warnings = output.warnings ?? [];
+    assert.ok(
+      warnings.some((w) => /does not resolve to any plan in this phase/.test(w) && w.includes('27-05')),
+      `expected an unresolved-token warning naming 27-05-followup's dangling '01' dependency; got: ${JSON.stringify(warnings)}`,
+    );
+    const wave05 = Object.keys(output.waves).find((w) => output.waves[w].some((id) => id.startsWith('27-05')));
+    assert.strictEqual(
+      wave05,
+      '1',
+      `27-05-followup must collapse to wave 1 (dropped edge, no valid in-phase '01') — the short form must NOT reach the decoy in phase 11; got wave ${wave05}`,
+    );
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // phase-plan-index — canonical XML format (template-aligned)
@@ -2110,6 +2492,171 @@ describe('find-phase scalar counts (#3218)', () => {
     const phase3 = roadmapOutput.phases.find((p) => String(p.number) === '3' || p.number === 3);
     assert.ok(phase3, 'roadmap.analyze must report phase 3');
     assert.strictEqual(findOutput.plan_count, phase3.plan_count, 'find-phase and roadmap.analyze must agree');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// phase number allocation across sibling git worktrees (#3849)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('phase add allocation vs sibling git worktrees (#3849)', () => {
+  const activeWorktrees = [];
+  const activeDirs = [];
+
+  function git(args, cwd) {
+    return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 15_000 });
+  }
+
+  function initRepo(repoDir) {
+    fs.mkdirSync(path.join(repoDir, '.planning', 'phases'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, '.planning', 'ROADMAP.md'),
+      ['# Roadmap v1.0', '', '### Phase 440: existing thing', '**Goal:** Setup', '', '---', ''].join('\n')
+    );
+    fs.mkdirSync(path.join(repoDir, '.planning', 'phases', '440-existing-thing'));
+    git(['init', '-b', 'main'], repoDir);
+    git(['config', 'user.email', 'test@example.com'], repoDir);
+    git(['config', 'user.name', 'Test'], repoDir);
+    git(['add', '-A'], repoDir);
+    git(['commit', '-m', 'init'], repoDir);
+  }
+
+  /** Materialize the issue's repro: a sibling worktree branch holding Phase 441. */
+  function addSiblingHolding441(repoDir) {
+    const sha = git(['rev-parse', 'HEAD'], repoDir).trim();
+    const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-3849-sib-'));
+    git(['worktree', 'add', '--detach', worktreeDir, sha], repoDir);
+    activeWorktrees.push({ repoDir, worktreeDir });
+    fs.mkdirSync(path.join(worktreeDir, '.planning', 'phases', '441-conversation-surface'), { recursive: true });
+    fs.writeFileSync(
+      path.join(worktreeDir, '.planning', 'ROADMAP.md'),
+      ['# Roadmap v1.0', '', '### Phase 440: existing thing', '**Goal:** Setup', '', '### Phase 441: conversation surface', '**Goal:** Talk', '', '---', ''].join('\n')
+    );
+    return worktreeDir;
+  }
+
+  /** A sibling worktree whose checkout has no .planning at all (fail-open case). */
+  function addBareSibling(repoDir) {
+    const sha = git(['rev-parse', 'HEAD'], repoDir).trim();
+    const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-3849-bare-'));
+    git(['worktree', 'add', '--detach', worktreeDir, sha], repoDir);
+    activeWorktrees.push({ repoDir, worktreeDir });
+    // eslint-disable-next-line local/no-raw-rmsync-in-tests -- fixture SETUP, not teardown: strips the tracked .planning/ so this worktree has none; cleanup() owns the dir's removal with the Windows retry budget
+    fs.rmSync(path.join(worktreeDir, '.planning'), { recursive: true, force: true });
+    return worktreeDir;
+  }
+
+  function teardown() {
+    while (activeWorktrees.length) {
+      const { repoDir, worktreeDir } = activeWorktrees.pop();
+      try {
+        git(['worktree', 'remove', '--force', worktreeDir], repoDir);
+      } catch (_) { /* best-effort; cleanup() below still removes the directory */ }
+      cleanup(worktreeDir);
+    }
+    while (activeDirs.length) cleanup(activeDirs.pop());
+  }
+
+  afterEach(teardown);
+
+  test('phase add skips a number held only by a sibling worktree (dir + roadmap header)', () => {
+    const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-3849-main-'));
+    activeDirs.push(repoDir);
+    initRepo(repoDir);
+    addSiblingHolding441(repoDir);
+
+    const result = runGsdTools('phase add anything', repoDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(
+      output.phase_number,
+      442,
+      '#3849: sibling worktree holds Phase 441 — allocation must skip to 442, not collide'
+    );
+    assert.ok(
+      fs.existsSync(path.join(repoDir, '.planning', 'phases', '442-anything')),
+      'directory for the non-colliding 442 should be created'
+    );
+  });
+
+  test('phase add-batch skips a number held only by a sibling worktree', () => {
+    const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-3849-batch-'));
+    activeDirs.push(repoDir);
+    initRepo(repoDir);
+    addSiblingHolding441(repoDir);
+
+    const result = runGsdTools(['phase', 'add-batch', '--descriptions', '["New Thing"]'], repoDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(
+      output.phases[0].phase_number,
+      442,
+      '#3849: the batch allocator must widen its horizon the same way the single-add allocator does'
+    );
+  });
+
+  test('a sibling worktree without .planning/ changes nothing (fail open)', () => {
+    const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-3849-failopen-'));
+    activeDirs.push(repoDir);
+    initRepo(repoDir);
+    addBareSibling(repoDir);
+
+    const result = runGsdTools('phase add next thing', repoDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_number, 441, 'no sibling numbers visible — max+1 from the local 440');
+  });
+
+  test('allocation FROM a linked worktree counts the main checkout too (the incident topology)', () => {
+    const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-3849-linked-'));
+    activeDirs.push(repoDir);
+    initRepo(repoDir);
+    // The real incident ran the other direction: cwd is a linked worktree and
+    // the MAIN checkout (scanned as a sibling here) holds the higher number.
+    const sha = git(['rev-parse', 'HEAD'], repoDir).trim();
+    const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-3849-linked-wt-'));
+    git(['worktree', 'add', '--detach', worktreeDir, sha], repoDir);
+    activeWorktrees.push({ repoDir, worktreeDir });
+    // eslint-disable-next-line local/no-raw-rmsync-in-tests -- fixture SETUP, not teardown: strips the tracked .planning/ so this worktree has none; cleanup() owns the dir's removal with the Windows retry budget
+    fs.rmSync(path.join(worktreeDir, '.planning'), { recursive: true, force: true });
+    fs.mkdirSync(path.join(worktreeDir, '.planning', 'phases'), { recursive: true });
+    fs.writeFileSync(
+      path.join(worktreeDir, '.planning', 'ROADMAP.md'),
+      ['# Roadmap v1.0', '', '### Phase 440: base', '**Goal:** Setup', '', '---', ''].join('\n')
+    );
+
+    const result = runGsdTools('phase add from linked', worktreeDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(
+      output.phase_number,
+      441,
+      '#3849: the main checkout (440) must be visible when allocating from a linked worktree'
+    );
+  });
+
+  test('phase add-batch counts bullet-only Phase N rows (#1229 reached the batch path)', () => {
+    const tmp = createTempProject();
+    try {
+      fs.writeFileSync(
+        path.join(tmp, '.planning', 'ROADMAP.md'),
+        ['# Roadmap v1.0', '', '- [ ] **Phase 11: bullet-only phase**', '', '---', ''].join('\n')
+      );
+      const result = runGsdTools(['phase', 'add-batch', '--descriptions', '["After Bullet"]'], tmp);
+      assert.ok(result.success, `Command failed: ${result.error}`);
+      const output = JSON.parse(result.output);
+      assert.strictEqual(
+        output.phases[0].phase_number,
+        12,
+        '#3849 secondary: a bullet-only Phase 11 must not be re-allocated by add-batch'
+      );
+    } finally {
+      cleanup(tmp);
+    }
   });
 });
 
@@ -3180,6 +3727,7 @@ Plans:
       path.join(tmpDir, '.planning', 'STATE.md'),
       `---\ngsd_state_version: 1.0\ncurrent_phase: 1\nprogress:\n  total_phases: 2\n  completed_phases: 0\n  percent: 0\n---\n\n# State\n\nTotal Phases: 2\n`,
     );
+    const beforeState = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
 
     const result = runGsdTools('phase remove 2', tmpDir);
     assert.ok(result.success, `Command failed: ${result.error}`);
@@ -3187,6 +3735,9 @@ Plans:
     assert.strictEqual(out.state_updated, true, 'state_updated must be true when STATE.md content changed');
     // Body 'Total Phases:' must be decremented from 2 to 1.
     const afterState = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
+    // #3685: earn the `true` above — assert the file's content actually
+    // differs from the pre-call snapshot, not merely that it exists.
+    assert.notEqual(afterState, beforeState, '#3685: STATE.md content must actually change when state_updated is true');
     const bodyMatch = afterState.match(/^Total Phases:\s*(\d+)/m);
     assert.ok(bodyMatch, 'body must have Total Phases field after remove');
     assert.strictEqual(bodyMatch[1], '1', `body 'Total Phases:' must be 1 after removing one of 2 phases; got ${bodyMatch[1]}`);
@@ -3238,6 +3789,65 @@ Plans:
     assert.ok(result.success, `Command failed: ${result.error}`);
     const out = JSON.parse(result.output);
     assert.strictEqual(out.state_updated, false, 'state_updated must be false when no STATE.md exists');
+  });
+
+  // #3685: roadmap_updated used to be reported as a hardcoded `true` —
+  // #2640/#2974 already fixed this call site's sibling `state_updated` flag
+  // to reflect a real content diff (via readModifyWriteStateMd's returned
+  // boolean); roadmap_updated is now fixed the same way, via
+  // updateRoadmapAfterPhaseRemoval's own before/after content comparison.
+  test('roadmap_updated is false when ROADMAP.md comes out byte-identical (#3685)', () => {
+    // Target phase number appears nowhere in ROADMAP.md (no heading, no
+    // dependency reference, no progress-table row, and higher than every
+    // existing phase number so no renumbering fires) and has no directory —
+    // updateRoadmapAfterPhaseRemoval's section-delete/renumber/row-delete
+    // passes are all no-matches, so `content` never diverges from
+    // `originalContent`.
+    //
+    // The fixture is written in ALREADY-NORMALIZED form (a blank line after
+    // the `###` heading) so the byte-identity assertion below compares a
+    // normalized pre-image against a normalized post-image. A hand-authored
+    // fixture that skips that blank line is NOT in the shape
+    // platformWriteSync's own normalizer produces, so writing it back
+    // through the same normalizing write path gains the blank line even
+    // though no phase data changed — that's the writer's own formatting
+    // pass reformatting an un-normalized input, not a real content change,
+    // and asserting byte-identity against such a fixture is unsound.
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap\n\n### Phase 1: Foundation\n\n**Goal:** Setup\n\n## Progress\n\n| Phase | Status |\n|-------|--------|\n| 1 | Done |\n`,
+    );
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '01-foundation'), { recursive: true });
+    const roadmapBefore = fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+
+    const result = runGsdTools('phase remove 5', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const roadmapAfter = fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+    assert.equal(roadmapAfter, roadmapBefore, 'ROADMAP.md must be byte-identical when the removed phase is absent from it');
+    const out = JSON.parse(result.output);
+    assert.strictEqual(
+      out.roadmap_updated, false,
+      'roadmap_updated was hardcoded true here, masking the no-op (#3685)',
+    );
+  });
+
+  test('roadmap_updated is true and ROADMAP.md content actually changes on a genuine removal (#3685)', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap\n\n### Phase 1: Foundation\n**Goal:** Setup\n\n### Phase 2: Auth\n**Goal:** Authentication\n\n## Progress\n\n| Phase | Status |\n|-------|--------|\n| 1 | Done |\n| 2 | Planned |\n`,
+    );
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '01-foundation'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '02-auth'), { recursive: true });
+    const roadmapBefore = fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+
+    const result = runGsdTools('phase remove 2', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const roadmapAfter = fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+    assert.notEqual(roadmapAfter, roadmapBefore, 'precondition: ROADMAP.md content must actually change');
+    const out = JSON.parse(result.output);
+    assert.strictEqual(out.roadmap_updated, true, 'roadmap_updated must be true for a genuine removal');
   });
 });
 
@@ -3323,6 +3933,132 @@ describe('phase complete canonical verification gate (#1522)', () => {
     assert.match(errorPayload.message, /\/gsd-verify-work 0?1/);
     assert.equal(fs.readFileSync(roadmapPath, 'utf-8'), beforeRoadmap);
     assert.equal(fs.readFileSync(statePath, 'utf-8'), beforeState);
+  });
+});
+
+// #3685: cmdPhaseComplete's roadmap_updated/state_updated flags were computed
+// via fs.existsSync(roadmapPath) / fs.existsSync(statePath) — true whenever
+// the file merely EXISTS, even when the transaction rewrote nothing. The
+// sibling requirements_updated (line ~2951 in src/phase.cts) already honors
+// the correct contract: true only when that file's content actually changed
+// in the transaction. Clock is pinned (GSD_TEST_MODE + GSD_NOW_MS) because
+// syncStateFrontmatter stamps a millisecond-resolution `last_updated:` field
+// on every STATE.md write pass — an unpinned second run would genuinely
+// differ by that timestamp alone, masking the no-op these tests need to
+// observe (see .gsd/bug/fix-3685-phase-complete-write-flags/repro-pinned.cjs
+// for the standalone reproduction).
+describe('phase complete write-flag content-change contract (#3685)', () => {
+  let tmpDir;
+  const PINNED_CLOCK_ENV = { GSD_TEST_MODE: '1', GSD_NOW_MS: '1750000000000' };
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  test('roadmap_updated is false when the transaction rewrites nothing (#3685)', () => {
+    writePhaseCompleteVerificationGateFixture(tmpDir, 'passed');
+    const roadmapPath = path.join(tmpDir, '.planning', 'ROADMAP.md');
+
+    const run1 = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir, PINNED_CLOCK_ENV);
+    assert.ok(run1.success, `first phase complete failed: ${run1.error}`);
+    const roadmapAfter1 = fs.readFileSync(roadmapPath, 'utf-8');
+
+    // Second call: phase 1 is already complete, so this is a genuine no-op
+    // against ROADMAP.md. Re-write the passed marker first so the #1522
+    // verification gate does not itself refuse the second call.
+    const run2 = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir, PINNED_CLOCK_ENV);
+    assert.ok(run2.success, `second phase complete failed: ${run2.error}`);
+    const roadmapAfter2 = fs.readFileSync(roadmapPath, 'utf-8');
+
+    assert.equal(roadmapAfter2, roadmapAfter1, 'ROADMAP.md must be byte-identical across the no-op second run');
+    const parsed2 = JSON.parse(run2.output);
+    assert.strictEqual(
+      parsed2.roadmap_updated, false,
+      'fs.existsSync() reported true here, masking the no-op (#3685)',
+    );
+  });
+
+  test('state_updated is false when the transaction rewrites nothing (#3685)', () => {
+    writePhaseCompleteVerificationGateFixture(tmpDir, 'passed');
+    const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+
+    const run1 = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir, PINNED_CLOCK_ENV);
+    assert.ok(run1.success, `first phase complete failed: ${run1.error}`);
+    const stateAfter1 = fs.readFileSync(statePath, 'utf-8');
+
+    const run2 = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir, PINNED_CLOCK_ENV);
+    assert.ok(run2.success, `second phase complete failed: ${run2.error}`);
+    const stateAfter2 = fs.readFileSync(statePath, 'utf-8');
+
+    assert.equal(stateAfter2, stateAfter1, 'STATE.md must be byte-identical across the no-op second run');
+    const parsed2 = JSON.parse(run2.output);
+    assert.strictEqual(
+      parsed2.state_updated, false,
+      'fs.existsSync() reported true here, masking the no-op (#3685)',
+    );
+    const roadmapAfter2 = fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+
+    // Stability across repeats: the flag must not alternate true/false on
+    // successive no-op runs — pin a THIRD call to the same behavior.
+    const run3 = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir, PINNED_CLOCK_ENV);
+    assert.ok(run3.success, `third phase complete failed: ${run3.error}`);
+    const stateAfter3 = fs.readFileSync(statePath, 'utf-8');
+    const roadmapAfter3 = fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+    assert.equal(stateAfter3, stateAfter2, 'STATE.md must remain byte-identical on a third no-op run');
+    assert.equal(roadmapAfter3, roadmapAfter2, 'ROADMAP.md must remain byte-identical on a third no-op run');
+    const parsed3 = JSON.parse(run3.output);
+    assert.strictEqual(parsed3.roadmap_updated, false, 'roadmap_updated must stay false, not alternate, on repeat no-ops (#3685)');
+    assert.strictEqual(parsed3.state_updated, false, 'state_updated must stay false, not alternate, on repeat no-ops (#3685)');
+  });
+
+  test('both write flags are true when the transaction genuinely rewrites (#3685)', () => {
+    writePhaseCompleteVerificationGateFixture(tmpDir, 'passed');
+    const roadmapPath = path.join(tmpDir, '.planning', 'ROADMAP.md');
+    const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+    const roadmapBefore = fs.readFileSync(roadmapPath, 'utf-8');
+    const stateBefore = fs.readFileSync(statePath, 'utf-8');
+
+    const result = runGsdTools(['phase', 'complete', '1'], tmpDir, PINNED_CLOCK_ENV);
+    assert.ok(result.success, `phase complete failed: ${result.error}`);
+    const parsed = JSON.parse(result.output);
+
+    const roadmapAfter = fs.readFileSync(roadmapPath, 'utf-8');
+    const stateAfter = fs.readFileSync(statePath, 'utf-8');
+
+    assert.notEqual(roadmapAfter, roadmapBefore, 'precondition: ROADMAP.md content must actually change');
+    assert.strictEqual(parsed.roadmap_updated, true, 'roadmap_updated must be true for a genuine rewrite');
+    assert.notEqual(stateAfter, stateBefore, 'precondition: STATE.md content must actually change');
+    assert.strictEqual(parsed.state_updated, true, 'state_updated must be true for a genuine rewrite');
+  });
+
+  test('roadmap_updated stays false when ROADMAP.md is absent (#3685)', () => {
+    writePhaseCompleteVerificationGateFixture(tmpDir, 'passed');
+    // Deletes a single fixture FILE inside tmpDir (not the temp dir itself);
+    // helpers.cleanup() is a directory-removal helper and cannot be used here.
+    // eslint-disable-next-line local/no-raw-rmsync-in-tests -- single-file delete, not a directory
+    fs.rmSync(path.join(tmpDir, '.planning', 'ROADMAP.md'));
+
+    const result = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir, PINNED_CLOCK_ENV);
+    assert.ok(result.success, `phase complete failed without ROADMAP.md: ${result.error}`);
+    const parsed = JSON.parse(result.output);
+    assert.strictEqual(parsed.roadmap_updated, false, 'roadmap_updated must be false when ROADMAP.md does not exist (#3685)');
+  });
+
+  test('state_updated stays false when STATE.md is absent (#3685)', () => {
+    writePhaseCompleteVerificationGateFixture(tmpDir, 'passed');
+    // Deletes a single fixture FILE inside tmpDir (not the temp dir itself);
+    // helpers.cleanup() is a directory-removal helper and cannot be used here.
+    // eslint-disable-next-line local/no-raw-rmsync-in-tests -- single-file delete, not a directory
+    fs.rmSync(path.join(tmpDir, '.planning', 'STATE.md'));
+
+    const result = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir, PINNED_CLOCK_ENV);
+    assert.ok(result.success, `phase complete failed without STATE.md: ${result.error}`);
+    const parsed = JSON.parse(result.output);
+    assert.strictEqual(parsed.state_updated, false, 'state_updated must be false when STATE.md does not exist (#3685)');
   });
 });
 
@@ -6611,12 +7347,17 @@ describe('bug-3287 — init plan-phase exposes expected_phase_dir with project_c
     test('full consistency check: all STATE.md fields are coherent after phase.complete', () => {
       setupPhase3517Project(tmpDir);
       const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+      const stateBefore = fs.readFileSync(statePath, 'utf8');
 
       const r = runSdkQuery(['phase.complete', '5'], tmpDir);
       assert.ok(r.success, `call failed: ${r.error}`);
       assert.equal(r.data?.state_updated, true, 'state_updated must be true');
 
       const state = fs.readFileSync(statePath, 'utf8');
+      // #3685: earn the `true` above — assert STATE.md's content actually
+      // changed, not merely that it exists (which is all the pre-fix
+      // existsSync-based flag proved).
+      assert.notEqual(state, stateBefore, '#3685: STATE.md content must actually change when state_updated is true');
 
       const fm = extractFrontmatter(state);
       assert.equal(
@@ -9053,6 +9794,7 @@ const { cleanup, runGsdTools } = require('./helpers.cjs');
 // CJS implementation directly since that is where the bug lives.
 const phaseModule = require('../gsd-core/bin/lib/phase.cjs');
 const { escapeRegex } = require('../gsd-core/bin/lib/pattern.cjs');
+const { splitTableRow } = require('../gsd-core/bin/lib/markdown-table.cjs');
 const { cmdPhaseComplete } = phaseModule;
 
 function writePassedVerificationFile(phaseDir, phase = '01') {
@@ -9177,15 +9919,19 @@ function roadmapCompletionSnapshot(roadmapContent) {
       continue;
     }
 
-    match = line.match(/^\|\s*(\d+[A-Z]?(?:\.\d+)*)\.?\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|$/i);
-    if (match) {
-      snapshot.progressRows.push({
-        phase: match[1].trim(),
-        title: match[2].trim(),
-        plans: match[3].trim(),
-        status: match[4].trim(),
-        completed: match[5].trim(),
-      });
+    if (line.trim().startsWith('|')) {
+      const cells = splitTableRow(line);
+      const phaseTitleMatch = cells.length === 4
+        && /^(\d+[A-Z]?(?:\.\d+)*)\.?\s*(.*)$/i.exec((cells[0] || '').trim());
+      if (phaseTitleMatch) {
+        snapshot.progressRows.push({
+          phase: phaseTitleMatch[1].trim(),
+          title: phaseTitleMatch[2].trim(),
+          plans: cells[1].trim(),
+          status: cells[2].trim(),
+          completed: cells[3].trim(),
+        });
+      }
     }
   }
 
@@ -9623,16 +10369,15 @@ describe('#3511: cmdPhaseComplete — advisory pre-scan warnings are phase-scope
  * 4-col (Phase | Plans | Status | Completed) or 5-col (Phase | Milestone | Plans | Status | Completed).
  */
 function extractCompletedCell(roadmapContent, phaseNum) {
-  // Match the full progress table row whose first cell starts with the phase number.
-  // Use [^|\n] to avoid crossing line boundaries. Capture everything up to the final '|'.
-  const re = new RegExp(`^(\\|\\s*${phaseNum}[^|\\n]*(?:\\|[^|\\n]*)*)\\|\\s*$`, 'm');
-  const m = roadmapContent.match(re);
-  if (!m) return null;
-  // m[1] = '| 01. Foundation | 1/1 | Complete    | 2026-01-01 '
-  // Split on '|' → ['', ' 01. Foundation ', ' 1/1 ', ' Complete    ', ' 2026-01-01 ']
-  // Drop the leading empty string and take the last element.
-  const cells = m[1].split('|').slice(1); // drop leading ''
-  return cells[cells.length - 1].trim();
+  // Find the progress table row whose first cell starts with the phase number.
+  for (const line of roadmapContent.split(/\r?\n/)) {
+    if (!line.trim().startsWith('|')) continue;
+    const cells = splitTableRow(line);
+    if (cells.length > 0 && cells[0].startsWith(String(phaseNum))) {
+      return cells[cells.length - 1].trim();
+    }
+  }
+  return null;
 }
 
 /**
@@ -10950,9 +11695,12 @@ describe('issue #2334: ghost-REQ-ID classification must probe write surfaces, no
           /-\s*\[x\]\s*\*\*KNOWN-01\*\*/i.test(reqContent),
           `#2334 HIGH 2b FAILED (fixture invariant): checkbox must have been ticked.\n${reqContent}`,
         );
+        const traceabilityRow = reqContent.split(/\r?\n/)
+          .filter((l) => l.trim().startsWith('|'))
+          .map((l) => splitTableRow(l))
+          .find((cells) => cells[0] && cells[0].trim().toLowerCase() === 'known-01');
         assert.ok(
-          // eslint-disable-next-line local/no-unbounded-quantifier -- parses REQUIREMENTS.md the test itself wrote via build2334GhostSurfaceFixture, bounded fixed-size fixture, not adversarial input
-          /\|\s*KNOWN-01\s*\|[^|]*\|\s*Complete\s*\|/i.test(reqContent),
+          traceabilityRow && /^Complete$/i.test(traceabilityRow[traceabilityRow.length - 1].trim()),
           `#2334 HIGH 2b FAILED (fixture invariant): Traceability row must have flipped to Complete.\n${reqContent}`,
         );
         assert.strictEqual(parsed.requirements_updated, true, '#2334 HIGH 2b FAILED: requirements_updated must be true');
@@ -11021,6 +11769,1840 @@ describe('issue #2334: ghost-REQ-ID classification must probe write surfaces, no
       }
     },
   );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regressions: issue #3697 — the `**Requirements**:` tokenizer UNDER-selects
+// silently. #2339 fixed OVER-selection (the shape filter) and added the
+// ghost-ID cross-check; neither covers an ID the tokenizer DROPPED. A spaced
+// range (`RANGE-01 … RANGE-05`) survives the `[,\s]+` split as its two
+// endpoints and marks only those; a tight range (`RANGE-01…05`) survives as one
+// token, fails the anchored shape filter, and marks nothing. Both paths report
+// success with `warnings: []`, because `ghostReqIds` is itself
+// `citedReqIds.filter(...)` and so cannot see an ID that was never selected.
+//
+// The fix warns; it does not parse. The selected set is unchanged (range syntax
+// stays unsupported), and the trigger is ID-SHAPED EVIDENCE only — the #2334 /
+// #2339 over-warning on `None`, on the shipped `<!-- ... -->` template comment,
+// and on parenthetical annotations must not return.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REQ_LINE_MISPARSE_RE = /could not be parsed as a comma-separated REQ-ID list/i;
+// The AMBIGUOUS channel, added in round 3. A spaced separator between two
+// selected, interior-implying REQ-IDs cannot be told from a range by any
+// token-level rule, and every ID on such a line IS selected — so the warning
+// discloses both readings instead of asserting a parse failure that did not
+// happen. See `formatRequirementsLineWarning` in src/phase.cts.
+const REQ_LINE_RANGE_READING_RE = /contains what reads as a range between two cited REQ-IDs/i;
+
+function build3697RangeFixture(roadmapRequirementsLine) {
+  return build2334GhostSurfaceFixture({
+    reqBody: [
+      '## Functional Requirements',
+      '',
+      '- [ ] **RANGE-01**: synthetic fixture requirement 1.',
+      '- [ ] **RANGE-02**: synthetic fixture requirement 2.',
+      '- [ ] **RANGE-03**: synthetic fixture requirement 3.',
+      '- [ ] **RANGE-04**: synthetic fixture requirement 4.',
+      '- [ ] **RANGE-05**: synthetic fixture requirement 5.',
+    ],
+    roadmapRequirementsLine,
+    traceabilityRows: [
+      '| RANGE-01 | Phase 01 | Pending |',
+      '| RANGE-02 | Phase 01 | Pending |',
+      '| RANGE-03 | Phase 01 | Pending |',
+      '| RANGE-04 | Phase 01 | Pending |',
+      '| RANGE-05 | Phase 01 | Pending |',
+    ],
+  });
+}
+
+const tickedReqIds = (reqContent) =>
+  [...reqContent.matchAll(/-\s*\[x\]\s*\*\*(RANGE-\d+)\*\*/gi)].map((m) => m[1].toUpperCase());
+
+describe('issue #3697: phase complete must warn when the Requirements line under-selects', () => {
+  for (const [label, line] of [
+    ['ellipsis', 'RANGE-01 … RANGE-05'],
+    ['hyphen', 'RANGE-01 - RANGE-05'],
+    ['worded', 'RANGE-01 through RANGE-05'],
+    ['parenthesized operator', 'RANGE-01 (..) RANGE-05'],
+  ]) {
+    test(
+      `#3697-1 (${label} spaced range): a range that survives the split as its two endpoints must warn — ` +
+      'and the endpoint-only marking behavior itself is UNCHANGED',
+      (t) => {
+        const tmpDir = build3697RangeFixture(line);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        assert.ok(
+          warnings.some((w) => REQ_LINE_RANGE_READING_RE.test(w)),
+          `#3697-1 FAILED (${label}): a spaced range marks ONLY its endpoints, so it must warn. ` +
+          `Got warnings: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+        );
+        assert.strictEqual(
+          parsed.has_warnings, true,
+          `#3697-1 FAILED (${label}): has_warnings must be true, got: ${JSON.stringify(parsed)}`,
+        );
+        // The warning must name what WAS selected, so the author can see the gap.
+        assert.ok(
+          warnings.some(
+            (w) => REQ_LINE_RANGE_READING_RE.test(w) && /RANGE-01/.test(w) && /RANGE-05/.test(w),
+          ),
+          `#3697-1 FAILED (${label}): the warning must name the IDs actually selected ` +
+          `(RANGE-01, RANGE-05), got: ${JSON.stringify(warnings)}`,
+        );
+        // Round 3 (review finding Major 3): nothing on this line was dropped —
+        // both endpoints were selected — so the warning must NOT assert that
+        // the line failed to parse. It offers the range reading and the
+        // annotation reading and lets the author choose.
+        assert.ok(
+          !warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w)),
+          `#3697-1 FAILED (${label}): a spaced range drops nothing the tokenizer could have taken, ` +
+          `so the misparse channel must stay silent, got: ${JSON.stringify(warnings)}`,
+        );
+        // Behavior guard: this is a warning, NOT range support. Exactly the two
+        // endpoints stay ticked; the interior IDs are still not expanded.
+        const reqContent = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+        assert.deepStrictEqual(
+          tickedReqIds(reqContent).sort(), ['RANGE-01', 'RANGE-05'],
+          `#3697-1 FAILED (${label}): the selected set must be UNCHANGED (endpoints only — ranges are ` +
+          `deliberately not expanded).\nREQUIREMENTS.md:\n${reqContent}`,
+        );
+      },
+    );
+  }
+
+  for (const [label, line] of [
+    ['ellipsis', 'RANGE-01…05'],
+    ['double-dot', 'RANGE-01..RANGE-05'],
+  ]) {
+    test(
+      `#3697-2 (${label} tight range): a line that selects ZERO IDs while being non-empty and not TBD ` +
+      'must warn, and must write nothing to the ledger',
+      (t) => {
+        const tmpDir = build3697RangeFixture(line);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        assert.ok(
+          warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w)),
+          `#3697-2 FAILED (${label}): a zero-selection line is completely inert and must warn. ` +
+          `Got warnings: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+        );
+        assert.ok(
+          warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w) && /RANGE-01/.test(w)),
+          `#3697-2 FAILED (${label}): the warning must name the unparsed ID-shaped text, ` +
+          `got: ${JSON.stringify(warnings)}`,
+        );
+        assert.strictEqual(
+          parsed.requirements_updated, false,
+          `#3697-2 FAILED (${label}): nothing was selected, so requirements_updated must be false, ` +
+          `got: ${JSON.stringify(parsed)}`,
+        );
+        const reqContent = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+        assert.deepStrictEqual(
+          tickedReqIds(reqContent), [],
+          `#3697-2 FAILED (${label}): no checkbox may be ticked.\nREQUIREMENTS.md:\n${reqContent}`,
+        );
+      },
+    );
+  }
+
+  for (const [label, line] of [
+    ['bare comma list', 'RANGE-01, RANGE-02, RANGE-03, RANGE-04, RANGE-05'],
+    ['bracketed comma list', '[RANGE-01, RANGE-02, RANGE-03, RANGE-04, RANGE-05]'],
+  ]) {
+    test(
+      `#3697-3 (control, ${label}): the canonical form must mark every ID and must not warn`,
+      (t) => {
+        const tmpDir = build3697RangeFixture(line);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        // Whole-channel assertion: the fixture registers every cited ID, so
+        // there is NO legitimate warning here. Filtering by the current
+        // phrase would let a re-worded over-warning slip through (review
+        // claim 8) — assert actual silence, not absence of one wording.
+        assert.deepStrictEqual(
+          warnings, [],
+          `#3697-3 FAILED (${label}): the canonical comma list must never warn, ` +
+          `got: ${JSON.stringify(warnings)}`,
+        );
+        const reqContent = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+        assert.deepStrictEqual(
+          tickedReqIds(reqContent).sort(),
+          ['RANGE-01', 'RANGE-02', 'RANGE-03', 'RANGE-04', 'RANGE-05'],
+          `#3697-3 FAILED (${label}): all five requirements must be ticked.\n` +
+          `REQUIREMENTS.md:\n${reqContent}`,
+        );
+      },
+    );
+  }
+
+  // The #2334/#2339 over-warning must not return. The trigger is ID-shaped
+  // evidence — NOT "the line has residue after the selected IDs are removed",
+  // which is exactly the check that once warned to register `<!--`, `brackets`,
+  // `optional` and the literal word `None`.
+  for (const [label, line] of [
+    ['TBD placeholder', 'TBD'],
+    ['literal None', 'None'],
+    ['shipped template comment', '[RANGE-01, RANGE-02]  <!-- brackets optional, remove if unused -->'],
+    ['parenthetical citation', 'RANGE-01, RANGE-02 (locked per ADR-7)'],
+    // The next four are the false-positive classes a free-text detector
+    // produced (the #2334/#2339 regression shape): a hyphen after the list is
+    // an ANNOTATION separator, not a range operator, whenever what follows is
+    // not itself a REQ-ID — and an ID-shaped citation on a correctly-parsed
+    // line is a citation, not unparsed residue.
+    ['numeric estimate annotation', 'RANGE-01, RANGE-02 - 3 points'],
+    ['date annotation', 'RANGE-01, RANGE-02 - 2026-08-21 target'],
+    ['em-dash citation with trailing period', 'RANGE-01, RANGE-02 — locked per ADR-7.'],
+    ['nested parenthetical citations', 'RANGE-01, RANGE-02 (see (ADR-7), then ADR-8)'],
+    // A hyphen between two ADJACENT selected IDs can drop nothing (there is no
+    // interior), so it reads as an annotation separator, not a range.
+    ['adjacent-ID annotation hyphen', 'RANGE-01, RANGE-02 - RANGE-03 deferred'],
+    // Cross-prefix pairs around a separator are annotations, not ranges — real
+    // ranges are same-prefix by nature.
+    ['hyphen citation annotation', 'RANGE-01, RANGE-02 - (ADR-7)'],
+    ['ellipsis-of-omission with citation', 'RANGE-01, RANGE-02 (...) (ADR-7)'],
+    // Markdown emphasis around a placeholder must not defeat the placeholder
+    // gate.
+    ['bold placeholder with citation', '**None** (per ADR-7)'],
+    // `LETTERS-\d+-\d+` is also a date: the bare-hyphen tight-range arm demands
+    // a full ID on both sides precisely so this stays silent.
+    ['date-like parenthetical annotation', 'RANGE-01 (target FY-2026-08)'],
+    // A declared-empty line citing its rationale — zero selection with ID-shaped
+    // text, but placeholder-led. The #2334 class R3 must not recreate.
+    ['None with citation', 'None (per ADR-7)'],
+    ['TBD with citation', 'TBD (see ADR-7)'],
+  ]) {
+    test(
+      `#3697-4 (negative space, ${label}): must stay silent — the historical over-warning must not return`,
+      (t) => {
+        const tmpDir = build3697RangeFixture(line);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        // Whole-channel assertion, same rationale as #3697-3: every ID these
+        // fixtures cite is registered, so nothing here may warn at all. A
+        // phrase-filtered check pins wording, not silence (review claim 8).
+        assert.deepStrictEqual(
+          warnings, [],
+          `#3697-4 FAILED (${label}): ${JSON.stringify(line)} must not produce ANY warning, ` +
+          `got: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+        );
+      },
+    );
+  }
+
+  // A range hidden INSIDE balanced parentheses is stripped by the token shave
+  // and must still warn (review claim 2's first reproduction: the selector
+  // sees only `RANGE-01`, and v1's scan saw nothing at all). Partial
+  // selection: exactly RANGE-01 is ticked; the range token is reported as
+  // unparsed; nothing is expanded.
+  for (const [label5, line5] of [
+    ['parenthesized', 'RANGE-01 (plus RANGE-02..RANGE-05)'],
+    ['backticked', 'RANGE-01, `RANGE-02..RANGE-05`'],
+    ['bold-wrapped', 'RANGE-01, **RANGE-02..RANGE-05**'],
+    ['underscore-wrapped', 'RANGE-01, _RANGE-02..RANGE-05_'],
+  ]) {
+  test(
+    `#3697-5 (${label5} tight range): a wrapped range must still warn and stay unexpanded`,
+    (t) => {
+      const tmpDir = build3697RangeFixture(line5);
+      t.after(() => cleanup(tmpDir));
+      const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+      const parsed = JSON.parse(output);
+      const warnings = parsed.warnings || [];
+      assert.ok(
+        warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w)),
+        `#3697-5 FAILED (${label5}): the wrapped range selects only RANGE-01, so it must warn. ` +
+        `Got warnings: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+      );
+      assert.ok(
+        warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w) && /RANGE-02\.\.RANGE-05/.test(w)),
+        `#3697-5 FAILED (${label5}): the warning must name the unparsed range token ` +
+        `(RANGE-02..RANGE-05), got: ${JSON.stringify(warnings)}`,
+      );
+      const reqContent = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+      assert.deepStrictEqual(
+        tickedReqIds(reqContent), ['RANGE-01'],
+        `#3697-5 FAILED (${label5}): exactly RANGE-01 must be ticked (no expansion, no extra writes).\n` +
+        `REQUIREMENTS.md:\n${reqContent}`,
+      );
+    },
+  );
+  }
+
+  // A valid prefix-agnostic ID that HAPPENS to start with a word operator
+  // (`TORANGE-05` reads as `to` + `RANGE-05`) is an ID, not a glued range —
+  // the glued-fragment rule is symbol-operator-only for exactly this reason.
+  // The ID is unregistered in this fixture, so the pre-existing ghost-ID
+  // warning legitimately fires; only the misparse channel must stay silent.
+  test(
+    '#3697-4b (word-operator-prefixed ID): a canonical list must not read as a glued range',
+    (t) => {
+      const tmpDir = build3697RangeFixture('RANGE-01, TORANGE-05');
+      t.after(() => cleanup(tmpDir));
+      const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+      const parsed = JSON.parse(output);
+      const warnings = parsed.warnings || [];
+      // Round 4 review Minor 1: this asserted only that the ASSERTIVE channel
+      // stayed silent, so a regression routing the line into the AMBIGUOUS
+      // channel would have passed. Whole-channel silence is not available here
+      // — the pre-existing ghost-ID warning legitimately fires on the
+      // unregistered `TORANGE-05` — so the precise assertion is that NO
+      // Requirements-line warning of ANY kind was emitted. The machine code
+      // added in this round is what makes that statable at all.
+      assert.strictEqual(
+        parsed.requirements_line_warning, undefined,
+        `#3697-4b FAILED: "RANGE-01, TORANGE-05" is a comma list of two valid IDs and must not ` +
+        `produce a Requirements-line warning in ANY channel, got kind ` +
+        `${JSON.stringify(parsed.requirements_line_warning)} / ${JSON.stringify(warnings)}\n` +
+        `Full output: ${output}`,
+      );
+    },
+  );
+
+  // ==========================================================================
+  // #3697-14 — AC-1b / AC-4: zero selection on a non-placeholder line.
+  //
+  // The issue's narrow clause verbatim: "warn when `citedReqIds.length === 0`
+  // while the raw capture is non-empty and not `TBD`". Before R3b these five
+  // words selected nothing and stayed SILENT, while the CLI-TOOLS reference's
+  // Requirements-line grammar section, the `placeholderLed` census comment and
+  // the advice string all stated they warned — a claim written into three
+  // artifacts and never executed once. (Named without spelling the doc's path:
+  // the docs-guard exemption ratchet fingerprints literal docs/ references in
+  // exempt test files, and this test reads no documentation.)
+  // The asymmetry was the tell: `Deferred (see ADR-7)` warned (the citation
+  // supplied ID-shaped residue) while bare `Deferred` did not.
+  // ==========================================================================
+  for (const [label14, line14] of [
+    ['Deferred', 'Deferred'],
+    ['N/A', 'N/A'],
+    ['Pending', 'Pending'],
+    ['TBA', 'TBA'],
+    ['bare dash', '-'],
+    // Prose with no ID-shaped token anywhere — the class R3's ID-shape gate
+    // could never reach, whatever the wording.
+    ['free prose', 'to be scoped after the spike'],
+  ]) {
+    test(
+      `#3697-14 (zero selection, ${label14}): a non-empty, non-placeholder line that selects NO ` +
+      'REQ-IDs must warn — #3697 AC-1b/AC-4',
+      (t) => {
+        const tmpDir = build3697RangeFixture(line14);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        assert.ok(
+          warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w)),
+          `#3697-14 FAILED (${label14}): ${JSON.stringify(line14)} is non-empty, is not a ` +
+          `placeholder and selects zero REQ-IDs, so it must warn. ` +
+          `Got warnings: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+        );
+        // The warning must name the escape the author actually has, or it
+        // reports a problem with no remedy.
+        assert.ok(
+          warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w) && /`TBD` or `None`/.test(w)),
+          `#3697-14 FAILED (${label14}): the warning must name the TBD/None placeholder escape, ` +
+          `got: ${JSON.stringify(warnings)}`,
+        );
+        // Selection behavior is UNCHANGED — this rule warns, it never invents IDs.
+        const reqContent = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+        assert.deepStrictEqual(
+          tickedReqIds(reqContent), [],
+          `#3697-14 FAILED (${label14}): a zero-selection line must tick NOTHING.\n` +
+          `REQUIREMENTS.md:\n${reqContent}`,
+        );
+      },
+    );
+  }
+
+  // The placeholder gate is what holds the whole #2334 negative space silent
+  // under R3b, so it is pinned in every spelling an author actually writes.
+  // Whole-channel silence, same rationale as #3697-4: a phrase filter pins
+  // wording, not silence.
+  for (const [label14b, line14b] of [
+    ['lowercase tbd', 'tbd'],
+    ['lowercase none', 'none'],
+    ['bold None only', '**None**'],
+    ['backticked TBD', '`TBD`'],
+    ['TBD with trailing note', 'TBD  <!-- pending scoping -->'],
+  ]) {
+    test(
+      `#3697-14b (placeholder spelling, ${label14b}): the placeholder gate must hold R3b off`,
+      (t) => {
+        const tmpDir = build3697RangeFixture(line14b);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        assert.deepStrictEqual(
+          warnings, [],
+          `#3697-14b FAILED (${label14b}): ${JSON.stringify(line14b)} is a declared-empty line and ` +
+          `must produce NO warning at all, got: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+        );
+      },
+    );
+  }
+
+  // R3b's `tokens.length > 0` guard. The tokenizer strips `<!-- ... -->`
+  // BEFORE splitting, so a comment-only line yields no tokens and cannot
+  // reach the rule — without this guard the shipped template's own comment
+  // line would warn, which is #2334's opening move.
+  test(
+    '#3697-14c (comment-only line): a line whose only content is a template comment stays silent',
+    (t) => {
+      const tmpDir = build3697RangeFixture('<!-- fill in once the spike lands -->');
+      t.after(() => cleanup(tmpDir));
+      const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+      const parsed = JSON.parse(output);
+      const warnings = parsed.warnings || [];
+      assert.deepStrictEqual(
+        warnings, [],
+        `#3697-14c FAILED: a comment-only Requirements line has no content tokens and must not ` +
+        `warn, got: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+      );
+    },
+  );
+
+  // ==========================================================================
+  // #3697-15 — AC-1a: a REQ-ID the selector dropped to a glued delimiter.
+  //
+  // `RANGE-01; RANGE-02` selects only RANGE-02 and marks only RANGE-02, with
+  // `requirements_updated: true` — #3697's own half-success failure mode,
+  // reached by one wrong delimiter, and silent before this rule.
+  //
+  // Round 4 review rated this Major rather than Blocker on the ground that it
+  // is indistinguishable from a parenthesised citation (`(ADR-7)` shaves to a
+  // bare ID too). At the RAW token level it is distinguishable: the shave
+  // class differs, and -15b pins the citation half.
+  // ==========================================================================
+  for (const [label15, line15, expectTicked15, expectNamed15] of [
+    ['semicolon', 'RANGE-01; RANGE-02', ['RANGE-02'], ['RANGE-01']],
+    ['colon', 'RANGE-01: RANGE-02', ['RANGE-02'], ['RANGE-01']],
+    // Every dropped ID is named, not just the first — the chain is what
+    // catches a clause that reports only one and reads as complete.
+    ['semicolon chain', 'RANGE-01; RANGE-02; RANGE-03', ['RANGE-03'], ['RANGE-01', 'RANGE-02']],
+    // The drop can be the LAST id as easily as the first.
+    ['trailing colon', 'RANGE-01, RANGE-02:', ['RANGE-01'], ['RANGE-02']],
+  ]) {
+    test(
+      `#3697-15 (delimiter-dropped ID, ${label15}): an ID the selector dropped to a glued ` +
+      '`;`/`:` must warn and be named — selection is UNCHANGED',
+      (t) => {
+        const tmpDir = build3697RangeFixture(line15);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        assert.ok(
+          warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w)),
+          `#3697-15 FAILED (${label15}): ${JSON.stringify(line15)} silently drops an ID, so it ` +
+          `must warn. Got warnings: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+        );
+        // Naming the dropped ID is the whole point — a warning that says
+        // "something was dropped" without saying WHAT is not actionable.
+        const expectedClause15 =
+          `${expectNamed15.join(', ')} ${expectNamed15.length === 1 ? 'was' : 'were'} NOT selected`;
+        assert.ok(
+          warnings.some((w) => w.includes(expectedClause15)),
+          `#3697-15 FAILED (${label15}): the warning must name EVERY dropped ID — expected the ` +
+          `clause ${JSON.stringify(expectedClause15)}, got: ${JSON.stringify(warnings)}`,
+        );
+        // The selector is untouched by this PR — the rule warns, it never
+        // widens what gets marked.
+        const reqContent = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+        assert.deepStrictEqual(
+          tickedReqIds(reqContent), expectTicked15,
+          `#3697-15 FAILED (${label15}): exactly ${JSON.stringify(expectTicked15)} must be ticked — ` +
+          `the warning must not change the selection.\nREQUIREMENTS.md:\n${reqContent}`,
+        );
+      },
+    );
+  }
+
+  // The rule's boundary, and the reason it is safe to ship. A delimiter glued
+  // to an ID-shaped token INSIDE a parenthetical is a citation, not a dropped
+  // requirement, and reporting it is the #2334 over-warning class. Whole
+  // channel, because there is nothing on these lines to warn about at all.
+  for (const [label15b, line15b] of [
+    ['colon in citation', 'RANGE-01, RANGE-02 (see ADR-7: section 3)'],
+    ['semicolon in citation', 'RANGE-01, RANGE-02 (see ADR-7; also ADR-9)'],
+    ['nested colon note', 'RANGE-01, RANGE-02 (blocked: ADR-7: sec 3)'],
+  ]) {
+    test(
+      `#3697-15b (citation boundary, ${label15b}): a delimiter inside a parenthetical is a ` +
+      'citation, not a dropped requirement',
+      (t) => {
+        const tmpDir = build3697RangeFixture(line15b);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        assert.deepStrictEqual(
+          warnings, [],
+          `#3697-15b FAILED (${label15b}): ${JSON.stringify(line15b)} is a correctly-parsed comma ` +
+          `list carrying a citation and must produce NO warning, got: ${JSON.stringify(warnings)}\n` +
+          `Full output: ${output}`,
+        );
+      },
+    );
+  }
+
+  // ==========================================================================
+  // #3697-16 — the warning's machine kind reaches the JSON output (round 4
+  // review Major 3).
+  //
+  // `warnings[]` stays a string[] — it is a documented output field rendered by
+  // execute-phase.md, so re-typing its elements would break a shipped
+  // contract. The kind is emitted as its own additive field, and THAT is what
+  // a consumer and a test key on. Rewording a message must not silently
+  // un-assert anything.
+  // ==========================================================================
+  for (const [label16, line16, expectCode16] of [
+    ['assertive / misparse', 'RANGE-01..RANGE-05', 'req-line-misparse'],
+    ['ambiguous / range reading', 'RANGE-01 … RANGE-05', 'req-line-range-reading'],
+    ['zero selection', 'Deferred', 'req-line-misparse'],
+    ['delimiter drop', 'RANGE-01; RANGE-02', 'req-line-misparse'],
+  ]) {
+    test(
+      `#3697-16 (warning kind, ${label16}): the JSON result carries a stable machine code`,
+      (t) => {
+        const tmpDir = build3697RangeFixture(line16);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        assert.ok(
+          parsed.requirements_line_warning,
+          `#3697-16 FAILED (${label16}): a warning fired, so the result must carry ` +
+          `requirements_line_warning.\nFull output: ${output}`,
+        );
+        assert.strictEqual(
+          parsed.requirements_line_warning.code, expectCode16,
+          `#3697-16 FAILED (${label16}): wrong kind for ${JSON.stringify(line16)}.\n` +
+          `Full output: ${output}`,
+        );
+        // The prose channel is UNCHANGED — this field is additive, and a
+        // consumer reading warnings[] must see exactly what it saw before.
+        assert.ok(
+          Array.isArray(parsed.warnings) && parsed.warnings.every((w) => typeof w === 'string'),
+          `#3697-16 FAILED (${label16}): warnings[] must remain a string[]; ` +
+          `got ${JSON.stringify(parsed.warnings)}`,
+        );
+      },
+    );
+  }
+
+  // The absent half. A field that is present on every run carries no
+  // information, and a consumer keying on its presence would be wrong forever.
+  test(
+    '#3697-16b (clean line): no warning kind is emitted when the line parses',
+    (t) => {
+      const tmpDir = build3697RangeFixture('RANGE-01, RANGE-02, RANGE-03, RANGE-04, RANGE-05');
+      t.after(() => cleanup(tmpDir));
+      const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+      const parsed = JSON.parse(output);
+      assert.strictEqual(
+        parsed.requirements_line_warning, undefined,
+        `#3697-16b FAILED: a clean Requirements line must emit no warning kind at all, got ` +
+        `${JSON.stringify(parsed.requirements_line_warning)}\nFull output: ${output}`,
+      );
+    },
+  );
+
+  // ==========================================================================
+  // #3697-17 — PARITY PIN against the SECOND parser of the same ROADMAP value.
+  //
+  // CLAUDE.md, KNOWN DEFECTS & ANTI-PATTERNS: "Generative Fix Divergence: when
+  // sharing constants/arrays/parsers between parallel surfaces, add a parity
+  // assertion test that fails if they diverge." Round 4 review Major 2.
+  //
+  // `normalizePhaseReqIds` (src/gap-checker.cts) parses the SAME
+  // `**Requirements:**` value — its own docblock says callers "may pass the
+  // roadmap value through verbatim". The two parsers do NOT agree today, and
+  // this PR does not make them agree: `phase complete` writes a ledger, gap
+  // analysis reports coverage, and unifying them would change what
+  // `phase complete` MARKS, which is the one invariant this PR holds fixed.
+  //
+  // So this is the pin, not the fix: every axis of disagreement is asserted
+  // explicitly, in BOTH directions, so drift on either side fails here rather
+  // than silently widening. The consequence is already user-visible — see
+  // -17b — and the pin is what makes it a known quantity instead of a slow
+  // leak.
+  // ==========================================================================
+  const { normalizePhaseReqIds } = require('../gsd-core/bin/lib/gap-checker.cjs');
+  const phaseSelects = (line) => analyzeRequirementsLine(line).citedReqIds;
+
+  for (const [axis, line17, expectPhase, expectGap, why] of [
+    [
+      'ranges',
+      'RANGE-01..RANGE-05',
+      [],
+      ['RANGE-01', 'RANGE-02', 'RANGE-03', 'RANGE-04', 'RANGE-05'],
+      'DELIBERATE: #3697 explicitly declines range expansion ("I am not asking for range syntax ' +
+      'to be supported"); gap analysis expanded ranges under #1269. This PR warns on the shape ' +
+      'rather than adopting it.',
+    ],
+    [
+      'placeholder vocabulary',
+      'None (per ADR-7)',
+      [],
+      ['ADR-7'],
+      'DIVERGENT: phase complete reads the LEAD token, so a declared-empty line citing its ' +
+      'rationale is empty. gap-checker strips parentheses first, so the whole value is no longer ' +
+      'the bare placeholder and the citation survives its ID-shape filter as a requirement.',
+    ],
+    [
+      'parentheses',
+      '(REQ-02)',
+      [],
+      ['REQ-02'],
+      'DIVERGENT: the selector strips square brackets only; gap-checker strips quotes, brackets ' +
+      'AND parentheses.',
+    ],
+    [
+      'ID shape',
+      'REQ-01a',
+      [],
+      ['REQ-01a'],
+      'DIVERGENT: the selector requires the token to END in digits; PHASE_REQ_ID_SHAPE_RE is ' +
+      'wider and admits a trailing suffix.',
+    ],
+    [
+      'the canonical form',
+      'REQ-01, REQ-02',
+      ['REQ-01', 'REQ-02'],
+      ['REQ-01', 'REQ-02'],
+      'AGREEMENT: on the shipped template form the two parsers agree exactly, which is what ' +
+      'makes the divergences above a boundary rather than chaos.',
+    ],
+  ]) {
+    test(`#3697-17 (parser parity, ${axis}): the divergence is pinned in both directions`, () => {
+      assert.deepStrictEqual(
+        phaseSelects(line17), expectPhase,
+        `#3697-17 FAILED (${axis}): phase complete's selection drifted for ${JSON.stringify(line17)}.\n${why}`,
+      );
+      assert.deepStrictEqual(
+        normalizePhaseReqIds(line17), expectGap,
+        `#3697-17 FAILED (${axis}): gap-checker's normalization drifted for ${JSON.stringify(line17)}.\n${why}`,
+      );
+    });
+  }
+
+  // The consequence, made concrete. This is what the divergence COSTS a user,
+  // and it is the reason the pin above is worth its cost: on one line, two
+  // commands report contradictory scopes, and this PR is what makes the
+  // contradiction visible by finally giving `phase complete` a voice.
+  test(
+    '#3697-17b (user-visible contradiction): a range line reports five requirements to gap ' +
+    'analysis and zero to phase complete',
+    () => {
+      const line = 'RANGE-01..RANGE-05';
+      const a = analyzeRequirementsLine(line);
+      assert.deepStrictEqual(a.citedReqIds, [], '#3697-17b: phase complete selects nothing');
+      assert.strictEqual(a.warn, true, '#3697-17b: and now says so, rather than failing silently');
+      assert.strictEqual(
+        normalizePhaseReqIds(line).length, 5,
+        '#3697-17b: while gap analysis reports five requirements in scope for the same line',
+      );
+    },
+  );
+
+  // ==========================================================================
+  // #3697-18 — the skipped-text rider must not tell the author to check
+  // whether a DATE is a requirement (round 4 review Minor 2).
+  //
+  // This round first answered it with a FILTER, and the pre-push review's
+  // continuation broke that in both directions: `API-2-01` is a legal
+  // requirement id (gap-checker's parseRequirements accepts it) so the filter
+  // hid a real drop, while `FY-26-08` and `FY-2026-08-15` leaked through. No
+  // regex separates a date from a sub-numbered id — they are the same shape,
+  // which is exactly why the strict-dash range rule refuses to act on it.
+  //
+  // So the rider DISCLOSES instead of adjudicating: it names the token and
+  // says why it may not be a requirement. Same move the two warning voices
+  // already make about an ambiguous separator.
+  // ==========================================================================
+  for (const [label18, line18, expectNamed18] of [
+    ['date beside a dotted range', 'RANGE-01 .. RANGE-05 (target FY-2026-08)', 'FY-2026-08'],
+    ['multi-segment date', 'RANGE-01 .. RANGE-05 (target FY-2026-08-15)', 'FY-2026-08-15'],
+    ['short-year date', 'RANGE-01 … RANGE-05 due FY-26-08', 'FY-26-08'],
+    ['sub-numbered requirement', 'RANGE-01 .. RANGE-05, API-2-01', 'API-2-01'],
+    ['four-digit sub-number', 'RANGE-01 .. RANGE-05, API-2026-08', 'API-2026-08'],
+  ]) {
+    test(
+      `#3697-18 (ambiguous numeric shape, ${label18}): named, and qualified rather than adjudicated`,
+      () => {
+        const a = analyzeRequirementsLine(line18);
+        const w = reqLineText(formatRequirementsLineWarning('1', line18, a));
+        assert.ok(w, `#3697-18 (${label18}): the range rule fired, so the line warns`);
+        // NAMED — suppressing it hid a genuinely dropped requirement.
+        assert.ok(
+          w.includes(expectNamed18),
+          `#3697-18 FAILED (${label18}): ${expectNamed18} must be named — a filter here hid a real ` +
+          `dropped requirement: ${w}`,
+        );
+        // QUALIFIED — the author is told why it may not be a requirement,
+        // instead of the warning deciding for them in either direction.
+        assert.match(
+          w,
+          /may equally be a date or a sub-numbered id/i,
+          `#3697-18 FAILED (${label18}): the shape is undecidable and the rider must say so: ${w}`,
+        );
+      },
+    );
+  }
+
+  // The other half: an UNAMBIGUOUS dropped id is named with no hedge attached.
+  test('#3697-18b (unambiguous skip): a plain dropped REQ-ID is named without the date caveat', () => {
+    const line = 'REQ-01, (REQ-02), REQ-03 — REQ-05';
+    const a = analyzeRequirementsLine(line);
+    const w = reqLineText(formatRequirementsLineWarning('1', line, a));
+    assert.match(
+      w, /ID-shaped text on the line that was NOT selected: REQ-02/i,
+      `#3697-18b FAILED: REQ-02 is a real skipped ID and must be named: ${w}`,
+    );
+    assert.doesNotMatch(
+      w, /may equally be a date/i,
+      `#3697-18b FAILED: REQ-02 is not the ambiguous shape and must carry no caveat: ${w}`,
+    );
+  });
+
+  // ==========================================================================
+  // #3697-19 — findings from this round's OWN pre-push adversarial review.
+  //
+  // Four claims this round made were driven and refuted before the push. Each
+  // is pinned here, because every one of them was a shape the author had not
+  // probed — the rules were correct across the probe set and wrong just
+  // outside it.
+  // ==========================================================================
+
+  // (1) An INVISIBLE line is an empty line. A lone U+200B carried a token to
+  // the parser while reading as empty to the author, so R3b warned and nothing
+  // on screen explained why.
+  for (const [label19, line19] of [
+    ['zero-width space', '\u200B'],
+    ['two zero-width spaces', '\u200B\u200B'],
+    ['word joiner', '\u2060'],
+    ['BOM', '\uFEFF'],
+    // All four below were driven by the pre-push review's continuation against
+    // a strip set that covered only the first four.
+    ['soft hyphen', '\u00AD'],
+    ['left-to-right mark', '\u200E'],
+    ['left-to-right isolate', '\u2066'],
+    ['variation selector 16', '\uFE0F'],
+  ]) {
+    test(`#3697-19 (invisible content, ${label19}): a line the author cannot see is not content`, () => {
+      const a = analyzeRequirementsLine(line19);
+      assert.strictEqual(
+        a.warn, false,
+        `#3697-19 FAILED (${label19}): an invisible-only line must not warn — no author could act on it`,
+      );
+    });
+  }
+
+  // A zero-width character INSIDE an otherwise valid line must be stripped, not
+  // treated as a delimiter: splitting on it would fabricate two fragments from
+  // one ID and invent a drop that never happened.
+  // An invisible INSIDE a token breaks it for the SELECTOR, so the id is
+  // genuinely not marked — #3697's own defect, in its most undetectable form.
+  //
+  // The first cut of this fix stripped invisibles from the detector wholesale
+  // and made exactly this case go SILENT, and the test written for it asserted
+  // the tokens and the empty R4 result while never asserting `warn` — it
+  // DOCUMENTED the bug instead of catching it. That omission was the pre-push
+  // review's `MISSED:` finding. The assertion below is the one that was absent.
+  for (const [label19b, line19b] of [
+    ['zero-width space', 'REQ-01\u200B, REQ-02'],
+    ['soft hyphen', 'REQ-01\u00AD, REQ-02'],
+    ['zero-width joiner', 'REQ-01\u200D, REQ-02'],
+  ]) {
+    test(`#3697-19b (embedded invisible, ${label19b}): an unmarkable id must never be silent`, () => {
+      const a = analyzeRequirementsLine(line19b);
+      assert.deepStrictEqual(
+        a.citedReqIds, ['REQ-02'],
+        `#3697-19b (${label19b}): the selector really does drop REQ-01 — selection is unchanged by this round`,
+      );
+      assert.strictEqual(
+        a.warn, true,
+        `#3697-19b FAILED (${label19b}): an id dropped to an INVISIBLE character is the least ` +
+        `detectable form of #3697's own defect and must not stay silent`,
+      );
+      assert.deepStrictEqual(
+        a.delimiterDroppedIds, ['REQ-01'],
+        `#3697-19b (${label19b}): and it must be NAMED — the author cannot see the character`,
+      );
+    });
+  }
+
+  // (2) R4's false positive. A BARE citation carrying a colon is the same shave
+  // class as a real delimiter drop, and the parenthetical test does not reach
+  // it. Same-prefix agreement with a SELECTED id is what separates them.
+  for (const [label19c, line19c] of [
+    ['bare citation', 'REQ-01, see ADR-7: section 3'],
+    ['bare citation, no verb', 'REQ-01, ADR-7: section 3'],
+    ['parenthesised citation', 'RANGE-01, RANGE-02 (see ADR-7: sec 3)'],
+  ]) {
+    test(`#3697-19c (citation boundary, ${label19c}): a foreign-prefix citation is not a dropped requirement`, () => {
+      const a = analyzeRequirementsLine(line19c);
+      assert.deepStrictEqual(
+        a.delimiterDroppedIds, [],
+        `#3697-19c FAILED (${label19c}): ${JSON.stringify(line19c)} cites a foreign prefix; ` +
+        `reporting it is the #2334 over-warning class`,
+      );
+    });
+  }
+
+  // (3) R4's false negative, on the DOCUMENTED form. The selector strips square
+  // brackets; R4's raw scanner did not, so the bracket spelling the template
+  // recommends silently dropped an ID with no warning at all.
+  for (const [label19d, line19d, expectDropped19] of [
+    ['bracketed semicolon', '[REQ-01; REQ-02]', ['REQ-01']],
+    ['bracketed colon', '[REQ-01, REQ-02: login]', ['REQ-02']],
+    // A trailing-only regex missed every one of these; they are one class
+    // (decoration on a token the selector then could not take), so they take
+    // one rule rather than four patches.
+    ['leading semicolon', 'REQ-01 ;REQ-02', ['REQ-02']],
+    ['leading colon', 'REQ-01 :REQ-02', ['REQ-02']],
+    ['bold-wrapped', '**REQ-01;** REQ-02', ['REQ-01']],
+    ['backtick-wrapped', '`REQ-01;` REQ-02', ['REQ-01']],
+  ]) {
+    test(`#3697-19d (bracket form, ${label19d}): the documented spelling must not defeat R4`, () => {
+      const a = analyzeRequirementsLine(line19d);
+      assert.deepStrictEqual(
+        a.delimiterDroppedIds, expectDropped19,
+        `#3697-19d FAILED (${label19d}): square brackets are the documented form and must be ` +
+        `stripped for R4 exactly as the selector strips them`,
+      );
+      assert.strictEqual(a.warn, true, `#3697-19d FAILED (${label19d}): and the line must warn`);
+    });
+  }
+
+  // (4) The rider filter suppressed a REGISTERED requirement. `API-2-01` is a
+  // legal requirement id — gap-checker's own parseRequirements accepts it — so
+  // only a DATE shape (four-digit year segment) may be filtered.
+  // The residual the same-prefix gate BUYS its safety with, pinned so it is a
+  // known quantity rather than a surprise. A genuinely dropped id whose prefix
+  // appears on no selected id stays silent — the same trade the strict-dash
+  // rule takes: under-report a rare shape rather than over-report a common one.
+  // EMPHASIS ALONE IS NOT EVIDENCE, and this pins the boundary in both
+  // directions. An earlier cut of this round fired on any wrapper, which made
+  // `REQ-01, see **REQ-7** for context` warn about a citation — the #2334
+  // class again. Nothing separates that from `**REQ-01**, REQ-02` meaning to
+  // list one, so R4 requires the positive signal: a glued `;`/`:` (a list
+  // separator was intended) or an invisible (the token is corrupted; no author
+  // types one on purpose). Markdown styling is authorial and is left to the
+  // skipped-text rider, which names the id without asserting a drop.
+  for (const [label19h, line19h] of [
+    ['emphasised citation', 'REQ-01, see **REQ-7** for context'],
+    ['backticked citation', 'REQ-01, see `REQ-7` for context'],
+    ['emphasis with no delimiter', '**REQ-01**, REQ-02'],
+    // The delimiter's POSITION is the rule. Outside the styling it is sentence
+    // punctuation, and an earlier cut of this round fired on exactly this —
+    // `see **REQ-7**; next topic` was reported as a dropped requirement.
+    ['punctuated emphasised citation', 'REQ-01, see **REQ-7**; next topic'],
+    ['punctuated backticked citation', 'REQ-01, see `REQ-7`; next'],
+    ['delimiter outside the wrapper', '**REQ-01**; REQ-02'],
+  ]) {
+    test(`#3697-19h (styling is not evidence, ${label19h}): a wrapper alone must not fire R4`, () => {
+      const a = analyzeRequirementsLine(line19h);
+      assert.deepStrictEqual(
+        a.delimiterDroppedIds, [],
+        `#3697-19h FAILED (${label19h}): markdown styling carries no list-separator intent, so ` +
+        `claiming a drop here is the #2334 over-warning class`,
+      );
+    });
+  }
+
+  // An invisible attached to the range OPERATOR, not to an id. The regression
+  // tests covered invisibles inside ids and not this, and that gap is exactly
+  // what let a fix for one direction break the other — the pre-push review's
+  // own MISSED finding.
+  for (const [label19i, line19i] of [
+    ['invisible around a dotted operator', 'REQ-01 \u200B..\u200B REQ-05'],
+    ['invisible before a glued dash', 'REQ-01 \u200B-REQ-05'],
+  ]) {
+    test(`#3697-19i (invisible on the operator, ${label19i}): the operator is still an operator`, () => {
+      assert.strictEqual(
+        analyzeRequirementsLine(line19i).warn, true,
+        `#3697-19i FAILED (${label19i}): an invisible beside the range operator must not hide it`,
+      );
+    });
+  }
+
+  // An UNBALANCED parenthesis is a typo, not a citation, and must not confer
+  // citation immunity on the rest of the line. A running-depth counter let one
+  // stay open to end-of-line and swallow every real drop after it.
+  for (const [label19j, line19j, expectDropped19j] of [
+    ['unclosed open paren', 'REQ-01, (note REQ-02; REQ-03', ['REQ-02']],
+    ['stray close paren', 'REQ-01, REQ-02; REQ-03)', ['REQ-02']],
+    // A matched span sharing a whitespace token with an id OUTSIDE it. The
+    // first cut promoted the whole token to immune because it CONTAINED a
+    // matched character, so the drop next to the citation went silent — the
+    // pre-push review's last MISSED finding, which named exactly the control
+    // these two rows add.
+    ['citation glued after the drop', 'REQ-01, REQ-02;(note) REQ-03', ['REQ-02']],
+    ['citation glued before the drop', 'REQ-01, (note)REQ-02; REQ-03', ['REQ-02']],
+  ]) {
+    test(`#3697-19j (unbalanced parens, ${label19j}): only a MATCHED span is a citation`, () => {
+      const a = analyzeRequirementsLine(line19j);
+      assert.deepStrictEqual(
+        a.delimiterDroppedIds, expectDropped19j,
+        `#3697-19j FAILED (${label19j}): an unmatched paren must not swallow the rest of the line`,
+      );
+    });
+  }
+
+  // And the matched forms still are citations.
+  for (const [label19k, line19k] of [
+    ['matched span', 'REQ-01, (see ADR-7: sec 3)'],
+    ['nested matched spans', 'RANGE-01, RANGE-02 (see (ADR-7), then ADR-8)'],
+  ]) {
+    test(`#3697-19k (matched parens, ${label19k}): a real citation is still immune`, () => {
+      assert.deepStrictEqual(
+        analyzeRequirementsLine(line19k).delimiterDroppedIds, [],
+        `#3697-19k FAILED (${label19k}): a matched parenthetical is a citation`,
+      );
+    });
+  }
+
+  test('#3697-19f (declared blind spot): a dropped id with an unshared prefix stays silent', () => {
+    const a = analyzeRequirementsLine('REQ-01, FOO-02: x');
+    assert.deepStrictEqual(a.citedReqIds, ['REQ-01'], '#3697-19f: FOO-02 really is dropped');
+    assert.deepStrictEqual(
+      a.delimiterDroppedIds, [],
+      '#3697-19f: and R4 deliberately does not claim it — textually identical to a foreign citation',
+    );
+  });
+
+  // Round 5 body claim-audit, MISSED item 1. A DEMONSTRATED R4 drop and an
+  // over-cap token on the same line: the over-cap voice's whole claim is that
+  // nothing could be checked, which is false the moment R4 has named an id.
+  // Before the fix `REQ-01, REQ-02: <2049 chars>` reported req-line-unverified
+  // and never mentioned REQ-02 — the actionable finding masked by the token
+  // beside it. Same exclusion, same reason, as rangeReadingOnly's.
+  test('#3697-19l (over-cap beside a drop): a demonstrated drop outranks the unverified voice', () => {
+    // 2049 = the 2048 cap + 1, written as a literal and asserted, in the same
+    // style as the #3697-B1/-B2 boundary fixtures below.
+    const overCap = 'x'.repeat(2049);
+    assert.strictEqual(overCap.length, 2049, '#3697-19l fixture must be one past the cap');
+    const line = `REQ-01, REQ-02: ${overCap}`;
+    const a = analyzeRequirementsLine(line);
+    assert.deepStrictEqual(a.delimiterDroppedIds, ['REQ-02'], '#3697-19l: R4 does name the drop');
+    assert.ok(a.oversizedTokens.length > 0, '#3697-19l: and the over-cap token is present');
+    const w = formatRequirementsLineWarning('1', line, a);
+    assert.strictEqual(
+      reqLineCode(w), REQ_LINE_WARNING_CODE.misparse,
+      '#3697-19l: a line with a demonstrated drop is a misparse, not an unverified line',
+    );
+    assert.match(
+      reqLineText(w), /is glued to the ID/,
+      '#3697-19l: and the drop diagnosis must survive — it is the only actionable part',
+    );
+    assert.match(
+      reqLineText(w), /exceed the 2048-character scan limit/,
+      '#3697-19l: while the over-cap disclosure is still carried, not traded away',
+    );
+  });
+
+  test('#3697-19p (over-cap beside a CLEAN range): the cap outranks the ambiguous voice', () => {
+    // The twin of #3697-19l on the other side of the boundary. There, a
+    // DEMONSTRATED drop outranks the unverified voice; here nothing was
+    // demonstrated, so the cap does — and what must not happen is the line
+    // reading as clean. `req-line-range-reading` is documented (in its own code
+    // comment and in CONTEXT.md's PHASE.REQ-LINE.SEAM.kinds predicate) to mean
+    // nothing was dropped, and this line carries a token no rule ever examined.
+    // Round 7 review, Minor 1.
+    const overCap = 'x'.repeat(2049);
+    assert.strictEqual(overCap.length, 2049, '#3697-19p fixture must be one past the cap');
+    const line = `RANGE-01 - RANGE-05, ${overCap}`;
+    const a = analyzeRequirementsLine(line);
+    // The range half is genuinely clean: R2 fired, both endpoints were taken.
+    assert.deepStrictEqual(
+      a.citedReqIds, ['RANGE-01', 'RANGE-05'],
+      '#3697-19p: both endpoints really are selected — this is the CLEAN range shape',
+    );
+    assert.ok(a.hasSpacedRange, '#3697-19p: and R2 really did fire');
+    assert.strictEqual(a.delimiterDroppedIds.length, 0, '#3697-19p: nothing was demonstrably dropped');
+    assert.ok(a.oversizedTokens.length > 0, '#3697-19p: while an over-cap token is present');
+    // The predicate itself, pinned: the ambiguous voice must stand down.
+    assert.strictEqual(
+      a.rangeReadingOnly, false,
+      '#3697-19p: the ambiguous voice claims nothing was dropped — it may not speak over an unexamined token',
+    );
+    const w = formatRequirementsLineWarning('1', line, a);
+    assert.strictEqual(
+      reqLineCode(w), REQ_LINE_WARNING_CODE.unverified,
+      '#3697-19p: an unexamined token makes the line UNVERIFIED, not clean',
+    );
+    // And specifically NOT the assertive voice: nothing on this line failed to
+    // parse, so `misparse` would be the #2334 over-warning class returning
+    // through the fix for its own false-clean.
+    assert.notStrictEqual(
+      reqLineCode(w), REQ_LINE_WARNING_CODE.misparse,
+      '#3697-19p: nothing demonstrably failed to parse — asserting a misparse here is the #2334 class',
+    );
+    assert.match(
+      reqLineText(w), /exceed the 2048-character scan limit/,
+      '#3697-19p: and the cap is named, so the reader knows what was not looked at',
+    );
+  });
+
+  test('#3697-19q (control for -19p): the same range WITHOUT an over-cap token still reads as a range', () => {
+    // Negative control. -19p must not be satisfiable by routing every spaced
+    // range to `unverified`; the ambiguous voice is still correct when there
+    // is nothing unexamined on the line.
+    const line = 'RANGE-01 - RANGE-05';
+    const a = analyzeRequirementsLine(line);
+    assert.strictEqual(a.oversizedTokens.length, 0, '#3697-19q: nothing over the cap here');
+    assert.strictEqual(a.rangeReadingOnly, true, '#3697-19q: so the ambiguous voice is the right one');
+    assert.strictEqual(
+      reqLineCode(formatRequirementsLineWarning('1', line, a)), REQ_LINE_WARNING_CODE.rangeReading,
+      '#3697-19q: unchanged by the -19p fix — a clean range is still a range reading',
+    );
+  });
+
+  // DECLARED BLIND SPOTS, pinned so the docs and the code cannot drift apart
+  // again — that drift IS the round 4 blocker. R4's trigger is a glued `;`/`:`
+  // or an embedded invisible. Styling is TOLERATED around an id, never a
+  // trigger on its own, so every line below silently drops an id. Each is
+  // documented as silent in the CLI tools reference; if one of these ever
+  // starts warning, that document is wrong and this test says so first.
+  for (const [label19m, line19m, expectSel19m] of [
+    ['bold', 'REQ-01, **REQ-02**', ['REQ-01']],
+    ['quotes', 'REQ-01, "REQ-02"', ['REQ-01']],
+    ['backticks', 'REQ-01, `REQ-02`', ['REQ-01']],
+    ['underscore', 'REQ-01, _REQ-02_', ['REQ-01']],
+    // The `**` sits BETWEEN the id and the `;`, so nothing is touching the id.
+    ['styling between id and delimiter', 'REQ-01, **REQ-02**;', ['REQ-01']],
+  ]) {
+    test(`#3697-19m (declared blind spot, styling-only ${label19m}): silent, and documented as silent`, () => {
+      const a = analyzeRequirementsLine(line19m);
+      assert.deepStrictEqual(a.citedReqIds, expectSel19m, `#3697-19m (${label19m}): the id really is dropped`);
+      assert.deepStrictEqual(a.delimiterDroppedIds, [], `#3697-19m (${label19m}): R4 does not claim it`);
+      assert.strictEqual(a.warn, false, `#3697-19m (${label19m}): and the line is silent`);
+    });
+  }
+
+  // The other half of the same boundary: only `;` and `:` are in the set.
+  // Round 4's separator census concluded "exactly those two" because it swept
+  // the ONE-SIDED form for `;`/`:` and only the bare and symmetric forms for
+  // every other separator — different members tested in different shapes, so
+  // the answer was forced. A fully crossed re-sweep (21 separators x 4
+  // spellings = 84) found 34 silent under-selections, every one of them a
+  // separator glued to exactly ONE of the two ids. Pinned here as the
+  // documented COST, never asserted as coverage.
+  for (const sep19n of ['/', '|', '&', '+', '.', '>', '\\', '；', '，', '؛']) {
+    for (const [dir19n, line19n, keep19n] of [
+      ['trailing', `REQ-01${sep19n} REQ-02`, 'REQ-02'],
+      ['leading', `REQ-01 ${sep19n}REQ-02`, 'REQ-01'],
+    ]) {
+      test(`#3697-19n (declared blind spot, ${dir19n} "${sep19n}"): silent, and documented as silent`, () => {
+        const a = analyzeRequirementsLine(line19n);
+        assert.deepStrictEqual(
+          a.citedReqIds, [keep19n],
+          `#3697-19n (${dir19n} "${sep19n}"): exactly one id survives the selector`,
+        );
+        assert.deepStrictEqual(
+          a.delimiterDroppedIds, [],
+          `#3697-19n (${dir19n} "${sep19n}"): R4 does not reach it`,
+        );
+        assert.strictEqual(a.warn, false, `#3697-19n (${dir19n} "${sep19n}"): and the line is silent`);
+      });
+    }
+  }
+
+  // The grammar tolerances the documentation was corrected to state. These are
+  // pre-existing selector behaviour, not new; the round 4 pre-push review
+  // caught the DOCS asserting a stricter rule than the code enforces.
+  for (const [label19g, line19g, expectSel19] of [
+    ['whitespace-separated', 'REQ-01 REQ-02', ['REQ-01', 'REQ-02']],
+    ['lowercase ids', 'req-01, req-02', ['req-01', 'req-02']],
+  ]) {
+    test(`#3697-19g (documented tolerance, ${label19g}): selected and silent, as the docs now say`, () => {
+      const a = analyzeRequirementsLine(line19g);
+      assert.deepStrictEqual(a.citedReqIds, expectSel19, `#3697-19g (${label19g}): both ids are selected`);
+      assert.strictEqual(a.warn, false, `#3697-19g (${label19g}): and nothing warns about it`);
+    });
+  }
+
+  // A HALF-SPACED range splits at the tokenizer before R1's own `\s*` can see
+  // it: `RANGE-01 -RANGE-05` tokenizes as `RANGE-01`, `-RANGE-05` and selects
+  // only the well-formed side. The glued-fragment rule must warn, and the
+  // selection stays exactly what the tokenizer produced.
+  for (const [label6, line6, expectTicked] of [
+    ['leading-glue', 'RANGE-01 -RANGE-05', ['RANGE-01']],
+    ['trailing-glue', 'RANGE-01- RANGE-05', ['RANGE-05']],
+    // A word operator can glue only TRAILING (an ID must end in digits, so
+    // `RANGE-01through` cannot be an ID — but `TORANGE-05` can, which is why
+    // the leading arm is symbol-only).
+    ['worded-glue', 'RANGE-01through RANGE-05', ['RANGE-05']],
+    // The trailing shave must not eat a glued `..` as sentence punctuation.
+    ['double-dot-glue', 'RANGE-01.. RANGE-05', ['RANGE-05']],
+  ]) {
+    test(
+      `#3697-6 (${label6} half-spaced range): a range glued to one endpoint must warn — ` +
+      'selection is unchanged',
+      (t) => {
+        const tmpDir = build3697RangeFixture(line6);
+        t.after(() => cleanup(tmpDir));
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        assert.ok(
+          warnings.some((w) => REQ_LINE_MISPARSE_RE.test(w)),
+          `#3697-6 FAILED (${label6}): a half-spaced range under-selects, so it must warn. ` +
+          `Got warnings: ${JSON.stringify(warnings)}\nFull output: ${output}`,
+        );
+        const reqContent = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+        assert.deepStrictEqual(
+          tickedReqIds(reqContent), expectTicked,
+          `#3697-6 FAILED (${label6}): exactly ${JSON.stringify(expectTicked)} must be ticked ` +
+          `(no expansion).\nREQUIREMENTS.md:\n${reqContent}`,
+        );
+      },
+    );
+  }
+});
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #3697 round 3 — unit + property coverage of the EXTRACTED detector.
+//
+// The end-to-end block above drives the CLI, one subprocess per case. That is
+// the right shape for wiring, and the wrong shape for the two rules round 3's
+// review blocked on: `RULESET.TESTS.property-based-testing` wants a fast-check
+// property over a parsing module (100+ runs), and
+// `RULESET.TESTS.boundary-coverage.fixtures` wants limit-1 / limit / limit+1 on
+// the 2048-char token cap. Both are expressible only against a callable
+// surface, which is why `analyzeRequirementsLine` was extracted from
+// `cmdPhaseComplete` in the same round.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const fc = require('fast-check');
+const {
+  analyzeRequirementsLine,
+  formatRequirementsLineWarning,
+  REQ_LINE_WARNING_CODE,
+} = require('../gsd-core/bin/lib/phase.cjs');
+
+// Round 4 review Major 3: the formatter returns `{ code, message }`, so channel
+// IDENTITY is asserted on the stable code and never on the English sentence.
+// The two channel regexes below survive for the assertions where the
+// USER-VISIBLE wording is itself the thing under test.
+const reqLineText = (w) => (w === null ? null : w.message);
+const reqLineCode = (w) => (w === null ? null : w.code);
+
+describe('#3697 round 3: Requirements-line detector — properties (RULESET.TESTS.property-based-testing)', () => {
+  // fc arbitraries for a well-formed REQ-ID. The shape is the selector's own:
+  // `[A-Z][A-Z0-9]*-\d+`. Word range operators are excluded from the prefix
+  // alphabet nowhere — deliberately: `TORANGE-05` IS a valid ID, and property
+  // (a) asserting silence over it is what pins the #3697-4b behaviour
+  // generatively rather than at one hand-picked example.
+  const reqPrefix = fc
+    .tuple(
+      fc.constantFrom(...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')),
+      // fast-check v4 removed `fc.stringOf`; build the tail from an array so
+      // the alphabet stays pinned to the selector's own `[A-Z0-9]` class.
+      fc
+        .array(fc.constantFrom(...'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'.split('')), {
+          minLength: 0,
+          maxLength: 6,
+        })
+        .map((cs) => cs.join('')),
+    )
+    .map(([head, tail]) => head + tail);
+  const reqNum = fc.integer({ min: 0, max: 9999 });
+  const reqId = fc.tuple(reqPrefix, reqNum).map(([p, n]) => `${p}-${n}`);
+
+  test(
+    '#3697-P1 (soundness of silence): a canonical comma list of well-formed REQ-IDs NEVER warns, ' +
+    'and selects exactly the IDs it lists',
+    () => {
+      fc.assert(
+        fc.property(fc.array(reqId, { minLength: 1, maxLength: 8 }), (ids) => {
+          const line = ids.join(', ');
+          const a = analyzeRequirementsLine(line);
+          // Domain invariant (boundary containment): the selected set IS the
+          // written set — no over-selection (#2334) and no under-selection
+          // (#3697) on the canonical form, whatever IDs it carries.
+          assert.deepStrictEqual(a.citedReqIds, ids);
+          assert.strictEqual(
+            a.warn,
+            false,
+            `#3697-P1: canonical list ${JSON.stringify(line)} must not warn; got ${JSON.stringify(
+              formatRequirementsLineWarning('1', line, a),
+            )}`,
+          );
+        }),
+        { numRuns: 300 },
+      );
+    },
+  );
+
+  test(
+    '#3697-P2 (completeness): a same-prefix pair separated by a spaced range operator, with an ' +
+    'interior between them, ALWAYS warns',
+    // NOT a bug-finder: every operator below was already in the pre-round
+    // operator set, so this property holds against the pre-round code too. An
+    // earlier round-3 commit claimed otherwise; the review refuted it. It is a
+    // regression guard over the spaced-range rule, which is what it is worth.
+    () => {
+      const ops = ['..', '...', '…', '—', '–', '-', 'to', 'thru', 'through'];
+      fc.assert(
+        fc.property(
+          reqPrefix,
+          fc.integer({ min: 0, max: 400 }),
+          fc.integer({ min: 2, max: 400 }),
+          fc.constantFrom(...ops),
+          (prefix, lo, delta, op) => {
+            const line = `${prefix}-${lo} ${op} ${prefix}-${lo + delta}`;
+            const a = analyzeRequirementsLine(line);
+            assert.strictEqual(
+              a.warn,
+              true,
+              `#3697-P2: ${JSON.stringify(line)} implies a dropped interior and must warn`,
+            );
+          },
+        ),
+        { numRuns: 300 },
+      );
+    },
+  );
+
+  test(
+    '#3697-P3 (the #2334 invariant): an ADJACENT same-prefix pair around a separator can drop ' +
+    'nothing, so it never warns however it is annotated',
+    () => {
+      const ops = ['-', '—', '–', '..'];
+      fc.assert(
+        fc.property(
+          reqPrefix,
+          fc.integer({ min: 0, max: 4000 }),
+          fc.integer({ min: 0, max: 1 }),
+          fc.constantFrom(...ops),
+          fc.constantFrom('deferred', 'blocked', 'per ADR-7', 'see notes', ''),
+          (prefix, lo, delta, op, tail) => {
+            const line = `${prefix}-${lo}, ${prefix}-${lo} ${op} ${prefix}-${lo + delta}${
+              tail ? ' ' + tail : ''
+            }`;
+            const a = analyzeRequirementsLine(line);
+            assert.strictEqual(
+              a.warn,
+              false,
+              `#3697-P3: ${JSON.stringify(line)} has no interior to drop and must stay silent; got ` +
+                JSON.stringify(formatRequirementsLineWarning('1', line, a)),
+            );
+          },
+        ),
+        { numRuns: 300 },
+      );
+    },
+  );
+
+  test(
+    '#3697-P4 (totality + idempotency): the detector is total over arbitrary input and returns ' +
+    'the same analysis every time',
+    () => {
+      fc.assert(
+        fc.property(fc.string({ maxLength: 300 }), (s) => {
+          const a = analyzeRequirementsLine(s);
+          const b = analyzeRequirementsLine(s);
+          assert.strictEqual(typeof a.warn, 'boolean');
+          assert.ok(Array.isArray(a.citedReqIds) && Array.isArray(a.tokens));
+          assert.deepStrictEqual(a, b, '#3697-P4: analysis must be deterministic');
+          const wr = formatRequirementsLineWarning('1', s, a);
+          const w = reqLineText(wr);
+          const wc = reqLineCode(wr);
+          // Round 4 review Major 3: a message without a kind, or a kind that is
+          // not in the declared vocabulary, is a channel no consumer can route
+          // on. Held over ARBITRARY input, so a new channel added later cannot
+          // ship without one.
+          assert.strictEqual(
+            wc === null,
+            w === null,
+            `#3697-P4: kind and message must appear together; got ${JSON.stringify(wr)}`,
+          );
+          if (wc !== null) {
+            assert.ok(
+              Object.values(REQ_LINE_WARNING_CODE).includes(wc),
+              `#3697-P4: ${JSON.stringify(wc)} is not a declared warning kind`,
+            );
+          }
+          // The formatter and the analysis must agree on whether there is
+          // anything to say — a warn with no text, or text with no warn, is a
+          // channel that can go silent or noisy on its own.
+          assert.strictEqual(
+            w === null,
+            a.warn === false,
+            `#3697-P4: warn=${a.warn} but message=${JSON.stringify(w)} for ${JSON.stringify(s)}`,
+          );
+        }),
+        { numRuns: 500 },
+      );
+    },
+  );
+
+  test(
+    '#3697-P5 (containment): every selected ID is REQ-ID-shaped and appears verbatim in the line',
+    () => {
+      // The first cut of this property drew from a bare `fc.string()` and was
+      // VACUOUS — measured over 500 samples it produced max length 10 and ZERO
+      // inputs containing a REQ-ID, so the loop body never executed a single
+      // assertion. Found by the round's pre-push review. The generator now
+      // interleaves real IDs with noise, and the property ASSERTS that it saw
+      // some: a containment property that never contains anything is a green
+      // test measuring nothing.
+      let sawIds = 0;
+      fc.assert(
+        fc.property(
+          fc.array(fc.oneof(reqId, fc.constantFrom('(', ')', '[', ']', ',', '—', '..', 'to', 'TBD', 'None', 'per', 'ADR-7')), {
+            minLength: 1,
+            maxLength: 12,
+          }),
+          (parts) => {
+            const line = parts.join(' ');
+            const cited = analyzeRequirementsLine(line).citedReqIds;
+            if (cited.length > 0) sawIds += 1;
+            for (const id of cited) {
+              assert.match(id, /^[A-Z][A-Z0-9]*-\d+$/i, `#3697-P5: ${JSON.stringify(id)} is not ID-shaped`);
+              assert.ok(line.includes(id), `#3697-P5: ${JSON.stringify(id)} is not present in the input`);
+            }
+          },
+        ),
+        { numRuns: 500 },
+      );
+      assert.ok(sawIds > 50, `#3697-P5 is VACUOUS: only ${sawIds}/500 generated lines selected any ID`);
+    },
+  );
+
+  test(
+    '#3697-P6 (totality over arbitrary text): the detector never throws on free-form input',
+    () => {
+      // What the old P5 generator was actually covering. Kept as its own
+      // property, honestly labelled, rather than left masquerading as
+      // containment coverage.
+      fc.assert(
+        fc.property(fc.string({ maxLength: 300, size: 'max' }), (str) => {
+          const a = analyzeRequirementsLine(str);
+          assert.strictEqual(typeof a.warn, 'boolean');
+          formatRequirementsLineWarning('1', str, a);
+        }),
+        { numRuns: 500 },
+      );
+    },
+  );
+});
+
+describe('#3697 round 3: the 2048-char token scan cap (RULESET.TESTS.boundary-coverage)', () => {
+  // `REQ_TOKEN_SCAN_LIMIT` is a hard cap with NO reserve or safety constant
+  // beside it, so clause (d) of RULESET.TESTS.boundary-coverage.fixtures — an
+  // input pushed within reserve-distance of the limit — has no referent here.
+  // (a)/(b)/(c) are the whole obligation, and they are exercised through BOTH
+  // predicate families the cap now guards: the unanchored ID-substring scan
+  // (R3) and the anchored range-token scan (R1, capped in round 3 per Nit 6).
+  const inertOfLength = (n) => `REQ-01${'X'.repeat(n - 'REQ-01'.length)}`;
+  const rangeTokenOfLength = (n) => {
+    const suffix = '..RANGE-05';
+    const digits = n - 'RANGE-'.length - suffix.length;
+    return `RANGE-${'0'.repeat(digits - 1)}1${suffix}`;
+  };
+
+  // `expectClassified` is the PREDICATE's verdict, which is what the cap
+  // governs. `warn` is deliberately NOT the boundary variable: past the cap the
+  // token is unclassified, and unclassified is reported, never treated as
+  // clean — asserting `warn === false` at limit+1 is precisely the silent
+  // regression the round's pre-push review refuted (CLAIM 2).
+  for (const [label, n, expectClassified] of [
+    ['limit-1 (2047)', 2047, true],
+    ['limit (2048)', 2048, true],
+    ['limit+1 (2049)', 2049, false],
+  ]) {
+    test(`#3697-B1 (${label}): the UNANCHORED ID-substring scan is applied at and below the cap only`, () => {
+      const tok = inertOfLength(n);
+      assert.strictEqual(tok.length, n, `#3697-B1 fixture is ${tok.length} chars, expected ${n}`);
+      const a = analyzeRequirementsLine(tok);
+      assert.deepStrictEqual(a.citedReqIds, [], '#3697-B1: the padded token is not itself an ID');
+      assert.strictEqual(
+        a.inertIdShaped.length > 0,
+        expectClassified,
+        `#3697-B1 (${label}): inertIdShaped membership must be ${expectClassified} at length ${n}`,
+      );
+      assert.strictEqual(
+        a.oversizedTokens.length > 0,
+        !expectClassified,
+        `#3697-B1 (${label}): past the cap the token must be recorded as unclassified`,
+      );
+      // Warns at every length — below the cap because a rule classified it,
+      // above it because "not classified" is itself reportable.
+      assert.strictEqual(a.warn, true, `#3697-B1 (${label}): unclassified is not clean`);
+    });
+
+    test(`#3697-B2 (${label}): the ANCHORED range-token scan takes the SAME cap (round-3 Nit 6)`, () => {
+      const tok = rangeTokenOfLength(n);
+      assert.strictEqual(tok.length, n, `#3697-B2 fixture is ${tok.length} chars, expected ${n}`);
+      const a = analyzeRequirementsLine(tok);
+      assert.strictEqual(
+        a.rangeTokens.length > 0,
+        expectClassified,
+        `#3697-B2 (${label}): rangeTokens membership must be ${expectClassified} at length ${n}`,
+      );
+      assert.strictEqual(
+        a.oversizedTokens.length > 0,
+        !expectClassified,
+        `#3697-B2 (${label}): past the cap the token must be recorded as unclassified`,
+      );
+      assert.strictEqual(a.warn, true, `#3697-B2 (${label}): unclassified is not clean`);
+    });
+  }
+});
+
+describe('#3697 round 3: the two warning channels', () => {
+  // ── Major 3 ────────────────────────────────────────────────────────────────
+  // An annotation separator between two NON-ADJACENT same-prefix IDs is
+  // textually identical to a range, and no token-level rule separates them.
+  // Before round 3 the detector resolved that ambiguity by assertion: it told
+  // the author the line "could not be parsed" and to rewrite it, on a line
+  // where every ID present HAD been selected and nothing had been dropped.
+  // Going silent instead is not available — the range reading is equally live,
+  // and silence is the #3697 defect itself. So the ambiguity is disclosed.
+  for (const [label, line, expectSelected] of [
+    ['em-dash', 'RANGE-01, RANGE-02 — RANGE-05 deferred', ['RANGE-01', 'RANGE-02', 'RANGE-05']],
+    ['hyphen', 'RANGE-01, RANGE-02 - RANGE-05 deferred', ['RANGE-01', 'RANGE-02', 'RANGE-05']],
+    ['bare range', 'RANGE-01 … RANGE-05', ['RANGE-01', 'RANGE-05']],
+  ]) {
+    test(
+      `#3697-9 (${label}): a spaced separator warns through the AMBIGUOUS channel and must NOT ` +
+      'claim the line failed to parse',
+      () => {
+        const a = analyzeRequirementsLine(line);
+        assert.deepStrictEqual(
+          a.citedReqIds,
+          expectSelected,
+          `#3697-9 (${label}): every ID written on the line must still be selected`,
+        );
+        assert.strictEqual(
+          a.rangeReadingOnly,
+          true,
+          `#3697-9 (${label}): only the spaced-range rule fired and both endpoints were selected — ` +
+          'that is why this channel exists',
+        );
+        const wr = formatRequirementsLineWarning('1', line, a);
+        const w = reqLineText(wr);
+        const wc = reqLineCode(wr);
+        assert.ok(w, `#3697-9 (${label}): the range reading is live, so the line must still warn`);
+        assert.strictEqual(
+          wc,
+          REQ_LINE_WARNING_CODE.rangeReading,
+          `#3697-9 (${label}): wrong channel: ${wc} / ${w}`,
+        );
+        assert.notStrictEqual(
+          wc,
+          REQ_LINE_WARNING_CODE.misparse,
+          `#3697-9 (${label}): nothing was dropped, so the warning must not assert a parse failure: ${w}`,
+        );
+        // Both readings must be offered — the author is the only one who can
+        // resolve the ambiguity, and a warning that hides half of it is the
+        // over-warning wearing better manners.
+        assert.match(w, /annotation rather than a range/i, `#3697-9 (${label}): ${w}`);
+        assert.match(w, /needs no change/i, `#3697-9 (${label}): ${w}`);
+        // The soft voice speaks about the SEPARATOR, never about the whole
+        // line: it has no basis for the latter (see #3697-9d).
+        assert.doesNotMatch(
+          w,
+          /the line is already correct/i,
+          `#3697-9 (${label}): the soft voice must not claim the whole line is correct: ${w}`,
+        );
+      },
+    );
+  }
+
+  // The channel discriminator must be RULE-SCOPED, not line-global. Both of
+  // these were misrouted by the first cut of the Major 3 fix, and the first is
+  // the damaging direction: it puts the false "could not be parsed" claim back
+  // on a correct line, which is the finding itself returning through a side
+  // door.
+  test(
+    '#3697-9b (unrelated parenthetical citation): a citation elsewhere on the line must not flip ' +
+    'the channel back to a misparse claim',
+    () => {
+      const line = 'RANGE-01, RANGE-02 — RANGE-05 deferred per (ADR-7)';
+      const a = analyzeRequirementsLine(line);
+      // `(ADR-7)` survives the selector's bracket strip and so is not selected —
+      // but #3697-4 already pins a parenthetical citation as NOT unparsed
+      // residue, and no rule fires on it. Only the rules that fired may speak.
+      assert.strictEqual(a.rangeReadingOnly, true, '#3697-9b: R2 alone fired, on selected endpoints');
+      const wr = formatRequirementsLineWarning('1', line, a);
+      const w = reqLineText(wr);
+      const wc = reqLineCode(wr);
+      assert.strictEqual(wc, REQ_LINE_WARNING_CODE.rangeReading, `#3697-9b: wrong channel: ${wc} / ${w}`);
+      assert.notStrictEqual(wc, REQ_LINE_WARNING_CODE.misparse, `#3697-9b: ${wc} / ${w}`);
+    },
+  );
+
+  test(
+    '#3697-9c (unselected endpoint): a spaced range whose own endpoint was never selected IS a ' +
+    'drop, and takes the assertive channel',
+    () => {
+      const line = 'RANGE-01 (RANGE-02) — RANGE-05';
+      const a = analyzeRequirementsLine(line);
+      // The detector shaves brackets and the selector does not, so R2 fires on
+      // a `RANGE-02` that was never selected. That is a genuine under-selection.
+      assert.deepStrictEqual(a.citedReqIds, ['RANGE-01', 'RANGE-05'], '#3697-9c: RANGE-02 is not selected');
+      assert.strictEqual(a.hasSpacedRange, true, '#3697-9c: R2 still fires');
+      assert.strictEqual(a.rangeReadingOnly, false, '#3697-9c: an unselected endpoint is a drop');
+      const wr = formatRequirementsLineWarning('1', line, a);
+      const w = reqLineText(wr);
+      const wc = reqLineCode(wr);
+      assert.strictEqual(wc, REQ_LINE_WARNING_CODE.misparse, `#3697-9c: wrong channel: ${wc} / ${w}`);
+    },
+  );
+
+  test(
+    '#3697-9d (dropped ID elsewhere on the line): the soft voice must not claim the LINE is ' +
+    'correct, and must name what the selector skipped',
+    () => {
+      // The pre-push review's CLAIM 1 counterexample. `(REQ-02)` survives the
+      // selector's bracket strip and no rule fires on it, so the channel is
+      // still the soft one — correctly, because `(ADR-7)` is the same shape and
+      // routing on it puts the false misparse claim back on a citation. What
+      // was wrong was the soft voice ASSERTING "the line is already correct and
+      // nothing needs to change" over a line that dropped a requirement.
+      const line = 'REQ-01, (REQ-02), REQ-03 — REQ-05';
+      const a = analyzeRequirementsLine(line);
+      assert.deepStrictEqual(a.citedReqIds, ['REQ-01', 'REQ-03', 'REQ-05'], '#3697-9d: REQ-02 is dropped');
+      assert.strictEqual(a.rangeReadingOnly, true, '#3697-9d: R2 alone fired, on selected endpoints');
+      assert.deepStrictEqual(a.unselectedIdShaped, ['REQ-02'], '#3697-9d: the skip is recorded as a fact');
+      const wr = formatRequirementsLineWarning('1', line, a);
+      const w = reqLineText(wr);
+      const wc = reqLineCode(wr);
+      assert.strictEqual(
+        wc, REQ_LINE_WARNING_CODE.rangeReading,
+        `#3697-9d: R2 alone fired on selected endpoints, so this is the range-reading kind: ${wc}`,
+      );
+      assert.doesNotMatch(w, /the line is already correct/i, `#3697-9d: ${w}`);
+      assert.match(w, /ID-shaped text on the line that was NOT selected: REQ-02/i, `#3697-9d: ${w}`);
+      assert.match(w, /check whether any of it is a requirement/i, `#3697-9d: ${w}`);
+    },
+  );
+
+  test(
+    '#3697-9e (over-cap token): a token past the scan limit is reported as UNCLASSIFIED, never ' +
+    'silently dropped',
+    () => {
+      // The review's CLAIM 2. Round 3's first cut of the uniform cap made a
+      // 2049-char range token silent — it warned before the round. The cap
+      // bounds the WORK; it must not bound the warning.
+      const suffix = '..RANGE-05';
+      const big = `RANGE-${'0'.repeat(2049 - 'RANGE-'.length - suffix.length - 1)}1${suffix}`;
+      assert.strictEqual(big.length, 2049, `#3697-9e fixture is ${big.length} chars, expected 2049`);
+      const a = analyzeRequirementsLine(big);
+      assert.strictEqual(a.rangeTokens.length, 0, '#3697-9e: past the cap, no predicate classifies it');
+      assert.deepStrictEqual(a.oversizedTokens, [big], '#3697-9e: but it IS recorded as unclassified');
+      assert.strictEqual(a.warn, true, '#3697-9e: and the line still warns');
+      const wr = formatRequirementsLineWarning('1', big, a);
+      const w = reqLineText(wr);
+      const wc = reqLineCode(wr);
+      assert.strictEqual(
+        wc, REQ_LINE_WARNING_CODE.unverified,
+        `#3697-9e: an unclassifiable line is the 'unverified' kind — the same seam CONTEXT.md ` +
+        `already records for a truncated scan: ${wc}`,
+      );
+      assert.match(w, /could not be checked/i, `#3697-9e: ${w}`);
+      assert.match(w, /2048-character scan limit/i, `#3697-9e: ${w}`);
+      assert.match(w, /unverified/i, `#3697-9e: ${w}`);
+    },
+  );
+
+  test('#3697-9f (cap uniformity): R2 and the glued rule cap their NEIGHBOURS, not just the operator', () => {
+    // The first review's MISSED finding. Capping the operator alone left
+    // `<over-cap ID> .. <over-cap ID>` running REQ_ID_SHAPE_RE and BigInt over
+    // both neighbours unbounded.
+    //
+    // The endpoints must DIFFER by more than 1, or R2 could not fire even
+    // uncapped and the fixture would prove nothing — the first cut of this test
+    // used the same ID twice and was exactly that vacuous.
+    const pad = '0'.repeat(2049 - 'RANGE-'.length - 1);
+    const lo = `RANGE-${pad}1`;
+    const hi = `RANGE-${pad}9`;
+    assert.strictEqual(lo.length, 2049, `#3697-9f fixture is ${lo.length} chars, expected 2049`);
+    assert.strictEqual(hi.length, 2049, `#3697-9f fixture is ${hi.length} chars, expected 2049`);
+    const a = analyzeRequirementsLine(`${lo} .. ${hi}`);
+    assert.strictEqual(a.hasSpacedRange, false, '#3697-9f: an over-cap endpoint must not be classified');
+    assert.deepStrictEqual(a.citedReqIds, [lo, hi], '#3697-9f: both endpoints are selected');
+    // Selected does NOT mean nothing was suppressed. The second continuation
+    // review's CLAIM J/K: an earlier cut exempted every selector-accepted token
+    // from `oversizedTokens`, so this line — which WARNED before the round,
+    // when R2 was uncapped — went silent. Both endpoints are unexaminable and
+    // sit either side of a range operator, so the line is reported unverified.
+    assert.deepStrictEqual(a.oversizedTokens, [lo, hi], '#3697-9f: both endpoints are unexaminable');
+    assert.strictEqual(a.warn, true, '#3697-9f: a suppressed classification is not clean');
+  });
+
+  test(
+    '#3697-9j (over-cap exemption scope): a selected over-cap ID is exempt ONLY when nothing could ' +
+    'have paired with it',
+    () => {
+      // The other half of CLAIM J/K. The exemption is what keeps #3697-9i
+      // silent; it must not extend to a token whose neighbour could have formed
+      // a range with it, because that is exactly where the cap suppressed a
+      // rule rather than merely declining to classify a lone token.
+      const big = `R-${'1'.repeat(2047)}`;
+      assert.strictEqual(big.length, 2049, `#3697-9j fixture is ${big.length} chars, expected 2049`);
+      // No neighbour that could pair -> exempt, silent.
+      assert.strictEqual(analyzeRequirementsLine(`REQ-01, ${big}`).warn, false, '#3697-9j: no pairing neighbour');
+      // A range operator beside it -> R2 was suppressed, so report.
+      assert.strictEqual(analyzeRequirementsLine(`${big} .. REQ-05`).warn, true, '#3697-9j: operator neighbour');
+      assert.strictEqual(analyzeRequirementsLine(`REQ-01 .. ${big}`).warn, true, '#3697-9j: operator neighbour');
+    },
+  );
+
+  test(
+    '#3697-9g (assertive voice): the skipped-text clause is on BOTH voices, and does not repeat ' +
+    'what the rule-specific clause already named',
+    () => {
+      // The continuation review found the clause wired into the soft return
+      // only, while the round claimed both. It also found the wording wrong:
+      // square brackets ARE stripped by the selector, only parentheses are not.
+      const line = 'REQ-01, (REQ-02), REQ-03..REQ-05';
+      const wr = formatRequirementsLineWarning('1', line, analyzeRequirementsLine(line));
+      const w = reqLineText(wr);
+      const wc = reqLineCode(wr);
+      assert.strictEqual(wc, REQ_LINE_WARNING_CODE.misparse, `#3697-9g: assertive voice expected: ${wc} / ${w}`);
+      assert.match(w, /ID-shaped text on the line that was NOT selected: REQ-02/i, `#3697-9g: ${w}`);
+      assert.match(w, /parentheses are not stripped, unlike square brackets/i, `#3697-9g: ${w}`);
+      // `REQ-03..REQ-05` is already named by "Unparsed text"; naming it twice
+      // is noise, and a warning that repeats itself is one readers skim.
+      // Count OUTSIDE the echoed line — the warning quotes the whole
+      // Requirements line first, so the raw echo is one legitimate occurrence.
+      const afterEcho = w.slice(w.indexOf('`)') + 2);
+      assert.strictEqual(
+        (afterEcho.match(/REQ-03\.\.REQ-05/g) || []).length,
+        1,
+        `#3697-9g: the range token must be diagnosed exactly once: ${w}`,
+      );
+      // And the claim must be TRUE: a bracketed ID is selected, so it can never
+      // appear in the skipped clause.
+      assert.deepStrictEqual(
+        analyzeRequirementsLine('[REQ-01, REQ-02]').citedReqIds,
+        ['REQ-01', 'REQ-02'],
+        '#3697-9g: square brackets are stripped by the selector',
+      );
+    },
+  );
+
+  test(
+    '#3697-9h (over-cap token with no hyphen): an unexaminable OPERATOR must not silence the line',
+    () => {
+      // The continuation review's CLAIM B. `oversizedTokens` first filtered on
+      // `includes('-')`, so a 2049-character run of dots between two IDs was
+      // missed: R2 declined to classify it (capped) and nothing reported it, so
+      // a line that warned before the round went silent after it.
+      const line = `REQ-01 ${'.'.repeat(2049)} REQ-05`;
+      const a = analyzeRequirementsLine(line);
+      assert.strictEqual(a.hasSpacedRange, false, '#3697-9h: the operator is past the cap');
+      assert.strictEqual(a.oversizedTokens.length, 1, '#3697-9h: and is recorded as unexaminable');
+      assert.strictEqual(a.warn, true, '#3697-9h: so the line is not silent');
+    },
+  );
+
+  test(
+    '#3697-9i (over-cap token the SELECTOR took): a selected ID is verified, never "unverified"',
+    () => {
+      // The continuation review's MISSED finding. The selector is uncapped and
+      // fully anchored, so a token it accepted was examined end to end.
+      // Reporting it unverified because the secondary detector declined to
+      // classify it is a contradiction inside one warning.
+      const bigId = `R-${'1'.repeat(2047)}`;
+      assert.strictEqual(bigId.length, 2049, `#3697-9i fixture is ${bigId.length} chars, expected 2049`);
+      const a = analyzeRequirementsLine(bigId);
+      assert.deepStrictEqual(a.citedReqIds, [bigId], '#3697-9i: it is a valid canonical REQ-ID');
+      assert.deepStrictEqual(a.oversizedTokens, [], '#3697-9i: selected means verified');
+      assert.strictEqual(a.warn, false, '#3697-9i: nothing to report');
+    },
+  );
+
+  // ── Minor 4 ────────────────────────────────────────────────────────────────
+  // A zero-selection non-placeholder line MUST warn — #3697's own acceptance
+  // criterion says so in as many words. What was wrong is that it reported an
+  // ADR citation as "Unparsed text", i.e. as requirement content it had failed
+  // to read. Name what the residue actually is, and name the escape hatch.
+  for (const [label, line] of [
+    ['Deferred (see ADR-7)', 'Deferred (see ADR-7)'],
+    ['N/A with citation', 'N/A (tracked in ADR-12)'],
+  ]) {
+    test(
+      `#3697-10 (${label}): a zero-selection line still warns, but names ID-shaped TEXT rather ` +
+      'than missed requirements, and points at the placeholder escape',
+      () => {
+        const a = analyzeRequirementsLine(line);
+        assert.deepStrictEqual(a.citedReqIds, [], `#3697-10 (${label}): nothing is selected here`);
+        const wr = formatRequirementsLineWarning('1', line, a);
+        const w = reqLineText(wr);
+        const wc = reqLineCode(wr);
+        assert.strictEqual(
+          wc, REQ_LINE_WARNING_CODE.misparse,
+          `#3697-10 (${label}): zero selection is a demonstrated parse failure: ${wc}`,
+        );
+        assert.ok(w, `#3697-10 (${label}): a non-empty non-placeholder line selecting zero must warn`);
+        assert.match(w, /ID-shaped text that was not selected/i, `#3697-10 (${label}): ${w}`);
+        assert.doesNotMatch(
+          w,
+          /Unparsed text/i,
+          `#3697-10 (${label}): the citation is not unparsed requirement content: ${w}`,
+        );
+        assert.doesNotMatch(
+          w,
+          /Range forms are not expanded/i,
+          `#3697-10 (${label}): no range rule fired, so no range may be diagnosed: ${w}`,
+        );
+        assert.match(w, /write `TBD` or `None`/i, `#3697-10 (${label}): ${w}`);
+      },
+    );
+  }
+
+  // ── Census closure ─────────────────────────────────────────────────────────
+  // The range-operator enumeration is a set the code fixes at author time over
+  // a domain (separator spellings) that grows without it. Round 3's census
+  // found the ASCII and typographic dashes split: U+2013/U+2014 were reached,
+  // the five other Unicode dashes were not, and each miss is a SILENT
+  // under-selection — #3697's own defect. They carry no collision risk because
+  // they are not the REQ-ID separator (that is ASCII `-`), so they close.
+  for (const [label, cp] of [
+    ['U+2010 hyphen', '‐'],
+    ['U+2011 non-breaking hyphen', '‑'],
+    ['U+2012 figure dash', '‒'],
+    ['U+2015 horizontal bar', '―'],
+    ['U+2212 minus sign', '−'],
+  ]) {
+    test(`#3697-11 (${label}): a typographic dash is the same range operator at a different codepoint`, () => {
+      const spaced = `RANGE-01 ${cp} RANGE-05`;
+      assert.strictEqual(
+        analyzeRequirementsLine(spaced).warn,
+        true,
+        `#3697-11 (${label}): spaced form must warn`,
+      );
+      const tight = `RANGE-01${cp}RANGE-05`;
+      assert.strictEqual(
+        analyzeRequirementsLine(tight).warn,
+        true,
+        `#3697-11 (${label}): tight form must warn`,
+      );
+      // And the collision the ASCII hyphen has must NOT arrive with them: a
+      // date-shaped annotation stays silent because its own separators are
+      // ASCII, so it never reaches the ID shape at all.
+      assert.strictEqual(
+        analyzeRequirementsLine(`RANGE-01 (target FY-2026-08)`).warn,
+        false,
+        `#3697-11 (${label}): the date-annotation control must stay silent`,
+      );
+    });
+  }
+
+  // Every dash takes the STRICT shape, whatever its codepoint. `PREFIX-\d+
+  // <dash> \d+` is also a date and a sub-numbered ID, and that ambiguity is a
+  // property of the shape rather than of which key was pressed. #3697-4 pins
+  // the ASCII date annotation silent; these pin its seven typographic twins to
+  // the same verdict. Two of them — U+2013 and U+2014 — warned BEFORE this PR,
+  // so this arm fixes a pre-existing inconsistency as well as the one an
+  // earlier round-3 commit briefly introduced for the other five.
+  const ALL_DASHES = [
+    ['ASCII hyphen-minus', '-'],
+    ['U+2010 hyphen', '‐'],
+    ['U+2011 non-breaking hyphen', '‑'],
+    ['U+2012 figure dash', '‒'],
+    ['U+2013 en dash', '–'],
+    ['U+2014 em dash', '—'],
+    ['U+2015 horizontal bar', '―'],
+    ['U+2212 minus sign', '−'],
+  ];
+
+  for (const [label, d] of ALL_DASHES) {
+    test(`#3697-13 (${label}): a date-shaped annotation must stay silent`, () => {
+      const line = `RANGE-01 (target FY-2026${d}08)`;
+      assert.strictEqual(
+        analyzeRequirementsLine(line).warn,
+        false,
+        `#3697-13 (${label}): ${JSON.stringify(line)} is a date annotation, not a range`,
+      );
+      // The sub-numbered-ID reading of the same shape, beside a selected ID.
+      const sub = `RANGE-01, API-2${d}01`;
+      assert.strictEqual(
+        analyzeRequirementsLine(sub).warn,
+        false,
+        `#3697-13 (${label}): ${JSON.stringify(sub)} is a sub-numbered ID, not a range`,
+      );
+    });
+
+    test(`#3697-13b (${label}): a tight range with a FULL ID on both sides must still warn`, () => {
+      const line = `RANGE-01${d}RANGE-05`;
+      assert.strictEqual(
+        analyzeRequirementsLine(line).rangeTokens.length,
+        1,
+        `#3697-13b (${label}): ${JSON.stringify(line)} is unambiguously a range`,
+      );
+    });
+  }
+
+  test('#3697-13c: the LOOSE operators keep their numeric endpoint', () => {
+    // `..`, `…` and the word operators have no date or sub-number reading
+    // between two numbers, so the strict shape would cost them coverage for
+    // nothing. They are deliberately not moved.
+    for (const line of ['RANGE-01…05', 'RANGE-01..05', 'RANGE-01through05']) {
+      assert.strictEqual(
+        analyzeRequirementsLine(line).rangeTokens.length,
+        1,
+        `#3697-13c: ${JSON.stringify(line)} must still read as a tight range`,
+      );
+    }
+  });
+
+  test('#3697-13d: the accepted false negative is now symmetric across dashes', () => {
+    // `RANGE-01, RANGE-02-05` is silent in the shipped design — the strict
+    // shape accepts that, deliberately, for the dash people actually type.
+    // Every other dash now accepts it identically; the inconsistency, not the
+    // gap, is what round 3 removed. A BARE `RANGE-02<dash>05` still warns,
+    // because it selects nothing and R3 catches it.
+    for (const [label, d] of ALL_DASHES) {
+      assert.strictEqual(
+        analyzeRequirementsLine(`RANGE-01, RANGE-02${d}05`).warn,
+        false,
+        `#3697-13d (${label}): mixed-list numeric endpoint is the accepted false negative`,
+      );
+      assert.strictEqual(
+        analyzeRequirementsLine(`RANGE-02${d}05`).warn,
+        true,
+        `#3697-13d (${label}): a bare zero-selection line must still warn via R3`,
+      );
+    }
+  });
+
+  test('#3697-12: the ASCII-hyphen strict shape is unchanged by the dash widening', () => {
+    // `LETTERS-\d+-\d+` is also a date and a sub-numbered ID, which is why the
+    // bare-hyphen tight arm demands a full ID on both sides. Widening the
+    // NOHYPHEN arm must not relax that.
+    for (const line of ['RANGE-01-05', 'FY-2026-08', 'API-2-01']) {
+      assert.strictEqual(
+        analyzeRequirementsLine(line).rangeTokens.length,
+        0,
+        `#3697-12: ${JSON.stringify(line)} must not read as a tight range`,
+      );
+    }
+    assert.strictEqual(
+      analyzeRequirementsLine('RANGE-01-RANGE-05').rangeTokens.length,
+      1,
+      '#3697-12: the full-ID-both-sides spelling must still read as a range',
+    );
+  });
 });
 
 // ─── #2572: phase-SUMMARY artifact↔disk advisory at phase completion ─────────
@@ -11131,10 +13713,15 @@ describe('#2572: phase complete warns when a SUMMARY claims files that never lan
   test('#2572-2: the advisory is ADVISORY — completion still succeeds and reports the phase complete', () => {
     const { tmpDir } = build2572SummaryArtifactFixture();
     try {
+      const stateBefore = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
       const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
       const parsed = JSON.parse(output);
       assert.strictEqual(parsed.completed_phase, '1', '#2572-2 FAILED: completion must not be blocked by the advisory');
       assert.strictEqual(parsed.state_updated, true, '#2572-2 FAILED: STATE.md must still be written');
+      // #3685: earn the `true` above — assert STATE.md's content actually
+      // differs from the pre-call snapshot.
+      const stateAfter = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
+      assert.notEqual(stateAfter, stateBefore, '#3685: STATE.md content must actually change when state_updated is true');
     } finally {
       cleanup(tmpDir);
     }
@@ -11826,6 +14413,233 @@ still to be determined by the roadmap.
   });
 });
 
+describe('phase complete lowest-outstanding vs positional-last (#4078)', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject('gsd-4078-');
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  const statePath = () => path.join(tmpDir, '.planning', 'STATE.md');
+  const roadmapPath = () => path.join(tmpDir, '.planning', 'ROADMAP.md');
+
+  /** Scaffold a phase dir with one executed plan (PLAN + SUMMARY). */
+  function scaffoldPhase(slug, planNum) {
+    const dir = path.join(tmpDir, '.planning', 'phases', slug);
+    fs.mkdirSync(dir, { recursive: true });
+    const padded = String(planNum).padStart(2, '0');
+    fs.writeFileSync(path.join(dir, `${padded}-01-PLAN.md`), '# Plan');
+    fs.writeFileSync(path.join(dir, `${padded}-01-SUMMARY.md`), '# Summary');
+  }
+
+  /**
+   * #4078 fixture shape: the original roadmap's phase rows (2–17) use the
+   * bullet-house em-dash grammar the canonical lookup has accepted since #2199
+   * (`- [ ] **Phase N — Name**`), while the later phase.add-ingested Phase 18
+   * uses the colon grammar both the template and the scaffold emit. Only the
+   * colon rows parse under the pre-fix next-phase scan, so the positionally
+   * LAST parseable phase (18) won over the lowest outstanding phase (2).
+   */
+  function writeMixedGrammarRoadmap() {
+    const summaryRows = [
+      '- [ ] **Phase 1: Bootstrap**',
+      '- [ ] **Phase 2 — Python 3.14 Source and CI Compatibility**',
+      '- [ ] **Phase 3 — Packaging Refresh**',
+      '- [ ] **Phase 17 — Docs Sweep**',
+      '- [ ] **Phase 18: Codex Automation Disposition**',
+    ];
+    fs.writeFileSync(
+      roadmapPath(),
+      [
+        '# Roadmap',
+        '',
+        '## Phases',
+        ...summaryRows,
+        '',
+        '### Phase 18: Codex Automation Disposition',
+        '**Requirements**: TBD',
+        '',
+        '1. TBD — run /gsd:plan-phase 18 to break down.',
+        '',
+      ].join('\n'),
+    );
+    scaffoldPhase('01-bootstrap', 1);
+  }
+
+  /** Uniform em-dash grammar (no colon rows at all) — phases 1..5, complete N. */
+  function writeDashRoadmap({ completeBox = null } = {}) {
+    const names = ['Bootstrap', 'Source Compat', 'Packaging', 'Release', 'Docs Sweep'];
+    let rows = names.map((n, i) => `- [ ] **Phase ${i + 1} — ${n}**`);
+    if (completeBox !== null) rows[completeBox - 1] = rows[completeBox - 1].replace('- [ ]', '- [x]');
+    fs.writeFileSync(
+      roadmapPath(),
+      ['# Roadmap', '', '## Phases', ...rows, ''].join('\n'),
+    );
+  }
+
+  function writeExplicitState(phaseNum, phaseName) {
+    fs.writeFileSync(
+      statePath(),
+      [
+        '# State',
+        '',
+        `**Current Phase:** ${phaseNum}`,
+        `**Current Phase Name:** ${phaseName}`,
+        '**Status:** In progress',
+        '**Current Plan:** 01-01',
+        '**Last Activity:** 2025-01-01',
+        '**Last Activity Description:** Working',
+        '',
+      ].join('\n'),
+    );
+  }
+
+  function parseFrontmatterField(content, key) {
+    const m = content.match(new RegExp(`^${key}:\\s*(.*)$`, 'm'));
+    return m ? m[1].trim().replace(/^["']|["']$/g, '') : null;
+  }
+
+  test('mixedGrammarLowestOutstandingNotPositionalLast', () => {
+    // Row 1 (failing-first regression from the issue): completing Phase 1 of an
+    // 18-phase roadmap whose original rows use the em-dash bullet grammar must
+    // advance to the lowest outstanding phase (2), NOT the positionally-last
+    // colon-form row (18) merely because it is the only row the pre-fix scan
+    // could parse.
+    writeMixedGrammarRoadmap();
+    writeExplicitState(1, 'Bootstrap');
+
+    const result = runVerifiedPhaseComplete('phase complete 1', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error || result.output}`);
+    const output = JSON.parse(result.output);
+
+    assert.strictEqual(output.completed_phase, '1');
+    assert.strictEqual(output.is_last_phase, false, 'phases 2–18 remain — not last');
+    assert.strictEqual(
+      parseInt(String(output.next_phase), 10),
+      2,
+      `lowest outstanding phase 2 must be next_phase, not the positionally-last phase 18 (got ${output.next_phase})`,
+    );
+    assert.match(String(output.next_phase_name), /python[- ]3\.14-source-and-ci-compatibility/i);
+  });
+
+  test('mixedGrammarStateMovesToPhaseTwo', () => {
+    // Row 2: the resolved next phase must actually be PERSISTED — body Current
+    // Phase and frontmatter current_phase/current_phase_name all describe 2.
+    writeMixedGrammarRoadmap();
+    writeExplicitState(1, 'Bootstrap');
+
+    const result = runVerifiedPhaseComplete('phase complete 1', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error || result.output}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(parseInt(String(output.next_phase), 10), 2);
+
+    const state = fs.readFileSync(statePath(), 'utf-8');
+    assert.ok(/\*\*Current Phase:\*\*\s*2\b/.test(state), `body Current Phase must be 2, got: ${state.match(/\*\*Current Phase:\*\*.*/)?.[0]}`);
+    const fmPhase = parseFrontmatterField(state, 'current_phase');
+    const fmName = parseFrontmatterField(state, 'current_phase_name');
+    assert.strictEqual(parseInt(fmPhase, 10), 2, `frontmatter current_phase must be 2 (got ${fmPhase})`);
+    assert.match(fmName, /python 3\.14/i, `frontmatter current_phase_name must name phase 2 (got ${fmName})`);
+  });
+
+  test('uniformDashGrammarStillResolvesNext', () => {
+    // Row 3: uniform em-dash grammar — no colon rows exist, so the pre-fix scan
+    // found NO next phase at all; completing 1 must still resolve phase 2.
+    writeDashRoadmap();
+    scaffoldPhase('01-bootstrap', 1);
+    writeExplicitState(1, 'Bootstrap');
+
+    const result = runVerifiedPhaseComplete('phase complete 1', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error || result.output}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(
+      parseInt(String(output.next_phase), 10),
+      2,
+      `next phase 2 must resolve from em-dash rows (got ${output.next_phase})`,
+    );
+    assert.strictEqual(output.is_last_phase, false);
+  });
+
+  test('dashGrammarAllCompleteStillEndsMilestone', () => {
+    // Row 4 (negative space): completing the highest phase with every lower box
+    // checked is still a legitimate milestone end — the widened grammar must not
+    // manufacture an outstanding phase.
+    writeDashRoadmap({ completeBox: 1 });
+    scaffoldPhase('01-bootstrap', 1);
+    scaffoldPhase('02-source-compat', 2);
+    scaffoldPhase('03-packaging', 3);
+    scaffoldPhase('04-release', 4);
+    scaffoldPhase('05-docs-sweep', 5);
+    const rp = roadmapPath();
+    let roadmap = fs.readFileSync(rp, 'utf-8');
+    roadmap = roadmap
+      .replace('- [ ] **Phase 2 — Source Compat**', '- [x] **Phase 2 — Source Compat**')
+      .replace('- [ ] **Phase 3 — Packaging**', '- [x] **Phase 3 — Packaging**')
+      .replace('- [ ] **Phase 4 — Release**', '- [x] **Phase 4 — Release**');
+    fs.writeFileSync(rp, roadmap);
+    writeExplicitState(5, 'Docs Sweep');
+
+    const result = runVerifiedPhaseComplete('phase complete 5', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error || result.output}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.is_last_phase, true, 'everything checked — milestone completes');
+    assert.strictEqual(output.next_phase, null);
+  });
+
+  test('dashGrammarLowerOutstandingWins', () => {
+    // Row 5 (#2028 through the widened grammar): completing 5 with 3 still
+    // unchecked must fall BACK to the lowest outstanding phase 3. Phases 1, 2
+    // and 4 are checked so 3 is genuinely the lowest outstanding box.
+    writeDashRoadmap();
+    const rp = roadmapPath();
+    let roadmap = fs.readFileSync(rp, 'utf-8');
+    roadmap = roadmap
+      .replace('- [ ] **Phase 1 — Bootstrap**', '- [x] **Phase 1 — Bootstrap**')
+      .replace('- [ ] **Phase 2 — Source Compat**', '- [x] **Phase 2 — Source Compat**')
+      .replace('- [ ] **Phase 4 — Release**', '- [x] **Phase 4 — Release**');
+    fs.writeFileSync(rp, roadmap);
+    scaffoldPhase('03-packaging', 3);
+    scaffoldPhase('05-docs-sweep', 5);
+    writeExplicitState(5, 'Docs Sweep');
+
+    const result = runVerifiedPhaseComplete('phase complete 5', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error || result.output}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(
+      parseInt(String(output.next_phase), 10),
+      3,
+      `out-of-order completion must point at the lowest outstanding phase 3 (got ${output.next_phase})`,
+    );
+    assert.strictEqual(output.is_last_phase, false);
+  });
+
+  test('dashGrammarSentinelStillExcluded', () => {
+    // Row 6 (#2949 through the widened grammar): an unchecked 0.x backlog row in
+    // the dash grammar never becomes next_phase.
+    writeDashRoadmap();
+    scaffoldPhase('01-bootstrap', 1);
+    scaffoldPhase('02-source-compat', 2);
+    const rp = roadmapPath();
+    fs.writeFileSync(
+      rp,
+      '- [ ] **Phase 0.1 — Backlog sentinel item**\n' + fs.readFileSync(rp, 'utf-8'),
+    );
+    writeExplicitState(1, 'Bootstrap');
+
+    const result = runVerifiedPhaseComplete('phase complete 1', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error || result.output}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(
+      parseInt(String(output.next_phase), 10),
+      2,
+      `real phase 2 (not the 0.1 sentinel) is next_phase (got ${output.next_phase})`,
+    );
+  });
+});
+
 // ─── #3572: phase remove must not prepend a second frontmatter block ──────────
 
 describe('bug #3572: phase remove must not corrupt STATE.md into two frontmatter blocks', () => {
@@ -11878,11 +14692,15 @@ describe('bug #3572: phase remove must not corrupt STATE.md into two frontmatter
     // targetDir !== null, and the body lacks Total Phases/of-N — the trigger.
     let r = runGsdTools('phase insert 1 "Inserted probe"', tmpDir);
     assert.ok(r.success, `phase insert failed: ${r.error}`);
+    const stateBeforeRemove = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
     r = runGsdTools('phase remove 1.1', tmpDir);
     assert.ok(r.success, `phase remove failed: ${r.error}`);
     assert.strictEqual(JSON.parse(r.output).state_updated, true, 'the #2640 resync must still happen');
 
     const after = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
+    // #3685: earn the `true` above — assert STATE.md's content actually
+    // differs from the snapshot taken immediately before the remove call.
+    assert.notEqual(after, stateBeforeRemove, '#3685: STATE.md content must actually change when state_updated is true');
     assert.ok(after.startsWith('---\n') || after.startsWith('---\r\n'), 'file must still OPEN with the frontmatter fence');
     assert.strictEqual(fenceLineCount(after), 2, `exactly one frontmatter block (2 fence lines); got ${fenceLineCount(after)}:\n${after.slice(0, 400)}`);
     assert.strictEqual((after.match(/gsd_state_version/g) || []).length, 1, 'exactly one gsd_state_version — no second derived block');
@@ -11992,5 +14810,391 @@ describe('bug #3572 controls and clamps', () => {
     assert.doesNotMatch(after, /Total Phases:\s*-\d+/, 'count must never go negative');
     assert.match(after, /^Total Phases:\s*0$/m, 'stale zero stays clamped at 0');
     t.after(() => cleanup(tmpDir));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #3701 — next_phase follows ROADMAP ORDER, not artifact presence.
+//
+// The successor cascade resolved disk-first: the first phase DIRECTORY above N
+// won, and the roadmap scan only ran when the disk found nothing. Directories
+// are created lazily, but `phase insert` scaffolds an inserted phase's directory
+// immediately — so an inserted decimal was routinely the only directory above N
+// and outranked every phase preceding it in the roadmap. The wrong value was
+// reported AND persisted to STATE.md, silently.
+//
+// #3581 fixed the identical defect at `init.progress` and named the rule: "the
+// frontier is ROADMAP ORDER, not artifact presence". This call site was outside
+// that change's scope.
+//
+// Most of this block is CONTROLS. The fix promotes the roadmap to decide WHICH
+// phase is next while the disk still decides HOW it is spelled, so the failure
+// mode of a naive fix is a silent spelling change on every aligned project —
+// which is the majority case, and which `alignedTreeKeepsDiskSpelling` catches.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('#3701 phase complete — next_phase follows roadmap order, not disk', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject('gsd-3701-');
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  const statePath = () => path.join(tmpDir, '.planning', 'STATE.md');
+
+  function scaffoldPhaseDir(slug) {
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', slug), { recursive: true });
+  }
+
+  /** Roadmap rows + matching detail headings, so both scan shapes are present. */
+  function writeRoadmap(rows) {
+    const checklist = rows.map((r) => `- [${r.done ? 'x' : ' '}] **Phase ${r.num}: ${r.name}**${r.inserted ? ' (INSERTED)' : ''} - ${r.name}`);
+    const details = rows.map((r) => `### Phase ${r.num}: ${r.name}\n\n**Goal:** ${r.name}`);
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap\n\n## Phases\n\n${checklist.join('\n')}\n\n## Phase Details\n\n${details.join('\n\n')}\n`,
+    );
+  }
+
+  function writeState(currentPhase) {
+    fs.writeFileSync(
+      statePath(),
+      `---\ngsd_state_version: 1.0\ncurrent_phase: ${currentPhase}\nstatus: executing\n---\n\n# Project State\n`,
+    );
+  }
+
+  function complete(phase) {
+    const result = runVerifiedPhaseComplete(`phase complete ${phase}`, tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error || result.output}`);
+    return JSON.parse(result.output);
+  }
+
+  function frontmatterField(key) {
+    const m = fs.readFileSync(statePath(), 'utf-8').match(new RegExp(`^${key}:\\s*(.*)$`, 'm'));
+    return m ? m[1].trim().replace(/^["']|["']$/g, '') : null;
+  }
+
+  // Roadmap 1, 2, 02.1 (INSERTED), 3 — the shape from the report.
+  const INSERTED_ROADMAP = [
+    { num: '1', name: 'Alpha' },
+    { num: '2', name: 'Beta' },
+    { num: '02.1', name: 'Inserted Thing', inserted: true },
+    { num: '3', name: 'Gamma' },
+  ];
+
+  // ── the defect ────────────────────────────────────────────────────────────
+
+  test('insertedDecimalDoesNotOutrankTheRoadmapSuccessor', () => {
+    // Directories for 01 and 02.1 only. Phase 2 is next in the roadmap and has
+    // no directory — the ordinary state of an unplanned phase.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02.1-inserted-thing');
+    writeRoadmap(INSERTED_ROADMAP);
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.is_last_phase, false);
+    assert.strictEqual(
+      output.next_phase,
+      '2',
+      `roadmap order puts Phase 2 next; the inserted decimal has a directory and must not outrank it (got ${output.next_phase})`,
+    );
+    assert.strictEqual(output.next_phase_name, 'beta');
+  });
+
+  test('theWrongSuccessorIsNotPersistedToStateMd', () => {
+    // Independent of the reported value: the defect's real cost is the resume
+    // pointer written to STATE.md, which sends the next session to the wrong
+    // phase for the whole of the following phase.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02.1-inserted-thing');
+    writeRoadmap(INSERTED_ROADMAP);
+    writeState(1);
+
+    complete(1);
+
+    assert.strictEqual(
+      frontmatterField('current_phase'),
+      '2',
+      'STATE.md must advance to the roadmap successor, not to the inserted decimal',
+    );
+  });
+
+  // ── controls: what must not move ──────────────────────────────────────────
+
+  test('alignedTreeKeepsDiskSpelling', () => {
+    // THE control for this fix. When roadmap and disk agree, the directory still
+    // supplies the spelling: the zero-padded token and the on-disk slug. A fix
+    // that merely promoted the roadmap would report `2`/`beta` here instead of
+    // `02`/`beta` — a silent output change on every aligned project.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    scaffoldPhaseDir('03-gamma');
+    writeRoadmap([{ num: '1', name: 'Alpha' }, { num: '2', name: 'Beta' }, { num: '3', name: 'Gamma' }]);
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '02', 'the on-disk zero-padded token is the established spelling');
+    assert.strictEqual(output.next_phase_name, 'beta');
+  });
+
+  test('roadmapSpellingWhenTheSuccessorHasNoDirectory', () => {
+    scaffoldPhaseDir('01-alpha');
+    writeRoadmap([{ num: '1', name: 'Alpha' }, { num: '2', name: 'Beta' }, { num: '3', name: 'Gamma' }]);
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '2', 'no directory exists, so the roadmap supplies the spelling too');
+    assert.strictEqual(output.next_phase_name, 'beta');
+  });
+
+  test('aDecimalThatGenuinelyIsNextIsStillSelected', () => {
+    // The mirror of the defect: an over-correction that refused decimals would
+    // pass the two tests above and fail here.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    scaffoldPhaseDir('02.1-inserted-thing');
+    writeRoadmap([
+      { num: '1', name: 'Alpha', done: true },
+      { num: '2', name: 'Beta' },
+      { num: '02.1', name: 'Inserted Thing', inserted: true },
+      { num: '3', name: 'Gamma' },
+    ]);
+    writeState(2);
+
+    const output = complete(2);
+    assert.strictEqual(output.next_phase, '02.1', 'the inserted phase really does follow 2 in roadmap order');
+    assert.strictEqual(output.next_phase_name, 'inserted-thing');
+  });
+
+  test('completingTheDecimalAdvancesToTheNextWholePhase', () => {
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    scaffoldPhaseDir('02.1-inserted-thing');
+    writeRoadmap([
+      { num: '1', name: 'Alpha', done: true },
+      { num: '2', name: 'Beta', done: true },
+      { num: '02.1', name: 'Inserted Thing', inserted: true },
+      { num: '3', name: 'Gamma' },
+    ]);
+    writeState('02.1');
+
+    const output = complete('02.1');
+    assert.strictEqual(output.next_phase, '3');
+    assert.strictEqual(output.next_phase_name, 'gamma');
+  });
+
+  // ── the disk fallback must survive ────────────────────────────────────────
+
+  test('noRoadmapFallsBackToTheDiskScan', () => {
+    // Making the roadmap primary must not make it required.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    writeState(1);
+    // deliberately no ROADMAP.md
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '02', 'with no roadmap the disk is the only resolver');
+  });
+
+  test('unparseableRoadmapPhaseRowsFallBackToTheDiskScan', () => {
+    // A roadmap that exists but yields no phase rows is the same situation as no
+    // roadmap at all, and must degrade the same way.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), '# Roadmap\n\nnothing here parses as a phase row\n');
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '02');
+  });
+
+  test('lastPhaseStillReportsMilestoneEnd', () => {
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    writeRoadmap([{ num: '1', name: 'Alpha', done: true }, { num: '2', name: 'Beta' }]);
+    writeState(2);
+
+    const output = complete(2);
+    assert.strictEqual(output.is_last_phase, true);
+    assert.strictEqual(output.next_phase, null);
+  });
+
+  // ── ordering: phase NUMBERS decide sequence, not row position ─────────────
+
+  test('roadmapRowsOutOfNumericOrderStillResolveTheLowestSuccessor', () => {
+    // Review round 2 (blocker). The roadmap scan walks raw text and one global
+    // regex sweeps both the checklist and the detail headings, so "first match
+    // above N" is a statement about file position, not sequence. Once this scan
+    // started deciding the answer, a roadmap listing rows `1, 3, 2` reported
+    // next_phase 3 and PERSISTED it — skipping Phase 2 entirely, on an input the
+    // pre-fix code got right because the disk scan is numerically sorted.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    writeRoadmap([
+      { num: '1', name: 'Alpha' },
+      { num: '3', name: 'Gamma' },
+      { num: '2', name: 'Beta' },
+    ]);
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '02', `Phase 2 is the lowest above 1 regardless of row position (got ${output.next_phase})`);
+    assert.strictEqual(output.next_phase_name, 'beta');
+  });
+
+  test('detailHeadingOrderDoesNotOverrideNumericOrder', () => {
+    // The checklist and the `## Phase Details` headings are swept by the same
+    // regex, so a details section ordered differently from the checklist is a
+    // second way row position could win.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      [
+        '# Roadmap', '', '## Phases', '',
+        '- [ ] **Phase 1: Alpha** - Alpha',
+        '- [ ] **Phase 2: Beta** - Beta',
+        '- [ ] **Phase 3: Gamma** - Gamma',
+        '', '## Phase Details', '',
+        '### Phase 3: Gamma', '', '**Goal:** Gamma', '',
+        '### Phase 1: Alpha', '', '**Goal:** Alpha', '',
+        '### Phase 2: Beta', '', '**Goal:** Beta', '',
+      ].join('\n'),
+    );
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '02');
+  });
+
+  test('outOfOrderRowsWithNoDirectoryStillResolveNumerically', () => {
+    // Same rule on the roadmap-only path, where no disk answer exists to mask a
+    // document-order mistake.
+    scaffoldPhaseDir('01-alpha');
+    writeRoadmap([
+      { num: '1', name: 'Alpha' },
+      { num: '3', name: 'Gamma' },
+      { num: '2', name: 'Beta' },
+    ]);
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '2');
+    assert.strictEqual(output.next_phase_name, 'beta');
+  });
+
+  test('anInsertedDecimalListedOutOfOrderDoesNotWin', () => {
+    // The two hazards together: rows out of sequence AND an inserted decimal
+    // holding the only directory above N.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02.1-inserted-thing');
+    writeRoadmap([
+      { num: '1', name: 'Alpha' },
+      { num: '3', name: 'Gamma' },
+      { num: '02.1', name: 'Inserted Thing', inserted: true },
+      { num: '2', name: 'Beta' },
+    ]);
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '2');
+  });
+
+  // ── sentinels and the #2028 stage this change does not touch ──────────────
+
+  test('sentinelBacklogAndDraftPhasesAreNeverSelected', () => {
+    // Both scans skip sentinels (#2786 / #3185 / #2949). Whichever one is
+    // primary, that must still hold.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('999.1-backlog-item');
+    scaffoldPhaseDir('0.1-draft-item');
+    writeRoadmap([
+      { num: '1', name: 'Alpha' },
+      { num: '2', name: 'Beta' },
+      { num: '999.1', name: 'Backlog Item' },
+      { num: '0.1', name: 'Draft Item' },
+    ]);
+    writeState(1);
+
+    const output = complete(1);
+    assert.strictEqual(output.next_phase, '2', 'sentinel phases are not the frontier');
+  });
+
+  test('lowestOutstandingOverrideStillWins', () => {
+    // Independence: the #2028 stage-3 override answers a different question — is
+    // a LOWER phase still outstanding — and is untouched by this change.
+    scaffoldPhaseDir('01-alpha');
+    scaffoldPhaseDir('02-beta');
+    scaffoldPhaseDir('03-gamma');
+    writeRoadmap([
+      { num: '1', name: 'Alpha' }, // still unchecked — outstanding
+      { num: '2', name: 'Beta' },
+      { num: '3', name: 'Gamma' },
+    ]);
+    writeState(2);
+
+    const output = complete(2);
+    assert.strictEqual(
+      output.next_phase,
+      '1',
+      'a lower outstanding phase still overrides the positional successor (#2028)',
+    );
+  });
+});
+
+// ─── #3982: phase.complete must not pick an archived details-block phase ─────
+
+describe('bug #3982: archived details leak into lowest-outstanding scan', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-3982-'));
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '20-first-thing'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), [
+      '---', 'milestone: v0.3', 'current_phase: 20', '---', '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), [
+      '# Roadmap', '',
+      '### 🚧 v0.3 — Third Milestone (Phases 20-22) — ACTIVE', '',
+      '- [x] **Phase 20: First Thing** - does the first thing.',
+      '- [ ] **Phase 21: Second Thing** - does the second thing.',
+      '- [ ] **Phase 22: Third Thing** - does the third thing.',
+      '',
+      '<details>',
+      '<summary>✅ v0.2 Second Milestone (Phases 10-12) — ARCHIVED</summary>', '',
+      '- [ ] **Phase 10: Never Finished** - was left unchecked when v0.2 closed.',
+      '- [x] **Phase 11: Done Thing** - completed.',
+      '- [x] **Phase 12: Other Done Thing** - completed.',
+      '',
+      '</details>', '',
+    ].join('\n'));
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '20-first-thing');
+    fs.writeFileSync(path.join(phaseDir, '20-01-PLAN.md'), [
+      '---', 'phase: 20-first-thing', 'plan: 01', '---', '',
+      '<objective>Do the first thing.</objective>', '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(phaseDir, '20-01-SUMMARY.md'), [
+      '---', 'phase: 20-first-thing', 'plan: 01', 'status: complete', '---', '',
+      'Done.', '',
+    ].join('\n'));
+  });
+
+  afterEach(() => { cleanup(tmpDir); });
+
+  test('phase complete 20 advances to 21, not the archived range', () => {
+    const out = runPhaseComplete(tmpDir, { phase: '20', tolerateExit: true });
+    const payload = JSON.parse(out.slice(out.indexOf('{')));
+    assert.strictEqual(payload.next_phase, '21',
+      'completing phase 20 must advance to the real next phase 21 (#3982)');
+    assert.notStrictEqual(payload.next_phase, '10',
+      'an archived milestone\'s unchecked phase must never win the lowest-outstanding scan (#3982)');
+    const state = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
+    assert.ok(!/current_phase:\s*10(\s|$)/m.test(state),
+      `STATE.md current_phase must not jump backwards into the archived range; got: ${state}`);
   });
 });

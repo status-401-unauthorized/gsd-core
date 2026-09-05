@@ -39,6 +39,10 @@ const PROTECTED_WORKFLOWS = new Set([
   'mutation.yml',
   'security-scan.yml',
   'release.yml',
+  // #3833: the reusable gate every `pull_request` compute lane depends on —
+  // marking it inert would let a change to the gate itself ship without ever
+  // running the full matrix it is responsible for enforcing.
+  'pr-mergeable-preflight.yml',
 ]);
 for (const wf of PROTECTED_WORKFLOWS) {
   if (INERT_WORKFLOWS.has(wf)) {
@@ -93,6 +97,10 @@ const RULES = [
     tests: [
       'tests/run-tests-harness.test.cjs',
       'tests/workflow-shell-pinning.test.cjs',
+      // #4220: the run-scoped temp root + computeSweepProtectSet ancestor-walk
+      // termination coverage — was previously not re-selected by an edit to
+      // scripts/run-tests.cjs, the exact file that shipped the #4020 hang.
+      'tests/run-tests-temp-root.test.cjs',
     ],
   },
   {
@@ -298,6 +306,9 @@ const RULES = [
       'tests/require-userprofile-with-home.rule.test.cjs',
       'tests/normalize-path-in-content.rule.test.cjs',
       'tests/require-fs-op-fallback.rule.test.cjs',
+      // #4244 (origin #4020/#4220 Windows CI hang) — see ADR-1703 amendment.
+      'tests/require-full-tmpdir-triad.rule.test.cjs',
+      'tests/no-unbounded-dirname-walk.rule.test.cjs',
     ],
   },
   {
@@ -341,18 +352,47 @@ function missingRuleTestFiles(rules) {
   return [...referenced].filter(f => !existsSync(path.join(__dirname, '..', f))).sort();
 }
 
-// Fail loudly at module load, mirroring the PROTECTED_WORKFLOWS check above —
-// this fires on EVERY invocation of the CLI (including the real `changes` job
-// in .github/workflows/test.yml), not only when a test suite happens to run.
-{
-  const missing = missingRuleTestFiles(RULES);
-  if (missing.length > 0) {
-    throw new Error(
-      `ci-test-scope: RULES reference test file(s) that do not exist on disk ` +
-      `(silent coverage hole — see #2758):\n  ${missing.join('\n  ')}`,
-    );
-  }
+/**
+ * Every PROTECTED_WORKFLOWS member that does not exist on disk.
+ * The name list and the real filenames are two surfaces over one fact
+ * (#3833): without this, renaming or deleting a gating workflow silently
+ * un-protects it and CI stays green while the protection is gone. Same
+ * shape and rationale as missingRuleTestFiles() above.
+ */
+function missingProtectedWorkflows(names = PROTECTED_WORKFLOWS) {
+  return [...names]
+    .filter(name => !existsSync(path.join(__dirname, '..', '.github', 'workflows', name)))
+    .sort();
 }
+
+/**
+ * Shared module-load assertion for the two "this list names something that
+ * does not exist on disk" guards above. Both are silent-coverage-hole guards:
+ * a name that no longer resolves stops selecting/protecting anything while CI
+ * stays green, so both must fail loudly at load rather than at test time.
+ */
+function assertNoneMissing(missing, summary, issueRef) {
+  if (missing.length === 0) return;
+  throw new Error(`ci-test-scope: ${summary} (${issueRef}):\n  ${missing.join('\n  ')}`);
+}
+
+// Fail loudly at module load — this fires on EVERY invocation of the CLI
+// (including the real `changes` job in .github/workflows/test.yml), not only
+// when a test suite happens to run.
+assertNoneMissing(
+  missingRuleTestFiles(RULES),
+  'RULES reference test file(s) that do not exist on disk (silent coverage hole)',
+  'see #2758',
+);
+
+// A PROTECTED_WORKFLOWS entry naming a file that does not exist means the
+// workflow was renamed or deleted without updating this list, silently
+// un-protecting it while CI stays green.
+assertNoneMissing(
+  missingProtectedWorkflows(PROTECTED_WORKFLOWS),
+  'PROTECTED_WORKFLOWS reference workflow file(s) that do not exist on disk (silent protection hole)',
+  'see #3833',
+);
 
 function usage() {
   return [
@@ -590,4 +630,4 @@ if (require.main === module) {
   runMain(main);
 }
 
-module.exports = { RULES, missingRuleTestFiles };
+module.exports = { RULES, missingRuleTestFiles, PROTECTED_WORKFLOWS, INERT_WORKFLOWS, missingProtectedWorkflows };

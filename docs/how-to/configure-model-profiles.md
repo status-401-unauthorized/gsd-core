@@ -185,17 +185,21 @@ quota / rate-limit failures; other failures keep the tier ladder. Leaving
 
 ## Using GSD on non-Anthropic runtimes
 
-If you installed GSD for Codex, OpenCode, Antigravity CLI, or Kilo, the installer already set `resolve_model_ids: "omit"` in your config. This tells GSD to skip Anthropic model ID resolution and let the runtime choose its own default model. No manual setup is needed for the basic case.
+If you installed GSD for Codex, OpenCode, Antigravity CLI, or Kilo, the installer already set `resolve_model_ids: "omit"` in your config. This prevents unresolved Anthropic model IDs from leaking into those runtimes. When `runtime` is set, runtime-native profile resolution still supplies any model and effort that the runtime adapter can transport. No manual setup is needed for the basic case.
 
-### Codex does not do tier routing — pin explicitly instead
+### Codex routes tiers at spawn time when supported
 
-**Codex agents inherit whatever model your Codex session is using.** GSD writes no `model` line into
-`~/.codex/agents/<agent>.toml`, so setting `model_profile` has no effect on Codex.
+GSD deliberately writes no profile-resolved `model` line into
+`~/.codex/agents/<agent>.toml` ([ADR-2313](../adr/2313-codex-passive-model-posture.md)).
+Instead, each Codex skill inspects the visible `spawn_agent` schema. When that schema advertises
+`model` and `reasoning_effort`, the skill passes the model and effort resolved from
+`model_profile` — including `adaptive` — on that individual spawn. When either field is absent,
+the skill omits that field and the child inherits the session or static agent configuration.
 
-This is deliberate ([ADR-2313](../adr/2313-codex-passive-model-posture.md)). A ChatGPT-account Codex
-session exposes only its own model, so a pinned tier model fails the request outright —
-`400 invalid_request_error: "The 'sonnet' model is not supported when using Codex with a ChatGPT
-account"` — and the agent never spawns.
+This keeps compatibility with older Codex schemas while allowing newer installations to route
+`gsd-planner`, `gsd-executor`, and other roles to their configured tiers. The fields are detected
+independently; support for typed `agent_type` dispatch does not imply support for either routing
+field.
 
 **To pin a model on Codex, name a real Codex model id per agent:**
 
@@ -209,7 +213,8 @@ account"` — and the agent never spawns.
 }
 ```
 
-Then re-run the installer, as with any `model_overrides` edit on Codex (see above).
+Then re-run the installer to materialize the override in the agent TOML as a fallback for spawn
+schemas that do not advertise inline `model` (see above).
 
 Two rules apply to what you can put there:
 
@@ -227,6 +232,51 @@ Codex UI drives both rather than one following GSD and the other following your 
 > account where those resolved successfully, add the `model_overrides` block above to keep them.
 > The installer prints a one-time notice when it drops a pin. If you were on a ChatGPT account, this
 > is the change that stops the 400s — nothing to do.
+
+### Allocating for execution-heavy workflows on Codex
+
+Execution and verification account for most of the model calls in a long GSD run — planning happens
+once per phase, execution happens per plan, and verification runs over everything produced. On
+2026-07-30 OpenAI cut GPT-5.6 Luna API pricing by 80% and Terra by 20%, and reduced how many credits
+both consume against Codex paid-plan quotas while leaving subscription prices and quota budgets
+unchanged. Sol was unchanged. That makes the cheaper models materially cheaper for exactly the
+high-volume half of a workflow.
+
+GSD does not add a routing surface for this — the levers below already express it, and
+[#2935](https://github.com/open-gsd/gsd-core/issues/2935) was closed as already-implemented on
+precisely that basis. Keep Sol where the reasoning is worth the spend, and put the volume on Terra
+or Luna:
+
+```json
+{
+  "runtime": "codex",
+  "model_overrides": {
+    "gsd-planner":   "gpt-5.6-sol",
+    "gsd-debugger":  "gpt-5.6-sol",
+    "gsd-executor":  "gpt-5.6-terra",
+    "gsd-verifier":  "gpt-5.6-luna"
+  }
+}
+```
+
+Prefer `models` when you want the split by *phase type* rather than by agent — it maps the six phase
+types at once and every agent carries a `phaseType`, so it survives the roster changing under you:
+
+```json
+{
+  "models": { "planning": "opus", "execution": "sonnet", "verification": "haiku" }
+}
+```
+
+Two things worth knowing before you tune this:
+
+- **Effort is a separate lever from model, and it is now per-model.** Dropping to Luna does not force
+  you to drop effort — Luna advertises everything up to `max`. See
+  [Configuration reference — effort](../CONFIGURATION.md#model-profiles) for the per-model table and
+  which levels clamp.
+- **These are cost/limit tradeoffs, not quality claims.** The 2026-07-30 change was a pricing and
+  credit-accounting change; it did not alter model quality. Sol remains the strongest model for
+  planning and hard debugging, which is why it stays there above.
 
 **If you want per-agent model IDs on any non-Claude runtime:**
 

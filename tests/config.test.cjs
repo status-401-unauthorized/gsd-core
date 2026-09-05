@@ -436,6 +436,90 @@ describe('config-set command', () => {
   });
 });
 
+// ─── config-set git.protected_branches (#3552) ──────────────────────────────
+
+describe('config-set git.protected_branches (#3552)', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+    runGsdTools('config-ensure-section', tmpDir);
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  test('accepts and persists multiple non-empty branch names', () => {
+    const branches = ['develop', 'next'];
+    const result = runGsdTools(
+      ['config-set', 'git.protected_branches', JSON.stringify(branches)],
+      tmpDir,
+    );
+
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    assert.deepStrictEqual(readConfig(tmpDir).git.protected_branches, branches);
+  });
+
+  test('rejects invalid shapes and preserves the previous list', () => {
+    const previous = ['develop', 'next'];
+    const seed = runGsdTools(
+      ['config-set', 'git.protected_branches', JSON.stringify(previous)],
+      tmpDir,
+    );
+    assert.ok(seed.success, `Seed failed: ${seed.error}`);
+
+    const invalidValues = [
+      'develop',
+      { develop: true },
+      ['develop', 42],
+      [],
+      [''],
+      ['develop', '   '],
+    ];
+
+    for (const invalidValue of invalidValues) {
+      const result = runGsdTools(
+        ['config-set', 'git.protected_branches', JSON.stringify(invalidValue)],
+        tmpDir,
+      );
+      assert.strictEqual(
+        result.success,
+        false,
+        `Expected rejection for ${JSON.stringify(invalidValue)}, got: ${result.output}`,
+      );
+      assert.deepStrictEqual(
+        readConfig(tmpDir).git.protected_branches,
+        previous,
+        `Rejected value ${JSON.stringify(invalidValue)} must not change the prior list`,
+      );
+    }
+  });
+
+  test('is absent by default and null removes the configured list', () => {
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(readConfig(tmpDir).git, 'protected_branches'),
+      'config-ensure-section must not add a protected_branches default',
+    );
+
+    const setResult = runGsdTools(
+      ['config-set', 'git.protected_branches', '["develop","next"]'],
+      tmpDir,
+    );
+    assert.ok(setResult.success, `Set failed: ${setResult.error}`);
+
+    const unsetResult = runGsdTools(
+      ['config-set', 'git.protected_branches', 'null'],
+      tmpDir,
+    );
+    assert.ok(unsetResult.success, `Unset failed: ${unsetResult.error}`);
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(readConfig(tmpDir).git, 'protected_branches'),
+      'git.protected_branches must be absent after unset',
+    );
+  });
+});
+
 // ─── config-get ──────────────────────────────────────────────────────────────
 
 describe('config-get command', () => {
@@ -2383,7 +2467,10 @@ describe('bug #3212 execute-phase stall detection and safe resume', () => {
     const workflow = read('gsd-core/workflows/execute-phase.md');
 
     assert.match(workflow, /<step name="safe_resume_gate"/, 'execute-phase must define a safe_resume_gate step');
-    assert.match(workflow, /git log --oneline --grep="\$\{CURRENT_PLAN_ID\}"/, 'safe resume gate must check commits for the current plan id');
+    // #4003: the gate greps an anchored, zero-pad-tolerant scope regex derived from the
+    // current plan id (a bare padded substring matched other milestones' plans).
+    assert.match(workflow, /PLAN_SCOPE_RE="\^\[a-z\]\+\\\(\(0\*\$\{PHASE_N\}\)-\(0\*\$\{PLAN_N\}\)\\\):"/, 'safe resume gate must derive an anchored plan-scope regex');
+    assert.match(workflow, /--grep="\$\{PLAN_SCOPE_RE\}"/, 'safe resume gate must check commits for the current plan id');
     assert.match(workflow, /SUMMARY.md is missing/, 'safe resume gate must detect production commits with missing SUMMARY.md');
     assert.match(workflow, /close out manually/, 'safe resume gate must offer manual close-out recovery');
     assert.match(workflow, /re-execute from scratch/, 'safe resume gate must offer re-execute recovery');

@@ -45,8 +45,9 @@ import modelCatalog = require('./model-catalog.cjs');
 const { MODEL_PROFILES: GSD_MODEL_PROFILES } = modelCatalog as unknown as { MODEL_PROFILES: Record<string, Record<string, string>> };
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- model-resolver.cjs is an export= CommonJS module
 import modelResolverModule = require('./model-resolver.cjs');
-const { resolveTierEntry: gsdResolveTierEntry } = modelResolverModule as {
+const { resolveTierEntry: gsdResolveTierEntry, resolveModelPolicy: gsdResolveModelPolicy } = modelResolverModule as {
   resolveTierEntry: (opts: { runtime: string; tier: string; overrides: unknown }) => { model?: string } | null;
+  resolveModelPolicy: (policy: unknown, tier: string | null | undefined) => string | null;
 };
 
 interface ReadOptions {
@@ -125,10 +126,66 @@ function readGsdEffectiveModelOverrides(targetDir: string | null = null, options
   return { ...(global || {}), ...(projectOverrides || {}) };
 }
 
+type AgentTools = Record<string, string[]>;
+
+function readGsdAgentTools(config: Record<string, unknown> | null): AgentTools | null {
+  const raw = config?.agent_tools;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+
+  const result: AgentTools = {};
+  for (const [selector, value] of Object.entries(raw as Record<string, unknown>)) {
+    // An explicitly present selector always has a verdict. Invalid values are
+    // empty so a project config cannot accidentally restore a global grant.
+    result[selector] = Array.isArray(value)
+      ? value.filter((entry): entry is string => typeof entry === 'string')
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0
+          && !entry.endsWith(':')
+          && !/[\s\u0000-\u001F\u007F-\u009F,#"'\u2028\u2029]/.test(entry))
+      : [];
+  }
+  return result;
+}
+
+/**
+ * Resolve valid install-time `agent_tools` grants from global defaults and
+ * the nearest project config. Project selectors replace only matching global
+ * selectors; malformed whole files remain harmless absence like the existing
+ * model override resolver.
+ */
+function readGsdEffectiveAgentTools(targetDir: string | null = null, options: ReadOptions = {}): AgentTools | null {
+  const home = options.homedir ? options.homedir() : os.homedir();
+  const globalConfig = _readGsdConfigFile(path.join(home, '.gsd', 'defaults.json'), 'global defaults');
+
+  let projectConfig: Record<string, unknown> | null = null;
+  if (targetDir) {
+    const candidate = _findAncestorGsdConfigPath(targetDir);
+    if (candidate) {
+      projectConfig = _readGsdConfigFile(candidate, 'project config');
+    }
+  }
+
+  const global = readGsdAgentTools(globalConfig);
+  const project = readGsdAgentTools(projectConfig);
+  if (projectConfig
+    && Object.prototype.hasOwnProperty.call(projectConfig, 'agent_tools')
+    && project === null) return {};
+  if (!global && !project) return null;
+  return { ...(global || {}), ...(project || {}) };
+}
+
 interface RuntimeProfileMergedConfig {
   runtime: string | null;
   model_profile: string;
   model_profile_overrides: unknown;
+  /**
+   * #3705: the provider-neutral policy (#49). Install-time never read it, so a
+   * project configured for a non-Anthropic provider had its agent frontmatter
+   * rebaked to catalog `anthropic/claude-*` IDs on every update while
+   * dispatch-time resolution honoured the policy correctly — two answers from
+   * one config, and only the frontmatter is what a spawn actually uses.
+   */
+  model_policy: unknown;
 }
 
 /**
@@ -169,6 +226,11 @@ function readGsdRuntimeProfileResolver(targetDir: string | null = null): Runtime
       (projectConfig && projectConfig.model_profile_overrides) ||
       (homeDefaults && homeDefaults.model_profile_overrides) ||
       null,
+    // #3705: same project-wins-over-home precedence as every other key here.
+    model_policy:
+      (projectConfig && projectConfig.model_policy) ||
+      (homeDefaults && homeDefaults.model_policy) ||
+      null,
   };
 
   if (!merged.runtime) return null;
@@ -188,6 +250,33 @@ function readGsdRuntimeProfileResolver(targetDir: string | null = null): Runtime
       if (!agentModels) return null;
       const tier = agentModels[profile] || agentModels.balanced;
       if (!tier) return null;
+      // #3705: policy sits between the per-agent override and the tier table —
+      // the position dispatch uses. Measured against `query resolve-model` on the
+      // same config: policy-only -> the policy model; tier-overrides-only -> the
+      // override; BOTH -> the policy model. So policy outranks
+      // `model_profile_overrides`, and an explicit `model_overrides[agent]`
+      // (applied by resolveAgentModelOverride below) outranks policy.
+      //
+      // Calls the exported owner (#49) rather than re-deriving tier -> model here:
+      // a second implementation of that mapping is the very divergence this issue
+      // is, one layer down. A null from it (unknown provider, missing tier key, a
+      // `runtime_tiers` miss) falls through to the tier table — never to null,
+      // which would omit a frontmatter key that used to be written.
+      // The policy object must carry the effective runtime before it is resolved.
+      // `resolveModelPolicy`'s `runtime_tiers` branch reads `policy['runtime']`, but
+      // the documented config shape (docs/CONFIGURATION.md) puts `runtime` at the
+      // TOP level and keeps only `provider`/`runtime_tiers` inside `model_policy`.
+      // Dispatch injects it — `{ ...config.model_policy, runtime: effectiveRuntime }`
+      // (model-resolver.cts) — and passing the policy unmodified here silently
+      // skipped `runtime_tiers` entirely, falling through to the flat hi/med/lo keys
+      // or the catalog tier. That is the same "catalog Anthropic ID baked over a
+      // configured provider" defect this fix exists to close, so the injection is
+      // mirrored rather than assumed.
+      const policyForRuntime = merged.model_policy
+        ? { ...(merged.model_policy as Record<string, unknown>), runtime }
+        : null;
+      const policyModel = gsdResolveModelPolicy(policyForRuntime, tier);
+      if (policyModel) return { model: policyModel };
       return gsdResolveTierEntry({
         runtime,
         tier,
@@ -226,6 +315,7 @@ function resolveAgentModelOverride(
 export = {
   readGsdGlobalModelOverrides,
   readGsdEffectiveModelOverrides,
+  readGsdEffectiveAgentTools,
   readGsdRuntimeProfileResolver,
   resolveAgentModelOverride,
 };

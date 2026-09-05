@@ -47,6 +47,7 @@ const commandRoster = require('../gsd-core/bin/lib/command-roster.cjs');
 const slashCommandTransformer = require('../scripts/fix-slash-commands.cjs');
 
 const REAL_COMMANDS_DIR = path.join(__dirname, '..', 'commands', 'gsd');
+const REAL_PACKAGE_ROOT = path.resolve(__dirname, '..');
 const MANIFEST = loadSkillsManifest(REAL_COMMANDS_DIR);
 const RESOLVED_CORE = resolveProfile({ modes: ['core'], manifest: MANIFEST });
 const RESOLVED_FULL = resolveProfile({ modes: ['full'], manifest: MANIFEST });
@@ -54,22 +55,14 @@ const TEST_ATTRIBUTION = () => 'Co-Authored-By: Test <t@example.com>';
 
 /**
  * Sandbox HOME/USERPROFILE for the duration of a test. Some runtimes (e.g.
- * codex) resolve a kind's `home` via os.homedir(); without this, an
- * in-process install would write into the developer's real home directory.
- * Mirrors tests/install-runtime-artifacts.test.cjs's sandboxHome().
+ * codex) resolve a kind's `home` via os.homedir(); without this, an in-process
+ * install would write into the developer's real home directory.
+ *
+ * #3712: promoted to tests/helpers.cjs, from the byte-identical copy that used
+ * to live here. It now also sets the sandbox marker src/real-home-guard.cts
+ * needs to stay permissive on hosts with no readable passwd entry.
  */
-function sandboxHome(t, dir) {
-  const savedHome = process.env.HOME;
-  const savedUserProfile = process.env.USERPROFILE;
-  process.env.HOME = dir;
-  process.env.USERPROFILE = dir;
-  t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
-    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = savedUserProfile;
-  });
-}
+const { sandboxHome } = require('./helpers.cjs');
 
 // ─── E3 — the opencode-family early return (matrix row E3) ──────────────────
 
@@ -157,13 +150,11 @@ const REAL_FS_WRITE_SURFACE = [
   'mkdtempSync', 'openSync', 'readSync', 'closeSync',
 ];
 
-// Package-source roots a correct install is expected to read for real, even
-// while a fake DESTINATION adapter is injected (40-design.md "Known limits":
-// this seam makes destination IO fake-able; package-source IO stays real by
-// design). Mirrors findInstallSourceRoot's/findAgentsSourceRoot's/
-// readGsdCommandNames's own targets (commands/gsd/, agents/), all resolved
-// the same way REAL_COMMANDS_DIR is above.
-const PACKAGE_SOURCE_ROOTS = [REAL_COMMANDS_DIR, path.join(__dirname, '..', 'agents')];
+// The provider resolver probes upward through the executing package before it
+// reaches commands/gsd and agents. All read-only package-tree probes are valid
+// real IO while a fake DESTINATION adapter is active; destination paths remain
+// poisoned below.
+const PACKAGE_SOURCE_ROOTS = [path.resolve(__dirname, '..')];
 
 function isPackageSourcePath(resolvedPath) {
   return PACKAGE_SOURCE_ROOTS.some(
@@ -398,6 +389,29 @@ function sha256Hex(content) {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
+function fakeInstalledCorpusSeed(configDir) {
+  const coreDir = path.join(configDir, 'gsd-core');
+  const commandsDir = path.join(coreDir, 'commands');
+  const commandsGsdDir = path.join(commandsDir, 'gsd');
+  const agentsDir = path.join(coreDir, 'agents');
+  return [
+    [configDir, { type: 'dir' }],
+    [coreDir, { type: 'dir' }],
+    [commandsDir, { type: 'dir' }],
+    [commandsGsdDir, { type: 'dir' }],
+    [path.join(commandsGsdDir, 'fixture.md'), { type: 'file', content: '# Fixture command\n' }],
+    [agentsDir, { type: 'dir' }],
+    [path.join(agentsDir, 'fixture-agent.md'), { type: 'file', content: '# Fixture agent\n' }],
+  ];
+}
+
+function fakeInstalledCorpusManifestFiles() {
+  return {
+    'gsd-core/commands/gsd/fixture.md': sha256Hex('# Fixture command\n'),
+    'gsd-core/agents/fixture-agent.md': sha256Hex('# Fixture agent\n'),
+  };
+}
+
 describe('installRuntimeArtifacts — F2: fake-adapter install touches no real filesystem', () => {
   test('fake-adapter install touches no real filesystem (claude, skills-only)', (t) => {
     // Every real fs method this call tree could reach is poisoned BY PATH
@@ -407,15 +421,16 @@ describe('installRuntimeArtifacts — F2: fake-adapter install touches no real f
     // try/finally inside test bodies").
     const packageSourceHits = poisonRealFsAgainstDestination(t, '');
 
-    const fakeFs = createFakeInstallFs();
-
-    // configDir deliberately never created for real — F2 asserts nothing
-    // real ever gets written under it.
     const configDir = path.join(os.tmpdir(), `gsd-f2-must-not-exist-${crypto.randomUUID()}`);
+    const fakeFs = createFakeInstallFs(fakeInstalledCorpusSeed(configDir));
+
+    // configDir exists only in the fake store — F2 asserts nothing real ever
+    // gets written under it. The installed corpus seed is the new provider
+    // contract, not destination setup on the host filesystem.
 
     const result = installRuntimeArtifacts(
       'claude', configDir, 'global', RESOLVED_CORE, undefined, undefined,
-      { fs: fakeFs },
+      { fs: fakeFs, packageRoot: REAL_PACKAGE_ROOT },
     );
 
     assert.notStrictEqual(
@@ -444,10 +459,13 @@ describe('installRuntimeArtifacts — F2: fake-adapter install touches no real f
     const legacyFile = path.join(legacyDir, 'gsd-old-cmd.md');
     const content = '# stale legacy command\n';
     const manifestPath = path.join(configDir, 'gsd-file-manifest.json');
-    const manifestJson = JSON.stringify({ files: { 'command/gsd-old-cmd.md': sha256Hex(content) } });
+    const manifestJson = JSON.stringify({ files: {
+      ...fakeInstalledCorpusManifestFiles(),
+      'command/gsd-old-cmd.md': sha256Hex(content),
+    } });
 
     const fakeFs = createFakeInstallFs([
-      [configDir, { type: 'dir' }],
+      ...fakeInstalledCorpusSeed(configDir),
       [legacyDir, { type: 'dir' }],
       [legacyFile, { type: 'file', content }],
       [manifestPath, { type: 'file', content: manifestJson }],
@@ -455,7 +473,7 @@ describe('installRuntimeArtifacts — F2: fake-adapter install touches no real f
 
     const result = installRuntimeArtifacts(
       'opencode', configDir, 'global', RESOLVED_CORE, undefined, undefined,
-      { fs: fakeFs },
+      { fs: fakeFs, packageRoot: REAL_PACKAGE_ROOT },
     );
 
     assert.notStrictEqual(result, undefined, 'F2 (opencode legacy migration): must still return a plan');
@@ -484,7 +502,7 @@ describe('installRuntimeArtifacts — F2: fake-adapter install touches no real f
     // the poisoned list (see install-fs-adapter.cts's module doc — it is
     // deliberately unrouted, real-fs-only, package-source introspection), so
     // resolving this here is safe even after poisoning existsSync et al.
-    const commandsGsdDir = runtimeArtifactLayout.findInstallSourceRoot();
+    const commandsGsdDir = REAL_COMMANDS_DIR;
     const repoRoot = path.dirname(path.dirname(commandsGsdDir));
     const nativePlugin = registry.runtimes.pi.runtime.hostBehaviors.nativePlugin;
     assert.ok(nativePlugin && nativePlugin.source, 'pi must declare hostBehaviors.nativePlugin.source (registry drifted)');
@@ -497,7 +515,7 @@ describe('installRuntimeArtifacts — F2: fake-adapter install touches no real f
 
     const result = installRuntimeArtifacts(
       'pi', configDir, 'global', RESOLVED_CORE, undefined, undefined,
-      { fs: fakeFs },
+      { fs: fakeFs, packageRoot: REAL_PACKAGE_ROOT },
     );
 
     assert.notStrictEqual(result, undefined, 'F2 (nativePlugin): must still return a plan');
@@ -530,10 +548,13 @@ describe('installRuntimeArtifacts — F2: fake-adapter install touches no real f
     const content = '# stale retired artifact\n';
     const relPath = `${destSubpath.replace(/\\/g, '/')}/${staleName}`;
     const manifestPath = path.join(configDir, 'gsd-file-manifest.json');
-    const manifestJson = JSON.stringify({ files: { [relPath]: sha256Hex(content) } });
+    const manifestJson = JSON.stringify({ files: {
+      ...fakeInstalledCorpusManifestFiles(),
+      [relPath]: sha256Hex(content),
+    } });
 
     const fakeFs = createFakeInstallFs([
-      [configDir, { type: 'dir' }],
+      ...fakeInstalledCorpusSeed(configDir),
       [destDir, { type: 'dir' }],
       [staleFile, { type: 'file', content }],
       [manifestPath, { type: 'file', content: manifestJson }],
@@ -1173,12 +1194,29 @@ describe('installRuntimeArtifacts — K3: real install before/after, full recurs
     for (const runtime of ['claude', 'qwen']) {
       const dirA = createTempDir(`gsd-k3-${runtime}-a-`);
       const dirB = createTempDir(`gsd-k3-${runtime}-b-`);
-      t.after(() => { cleanup(dirA); cleanup(dirB); });
+      // Two SEQUENTIAL sandboxes for one test: sandboxHome()'s per-call
+      // t.after hooks each save the env as they found it, so the second call
+      // saves the FIRST sandbox as its "original" — hook ordering then leaves
+      // HOME pointing at dirA after the test, leaking into later tests in the
+      // shard (observed on the windows matrix: a leaked gsd-k3-qwen-* home
+      // made the L2 property's antigravity/global run refuse via the
+      // #3712 real-home guard). Manage the env directly with ONE restore.
+      const savedHome = process.env.HOME;
+      const savedUserProfile = process.env.USERPROFILE;
+      const savedMarker = process.env.GSD_TEST_HOME_SANDBOX;
+      t.after(() => {
+        if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+        if (savedUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedUserProfile;
+        if (savedMarker === undefined) delete process.env.GSD_TEST_HOME_SANDBOX; else process.env.GSD_TEST_HOME_SANDBOX = savedMarker;
+        cleanup(dirA); cleanup(dirB);
+      });
 
-      sandboxHome(t, dirA);
-      installRuntimeArtifacts(runtime, dirA, 'global', RESOLVED_FULL);
-      sandboxHome(t, dirB);
-      installRuntimeArtifacts(runtime, dirB, 'global', RESOLVED_FULL);
+      for (const dir of [dirA, dirB]) {
+        process.env.HOME = dir;
+        process.env.USERPROFILE = dir;
+        process.env.GSD_TEST_HOME_SANDBOX = dir;
+        installRuntimeArtifacts(runtime, dir, 'global', RESOLVED_FULL);
+      }
 
       const filesA = walkFilesRecursively(dirA);
       const filesB = walkFilesRecursively(dirB);
@@ -1187,6 +1225,19 @@ describe('installRuntimeArtifacts — K3: real install before/after, full recurs
         `K3 (${runtime}): the file sets written by two independent installs must match`,
       );
       for (const [relPath, contentA] of filesA) {
+        if (relPath === '.gsd-source') {
+          assert.strictEqual(
+            contentA.toString('utf8'),
+            `${path.join(dirA, 'gsd-core', 'commands', 'gsd')}\n`,
+            `K3 (${runtime}): first marker must target its own installed corpus`,
+          );
+          assert.strictEqual(
+            filesB.get(relPath).toString('utf8'),
+            `${path.join(dirB, 'gsd-core', 'commands', 'gsd')}\n`,
+            `K3 (${runtime}): second marker must target its own installed corpus`,
+          );
+          continue;
+        }
         assert.ok(
           contentA.equals(filesB.get(relPath)),
           `K3 (${runtime}): ${relPath} content drifted between two independent installs`,
@@ -1268,17 +1319,36 @@ describe('installRuntimeArtifacts — L2: plan is deterministic (property)', () 
     };
   }
 
-  test('plan is deterministic', () => {
+  test('plan is deterministic', (t) => {
     const runtimes = Object.keys(registry.runtimes);
     const RUNTIME_ARB = fc.constantFrom(...runtimes);
     const SCOPE_ARB = fc.constantFrom('global', 'local');
     let hits = 0;
+    // #3738: the per-run HOME sandbox must EXIST on disk — the #3712 guard's
+    // sandbox exemption fails closed when it cannot stat the effective home
+    // (identify() -> 'absent'), which is exactly what a never-created configDir
+    // gives it on the windows matrix where tmpdir sits under the real home.
+    const createdL2Dirs = [];
+    t.after(() => { for (const d of createdL2Dirs) cleanup(d); });
 
     fc.assert(
       fc.property(RUNTIME_ARB, SCOPE_ARB, (runtime, scope) => {
         // configDir is never created for real — both calls run against fresh,
         // independent fake adapters, so no real fs cleanup is needed here.
         const configDir = path.join(os.tmpdir(), `gsd-l2-${runtime}-${crypto.randomUUID()}`);
+        fs.mkdirSync(configDir, { recursive: true });
+        createdL2Dirs.push(configDir);
+        // #3738: a home-override runtime (antigravity → <HOME>/.gemini/config)
+        // resolves its dest from os.homedir(), NOT configDir — sandbox HOME to
+        // configDir for the duration of both calls (mirroring L1 above) so the
+        // plan never escapes into an ambient or leaked home and the #3712
+        // real-home guard stays satisfied on hosts where tmpdir sits under the
+        // real home (windows).
+        const savedL2Home = process.env.HOME;
+        const savedL2UserProfile = process.env.USERPROFILE;
+        process.env.HOME = configDir;
+        process.env.USERPROFILE = configDir;
+        try {
         const planA = installRuntimeArtifacts(runtime, configDir, scope, RESOLVED_CORE, undefined, undefined, { fs: createFakeInstallFs() });
         const planB = installRuntimeArtifacts(runtime, configDir, scope, RESOLVED_CORE, undefined, undefined, { fs: createFakeInstallFs() });
         hits++;
@@ -1289,6 +1359,10 @@ describe('installRuntimeArtifacts — L2: plan is deterministic (property)', () 
           `L2 (${runtime}/${scope}): two installs against fresh fake adapters with the same inputs must ` +
           'yield structurally identical plans (temp-dir names normalized — see normalizePlanForIdempotence)',
         );
+        } finally {
+          if (savedL2Home === undefined) delete process.env.HOME; else process.env.HOME = savedL2Home;
+          if (savedL2UserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedL2UserProfile;
+        }
       }),
       { numRuns: 30, seed: 2874, verbose: true },
     );

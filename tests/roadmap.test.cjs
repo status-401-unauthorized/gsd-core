@@ -10,7 +10,8 @@ const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
-const { runGsdTools, createTempProject, cleanup } = require('./helpers.cjs');
+const { runGsdTools, createTempProject, cleanup, captureFdSync } = require('./helpers.cjs');
+const { scanFencedBlocks } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
 
 describe('roadmap get-phase command', () => {
   let tmpDir;
@@ -1201,19 +1202,7 @@ describe('#3057 B3: roadmap update-plan-progress — verification staleness-chec
    * corrupts the captured payload into two concatenated JSON objects).
    */
   function captureUpdatePlanProgress(t, cwd, phaseNum) {
-    const chunks = [];
-    const origWriteSync = fs.writeSync.bind(fs);
-    t.mock.method(fs, 'writeSync', (fd, data, offset, length) => {
-      if (fd === 2) return Buffer.isBuffer(data) ? data.length : String(data).length;
-      if (fd !== 1) return origWriteSync(fd, data, offset, length);
-      const chunk = Buffer.isBuffer(data)
-        ? data.subarray(offset ?? 0, length === undefined ? data.length : (offset ?? 0) + length).toString('utf8')
-        : String(data);
-      chunks.push(chunk);
-      return Buffer.byteLength(chunk, 'utf8');
-    });
-    roadmapMod.cmdRoadmapUpdatePlanProgress(cwd, phaseNum, false);
-    const captured = chunks.join('');
+    const captured = captureFdSync(1, () => roadmapMod.cmdRoadmapUpdatePlanProgress(cwd, phaseNum, false));
     assert.ok(captured.length > 0, 'cmdRoadmapUpdatePlanProgress produced no stdout output');
     return captured;
   }
@@ -1953,9 +1942,12 @@ describe('bug #2661: execute-plan.md update_roadmap gating', () => {
     // The sync call must be inside an `if [ "$IS_WORKTREE" != "true" ]` block,
     // i.e. it must NOT be unconditional and it must NOT appear on the worktree branch.
     // We verify by extracting the bash block and checking the call sits under the gate.
-    const bashMatch = step.match(/```bash\s*([\s\S]*?)```/);
-    assert.ok(bashMatch, 'update_roadmap must contain a bash block');
-    const bash = bashMatch[1];
+    const stepLines = step.split(/\r?\n/);
+    const bashFence = scanFencedBlocks(stepLines).find(
+      (b) => b.closeLineIdx !== -1 && (b.infoString || '').trim() === 'bash',
+    );
+    assert.ok(bashFence, 'update_roadmap must contain a bash block');
+    const bash = stepLines.slice(bashFence.openLineIdx + 1, bashFence.closeLineIdx).join('\n');
 
     assert.ok(
       /IS_WORKTREE/.test(bash),
@@ -3849,5 +3841,752 @@ describe('bug #3263: roadmap validate warns on a truncated milestone window', ()
       const payload = JSON.parse(result.output);
       assert.deepStrictEqual(payload.warnings, [], 'unscoped roadmap must have no warnings');
     } finally { cleanup(tmpDir); }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #3641: hasPhaseEntries is convention-blind — V005 (and V004) cannot see
+// bracket-convention phase entries (`### [GSD.04] 01: Name`), so a genuinely
+// truncated bracket window classifies COMPLETE and validate stays silent
+// (while V004 falsely reports "no recognizable phase entries"). The fix
+// threads the resolved `phase_id_convention` into hasPhaseEntries and routes
+// V004 through the same owner. Mirrors the #3263 harness directly above.
+// Matrix: .gsd/bug/fix-3641-hasphaseentries-convention-v005/50-test-matrix.md
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('bug #3641: bracket-convention windows are visible to validate (V005/V004)', () => {
+  const ROADMAP_PARSER_LIB = path.join(__dirname, '..', 'gsd-core', 'bin', 'lib', 'roadmap-parser.cjs');
+
+  function writeFixture3641(tmpDir, roadmapContent, stateFields, conventionSource) {
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), roadmapContent);
+    if (stateFields) {
+      const lines = ['---'];
+      for (const [k, v] of Object.entries(stateFields)) lines.push(`${k}: ${v}`);
+      lines.push('---', '');
+      fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), lines.join('\n'));
+    }
+    if (conventionSource && conventionSource.kind === 'config') {
+      fs.writeFileSync(
+        path.join(tmpDir, '.planning', 'config.json'),
+        JSON.stringify({ phase_id_convention: 'bracket' }, null, 2),
+      );
+    }
+    // kind === 'frontmatter': the roadmap content itself carries the frontmatter.
+  }
+
+  const BRACKET_TRUNCATED_ROADMAP = [
+    '# Roadmap',
+    '',
+    '## v3.0 In Progress 🚧',
+    '',
+    'Some preamble notes. No phase headings here.',
+    '',
+    '## v4.0 Next',
+    '',
+    '### [GSD.04] 01: Foo',
+    '',
+    '### [GSD.04] 02: Bar',
+  ].join('\n');
+
+  test('bracket truncated window (config convention) → V005 fires, no false V004', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-truncated-');
+    t.after(() => cleanup(tmpDir));
+  writeFixture3641(tmpDir, BRACKET_TRUNCATED_ROADMAP, { milestone: 'v3.0' }, { kind: 'config' });
+  const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+  assert.strictEqual(result.success, false, 'truncated bracket window must exit non-zero');
+  const payload = JSON.parse(result.output);
+  assert.ok(payload.warnings.some((w) => w.code === 'V005'),
+    `truncated bracket window must produce V005; got: ${JSON.stringify(payload)}`);
+  assert.ok(!payload.warnings.some((w) => w.code === 'V004'),
+    `the document HAS bracket phase entries — V004 must not fire; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('bracket complete window → no warnings, exit 0', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-complete-');
+    t.after(() => cleanup(tmpDir));
+  writeFixture3641(tmpDir, [
+    '# Roadmap',
+    '',
+    '## v3.0 In Progress 🚧',
+    '',
+    '### [GSD.03] 01: Foo',
+    '',
+    '### [GSD.03] 02: Bar',
+    '',
+    '## v4.0 Next',
+    '',
+    'Later plans.',
+  ].join('\n'), { milestone: 'v3.0' }, { kind: 'config' });
+  const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+  assert.ok(result.success, `complete bracket window must exit 0; got: ${result.error}`);
+  const payload = JSON.parse(result.output);
+  assert.deepStrictEqual(payload.warnings, [], `complete bracket window must have no warnings; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('bracket truncated window (frontmatter convention) → V005 fires', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-fm-');
+    t.after(() => cleanup(tmpDir));
+  const withFrontmatter = [
+    '---',
+    'phase_id_convention: bracket',
+    '---',
+    '',
+    BRACKET_TRUNCATED_ROADMAP,
+  ].join('\n');
+  writeFixture3641(tmpDir, withFrontmatter, { milestone: 'v3.0' }, { kind: 'frontmatter' });
+  const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+  assert.strictEqual(result.success, false, 'frontmatter-convention truncated window must exit non-zero');
+  const payload = JSON.parse(result.output);
+  assert.ok(payload.warnings.some((w) => w.code === 'V005'),
+    `frontmatter convention must resolve for V005; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('legacy truncated window without convention → V005 still fires (parity)', (t) => {
+    const tmpDir = createTempProject('gsd-3641-legacy-parity-');
+    t.after(() => cleanup(tmpDir));
+  writeFixture3641(tmpDir, [
+    '# Roadmap',
+    '',
+    '## v3.0 In Progress 🚧',
+    '',
+    'Some preamble notes.',
+    '',
+    '## v4.0 Next',
+    '',
+    '### Phase 1: Foo',
+    '',
+    '### Phase 2: Bar',
+  ].join('\n'), { milestone: 'v3.0' }, null);
+  const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+  assert.strictEqual(result.success, false, 'legacy truncated window must still exit non-zero');
+  const payload = JSON.parse(result.output);
+  assert.ok(payload.warnings.some((w) => w.code === 'V005'),
+    `legacy V005 behavior must be unchanged; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('bracket-spelling roadmap without convention → not widened (V004 only)', (t) => {
+    const tmpDir = createTempProject('gsd-3641-no-convention-');
+    t.after(() => cleanup(tmpDir));
+  writeFixture3641(tmpDir, BRACKET_TRUNCATED_ROADMAP, { milestone: 'v3.0' }, null);
+  const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+  assert.strictEqual(result.success, false, 'unrecognized entries must still exit non-zero');
+  const payload = JSON.parse(result.output);
+  assert.ok(payload.warnings.some((w) => w.code === 'V004'),
+    `a project that never opted in keeps the legacy reading (V004); got: ${JSON.stringify(payload)}`);
+  assert.ok(!payload.warnings.some((w) => w.code === 'V005'),
+    `no convention declared — the widened grammar must not engage; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('bracket phase-less roadmap with bracket milestone name headings → V004 only, no V005', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-phaseless-');
+    t.after(() => cleanup(tmpDir));
+  writeFixture3641(tmpDir, [
+    '# Roadmap',
+    '',
+    '## [GSD.02] Foundation',
+    '',
+    'Nothing planned yet. A bracket MILESTONE heading is a bracket plus a',
+    'name — not a phase entry (no digit-then-colon tail).',
+  ].join('\n'), { milestone: 'v3.0' }, { kind: 'config' });
+  const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+  assert.strictEqual(result.success, false, 'genuinely phase-less bracket roadmap must exit non-zero');
+  const payload = JSON.parse(result.output);
+  assert.ok(payload.warnings.some((w) => w.code === 'V004'),
+    `V004 owns the phase-less case under bracket too; got: ${JSON.stringify(payload)}`);
+  assert.ok(!payload.warnings.some((w) => w.code === 'V005'),
+    `a phase-less window must never produce V005; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('fenced bracket heading example does not count as a phase entry', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-fence-');
+    t.after(() => cleanup(tmpDir));
+  writeFixture3641(tmpDir, [
+    '# Roadmap',
+    '',
+    '## v3.0 In Progress 🚧',
+    '',
+    'Documentation example of the syntax:',
+    '',
+    '```markdown',
+    '### [GSD.03] 01: Documented example',
+    '```',
+    '',
+    'No real phase headings anywhere.',
+    '',
+    '## v4.0 Next',
+    '',
+    'Later plans.',
+  ].join('\n'), { milestone: 'v3.0' }, { kind: 'config' });
+  const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+  assert.strictEqual(result.success, false, 'fenced-example-only roadmap must exit non-zero');
+  const payload = JSON.parse(result.output);
+  assert.ok(payload.warnings.some((w) => w.code === 'V004'),
+    `a fenced example is not a real entry; got: ${JSON.stringify(payload)}`);
+  assert.ok(!payload.warnings.some((w) => w.code === 'V005'),
+    `fenced examples must not flip the scope axis; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('bracket+label mixed spelling still recognized under bracket convention', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-mixed-');
+    t.after(() => cleanup(tmpDir));
+  writeFixture3641(tmpDir, [
+    '# Roadmap',
+    '',
+    '## v3.0 In Progress 🚧',
+    '',
+    '### [GSD.03] Phase 01: Foo',
+    '',
+    '## v4.0 Next',
+    '',
+    'Later plans.',
+  ].join('\n'), { milestone: 'v3.0' }, { kind: 'config' });
+  const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+  assert.ok(result.success, `mixed spelling is already-recognized — must exit 0; got: ${result.error}`);
+  const payload = JSON.parse(result.output);
+  assert.deepStrictEqual(payload.warnings, [], `mixed spelling must stay recognized; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('colon-bearing bracket milestone heading in-window does not read as a phase entry (#3641 review HIGH)', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-colon-milestone-');
+    t.after(() => cleanup(tmpDir));
+    writeFixture3641(tmpDir, [
+      '# Roadmap',
+      '',
+      '## [GSD.03] v3.0: Current',
+      '',
+      'No phases under the active milestone — and its own heading carries a',
+      'colon, which must NOT make the window read as having phase entries.',
+      '',
+      '## [GSD.04] v4.0: Next',
+      '',
+      '### [GSD.04] 01: Foo',
+    ].join('\n'), { milestone: 'v3.0' }, { kind: 'config' });
+    const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+    assert.strictEqual(result.success, false, 'truncated bracket window (colon-bearing milestone heading) must exit non-zero');
+    const payload = JSON.parse(result.output);
+    assert.ok(payload.warnings.some((w) => w.code === 'V005'),
+      `ADR-612 discriminator: a bracket + NAME(:version) heading is a milestone, not an entry — the window is still truncated; got: ${JSON.stringify(payload)}`);
+    assert.ok(!payload.warnings.some((w) => w.code === 'V004'), `real bracket entries exist; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('decoy bracket notes heading outside the window does not manufacture V005 (#3641 review MEDIUM)', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-decoy-');
+    t.after(() => cleanup(tmpDir));
+    writeFixture3641(tmpDir, [
+      '# Roadmap',
+      '',
+      '## v3.0 Current 🚧',
+      '',
+      'Nothing planned yet — a genuinely phase-less milestone.',
+      '',
+      '## v4.0 Next',
+      '',
+      '### [GSD.04] Notes: follow-ups',
+      '',
+      'Prose under a later milestone, not a phase entry.',
+    ].join('\n'), { milestone: 'v3.0' }, { kind: 'config' });
+    const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+    assert.strictEqual(result.success, false, 'phase-less bracket roadmap must exit non-zero');
+    const payload = JSON.parse(result.output);
+    assert.ok(payload.warnings.some((w) => w.code === 'V004'),
+      `no real entries — V004 owns the verdict; got: ${JSON.stringify(payload)}`);
+    assert.ok(!payload.warnings.some((w) => w.code === 'V005'),
+      `a decoy colon heading must never flip the scope axis to TRUNCATED; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('milestone-scope probe agrees with validate on a truncated bracket window (#3641 review MEDIUM)', (t) => {
+    const tmpDir = createTempProject('gsd-3641-bracket-probe-');
+    t.after(() => cleanup(tmpDir));
+    writeFixture3641(tmpDir, BRACKET_TRUNCATED_ROADMAP, { milestone: 'v3.0' }, { kind: 'config' });
+    const result = runGsdTools(['roadmap', 'milestone-scope', '--raw'], tmpDir);
+    assert.ok(result.success, `probe must exit 0; got: ${result.error}`);
+    const payload = JSON.parse(result.output);
+    assert.strictEqual(payload.scope, 'truncated',
+      `the #3262 capture/compare signal must agree with validate's V005 classifier; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('colon-less legacy phase heading alone still yields V004 (owner-entry definition pin)', (t) => {
+    const tmpDir = createTempProject('gsd-3641-colonless-');
+    t.after(() => cleanup(tmpDir));
+    writeFixture3641(tmpDir, [
+      '# Roadmap',
+      '',
+      '## v3.0 Current 🚧',
+      '',
+      '### Phase 1 — Foo',
+    ].join('\n'), { milestone: 'v3.0' }, null);
+    const result = runGsdTools(['roadmap', 'validate', '--raw'], tmpDir);
+    assert.strictEqual(result.success, false, 'colon-less-only roadmap must exit non-zero');
+    const payload = JSON.parse(result.output);
+    assert.ok(payload.warnings.some((w) => w.code === 'V004'),
+      `the canonical entry grammar is colon-terminated — a colon-less heading is not an entry for ANY reader; got: ${JSON.stringify(payload)}`);
+  });
+
+  test('hasPhaseEntries gates the widened grammar on the bracket convention (unit seam)', () => {
+    // Direct rows on the exported predicate: the widened heading grammar
+    // engages ONLY when the resolved convention is 'bracket'.
+    const roadmapParser = require(ROADMAP_PARSER_LIB);
+    assert.strictEqual(typeof roadmapParser.hasPhaseEntries, 'function',
+      'hasPhaseEntries must be exported for the validate seam (#3641)');
+    const bracketHeading = '### [GSD.04] 01: Foo';
+    const legacyHeading = '### Phase 01: Foo';
+    assert.strictEqual(roadmapParser.hasPhaseEntries(bracketHeading, 'bracket'), true,
+      "bracket convention: '[GSD.04] 01:' is a phase entry");
+    assert.strictEqual(roadmapParser.hasPhaseEntries(bracketHeading, null), false,
+      'no convention: the bracket+bare-number spelling is not an entry');
+    assert.strictEqual(roadmapParser.hasPhaseEntries(legacyHeading, 'bracket'), true,
+      'bracket convention is a superset — the legacy label stays recognized');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #3885 (ADR-3473 §8.5) / item 5 — `countPhasePlansAndSummaries` swallows an
+// unreadable phase directory into "absent", indistinguishable from a phase
+// that genuinely has no CONTEXT.md.
+//
+// Mechanism (src/roadmap.cts, countPhasePlansAndSummaries):
+//   try { phaseFiles = fs.readdirSync(phaseDir); } catch { /* empty */ }
+// An EACCES/EIO collapses `phaseFiles` to `[]`, which makes
+// `findContextMdIn(scopedFiles)` return null — identical to a phase dir that
+// was successfully read and genuinely has no CONTEXT.md. `cmdRoadmapAnalyze`
+// (the only exported consumer) surfaces this as `has_context: false` on the
+// phase's entry in `phases[]`, with nothing distinguishing "could not read"
+// from "nothing there".
+//
+// DESIGN DECISION (chosen by this test file, not yet implemented): each
+// `AnalyzePhase` gains a `context_read_error: string | null` field — null on
+// success (including a genuinely missing/ENOENT directory), and a message
+// string naming the phase directory when the readdirSync call fails with any
+// non-ENOENT error (EACCES, EIO, ...). Mirrors the SCOPE.UNREADABLE
+// discriminator `src/core-utils.cts`'s `getPhaseFileStats` already uses to
+// keep "unreadable" separate from "absent" on the sibling phase-stats path.
+//
+// `countPhasePlansAndSummaries` itself is not exported from roadmap.cjs, so
+// these tests drive the ONLY exported consumer, `cmdRoadmapAnalyze`, in
+// process — injecting the fs failure by monkeypatching `fs.readdirSync`
+// (restored in `finally`) and capturing `output()`'s raw fd-1 write by
+// monkeypatching `fs.writeSync` (io.cjs writes via `fs.writeSync(1, ...)`,
+// bypassing console.log, so `captureConsole()` cannot see it). NEVER
+// `chmod 0o000` — root bypasses mode bits, so that trick passes with zero
+// coverage in root Docker/CI.
+describe('#3885 (ADR-3473 §8.5): countPhasePlansAndSummaries distinguishes unreadable from absent (roadmap.cts caller)', () => {
+  let tmpDir;
+  let roadmapLib;
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+    roadmapLib = require('../gsd-core/bin/lib/roadmap.cjs');
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      '# Roadmap\n\n### Phase 3: API\n**Goal:** Build API\n',
+    );
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  // Runs `roadmapLib.cmdRoadmapAnalyze(cwd, false)` while capturing the raw
+  // fd-1 bytes `output()` writes via `fs.writeSync`, and returns the parsed
+  // JSON result. Restores `fs.writeSync` in `finally` even if analyze throws.
+  function runAnalyzeCapturingStdout(cwd) {
+    const chunks = [];
+    const origWriteSync = fs.writeSync;
+    fs.writeSync = function patchedWriteSync(fd, buffer, offset, length) {
+      if (fd !== 1) return origWriteSync.apply(fs, arguments);
+      const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+      const start = offset ?? 0;
+      const len = length ?? (buf.length - start);
+      chunks.push(Buffer.from(buf.subarray(start, start + len)));
+      return len;
+    };
+    try {
+      roadmapLib.cmdRoadmapAnalyze(cwd, false);
+    } finally {
+      fs.writeSync = origWriteSync;
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  }
+
+  // Monkeypatches `fs.readdirSync` so a call whose FIRST argument resolves to
+  // `targetPath` throws an error shaped like `code`; every other path is
+  // delegated to the real implementation. Returns a restorer — callers MUST
+  // invoke it in `finally`.
+  function injectReaddirFailure(targetPath, code) {
+    const resolved = path.resolve(targetPath);
+    const origReaddirSync = fs.readdirSync;
+    fs.readdirSync = function patchedReaddirSync(p, ...rest) {
+      if (path.resolve(String(p)) === resolved) {
+        const err = new Error(`${code}: simulated failure, scandir '${p}'`);
+        err.code = code;
+        throw err;
+      }
+      return origReaddirSync.call(fs, p, ...rest);
+    };
+    return () => { fs.readdirSync = origReaddirSync; };
+  }
+
+  function findPhase3(analyzeOutput) {
+    const phase = analyzeOutput.phases.find((p) => p.number === '3');
+    assert.ok(phase, `phase 3 must appear in analyze output; got: ${JSON.stringify(analyzeOutput.phases)}`);
+    return phase;
+  }
+
+  // T61 — MUST STAY GREEN: a readable phase directory with no CONTEXT.md
+  // reports has_context:false, and (using `?? null` so this passes both
+  // before and after the fix) no read-error signal.
+  test('T61: readableDirWithoutContextReportsFalse', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(path.join(phaseDir, '03-01-PLAN.md'), '---\nwave: 1\n---\n## Task 1\n');
+
+    const output = runAnalyzeCapturingStdout(tmpDir);
+    const phase = findPhase3(output);
+    assert.strictEqual(phase.has_context, false, 'no CONTEXT.md on disk — has_context must be false');
+    assert.strictEqual(phase.context_read_error ?? null, null, 'a readable, genuinely context-less dir must report no read error');
+  });
+
+  // T62 — RED today: measured on this tree, an EACCES on the phase
+  // directory's readdirSync collapses to has_context:false /
+  // disk_status:"empty" with nothing distinguishing it from a phase that was
+  // successfully read and genuinely has no CONTEXT.md. Required: the failure
+  // must be reported, naming the phase directory.
+  test('T62: unreadablePhaseDirIsNotReportedAsAbsent', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(path.join(phaseDir, '03-01-PLAN.md'), '---\nwave: 1\n---\n## Task 1\n');
+
+    const restore = injectReaddirFailure(phaseDir, 'EACCES');
+    let output;
+    try {
+      output = runAnalyzeCapturingStdout(tmpDir);
+    } finally {
+      restore();
+    }
+    const phase = findPhase3(output);
+    assert.strictEqual(
+      typeof (phase.context_read_error ?? null),
+      'string',
+      `an unreadable phase directory must be reported as an error, not silently absent; got context_read_error=${JSON.stringify(phase.context_read_error)}`,
+    );
+    assert.ok(
+      (phase.context_read_error || '').includes('03-api'),
+      `the reported error must name the discarded input (the phase directory); got: ${phase.context_read_error}`,
+    );
+  });
+
+  // T64 — MUST STAY GREEN: a genuinely missing directory (ENOENT) is absent,
+  // not an error — this is the row that keeps T62's fix from over-firing on
+  // every ordinary "no directory yet" phase. Injected the same way as T62/T63
+  // (readdirSync throws ENOENT for the exact phase-dir path) so the assertion
+  // exercises the discriminator itself, not merely "no error was ever
+  // thrown".
+  test('T64: missingDirIsGenuinelyAbsent', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(path.join(phaseDir, '03-01-PLAN.md'), '---\nwave: 1\n---\n## Task 1\n');
+
+    const restore = injectReaddirFailure(phaseDir, 'ENOENT');
+    let output;
+    try {
+      output = runAnalyzeCapturingStdout(tmpDir);
+    } finally {
+      restore();
+    }
+    const phase = findPhase3(output);
+    assert.strictEqual(
+      phase.context_read_error ?? null,
+      null,
+      `ENOENT must be treated as genuinely absent, not reported as an error; got: ${phase.context_read_error}`,
+    );
+  });
+
+  // ─── #4014 (epic #3473 B4-unreadable) matrix rows 7-9 ───────────────────
+  //
+  // `countPhasePlansAndSummaries` (not exported — driven through
+  // cmdRoadmapAnalyze, the same style as T61/T62/T64 above) gains a
+  // `context_scope` field on its result, surfaced on `AnalyzePhase` as
+  // `context_scope` — the typed SCOPE-enum sibling of the existing
+  // `context_read_error` string field.
+
+  test('#4014 matrix row 7: readable phase dir with CONTEXT.md reports has_context:true, context_scope:complete', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(path.join(phaseDir, 'CONTEXT.md'), '# context\n');
+
+    const output = runAnalyzeCapturingStdout(tmpDir);
+    const phase = findPhase3(output);
+    assert.strictEqual(phase.has_context, true);
+    assert.strictEqual(phase.context_scope, 'complete');
+    assert.strictEqual(phase.context_read_error ?? null, null);
+  });
+
+  test('#4014 matrix row 8: unreadable phase dir reports context_scope:unreadable, distinct from a genuinely empty phase dir', () => {
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '03-api');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(path.join(phaseDir, '03-01-PLAN.md'), '---\nwave: 1\n---\n## Task 1\n');
+
+    const restore = injectReaddirFailure(phaseDir, 'EACCES');
+    let output;
+    try {
+      output = runAnalyzeCapturingStdout(tmpDir);
+    } finally {
+      restore();
+    }
+    const phase = findPhase3(output);
+    assert.strictEqual(phase.has_context, false);
+    assert.strictEqual(phase.context_scope, 'unreadable',
+      `an unreadable phase directory must report context_scope 'unreadable', distinct from a genuinely empty one; got: ${phase.context_scope}`);
+  });
+
+  test('#4014 matrix row 9: genuinely absent phase dir reports context_scope:complete (boundary — not unreadable)', () => {
+    // No phase directory created at all — matches T64's ENOENT-shaped absence.
+    const output = runAnalyzeCapturingStdout(tmpDir);
+    const phase = findPhase3(output);
+    assert.strictEqual(phase.has_context, false);
+    assert.strictEqual(phase.context_scope, 'complete',
+      `a genuinely absent phase directory must report context_scope 'complete', not 'unreadable'; got: ${phase.context_scope}`);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #3957 (epic #3473 B9) — a no-op decline reports the real condition.
+// .gsd/phase/enhance-3957-noop-real-condition/{40-design,50-test-matrix}.md
+// Rows 11-18 of the test matrix. In-process (not runGsdTools's subprocess):
+// a subprocess's legacy result shape drops stderr on a clean (exit 0) run
+// (tests/helpers.cjs toLegacyShape), and a no-op decline is exactly that.
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('#3957 (epic #3473 B9): no-op decline reports the real condition', () => {
+  const roadmapLib = require('../gsd-core/bin/lib/roadmap.cjs');
+
+  // Mirrors state.test.cjs's captureCliIO — see that file's doc comment.
+  function captureCliIO(fn) {
+    const originalStderrWrite = process.stderr.write.bind(process.stderr);
+    let stderr = '';
+    process.stderr.write = (chunk) => {
+      stderr += String(chunk);
+      return true;
+    };
+    let stdout;
+    try {
+      stdout = captureFdSync(1, fn);
+    } finally {
+      process.stderr.write = originalStderrWrite;
+    }
+    return { stdout, stderr };
+  }
+
+  describe('cmdRoadmapUpdatePlanProgress', () => {
+    let tmpDir;
+    afterEach(() => { if (tmpDir) cleanup(tmpDir); });
+
+    // Row 11 (signature D — false success, B9.4). Run once to produce a real
+    // change, then re-run against the now-up-to-date ROADMAP.md.
+    test('update-plan-progress: idempotent re-run reports updated:false, does not rewrite', () => {
+      tmpDir = createTempProject();
+      fs.writeFileSync(
+        path.join(tmpDir, '.planning', 'ROADMAP.md'),
+        [
+          '# Roadmap', '',
+          '- [ ] **Phase 1: Test** - description', '',
+          '### Phase 1: Test', '**Goal:** Test goal', '**Plans:** TBD', '',
+          '## Progress', '',
+          '| Phase | Milestone | Plans Complete | Status | Completed |',
+          '|-------|-----------|----------------|--------|-----------|',
+          '| 1. Test | v1.0 | 0/1 | Planned | - |',
+          '',
+        ].join('\n'),
+      );
+      const p1 = path.join(tmpDir, '.planning', 'phases', '01-test');
+      fs.mkdirSync(p1, { recursive: true });
+      fs.writeFileSync(path.join(p1, '01-01-PLAN.md'), '# Plan 1');
+      fs.writeFileSync(path.join(p1, '01-01-SUMMARY.md'), '# Summary 1');
+      fs.writeFileSync(path.join(p1, '01-VERIFICATION.md'), '---\nstatus: passed\n---\n# Verification\n');
+
+      const first = captureCliIO(() => { roadmapLib.cmdRoadmapUpdatePlanProgress(tmpDir, '1', false); });
+      const firstOut = JSON.parse(first.stdout);
+      assert.strictEqual(firstOut.updated, true, 'setup: first run must be a real change');
+
+      const roadmapPath = path.join(tmpDir, '.planning', 'ROADMAP.md');
+      const beforeSecond = fs.readFileSync(roadmapPath, 'utf-8');
+      const beforeMtime = fs.statSync(roadmapPath).mtimeMs;
+
+      const second = captureCliIO(() => { roadmapLib.cmdRoadmapUpdatePlanProgress(tmpDir, '1', false); });
+      const secondOut = JSON.parse(second.stdout);
+
+      assert.strictEqual(secondOut.updated, false, 'idempotent re-run must not report updated:true');
+      assert.strictEqual(
+        secondOut.reason,
+        "no changes were needed — ROADMAP.md already reflects this phase's plan/summary counts and status",
+      );
+      assert.strictEqual(fs.readFileSync(roadmapPath, 'utf-8'), beforeSecond, 'ROADMAP.md bytes must not change');
+      assert.strictEqual(fs.statSync(roadmapPath).mtimeMs, beforeMtime, 'ROADMAP.md must not be rewritten (no write call)');
+      assert.match(
+        second.stderr,
+        /^\[gsd-tools\] WARNING: roadmap update-plan-progress skipped — no changes were needed;/,
+      );
+    });
+
+    // Row 12 (boundary — must not regress; pre-existing coverage exists
+    // above under "updates progress and checks checkbox on completion").
+    test('update-plan-progress: real change still reports updated:true', () => {
+      tmpDir = createTempProject();
+      fs.writeFileSync(
+        path.join(tmpDir, '.planning', 'ROADMAP.md'),
+        [
+          '# Roadmap', '',
+          '### Phase 1: Test', '**Goal:** Test goal', '**Plans:** TBD', '',
+          '## Progress', '',
+          '| Phase | Milestone | Plans Complete | Status | Completed |',
+          '|-------|-----------|----------------|--------|-----------|',
+          '| 1. Test | v1.0 | 0/2 | Planned | - |',
+          '',
+        ].join('\n'),
+      );
+      const p1 = path.join(tmpDir, '.planning', 'phases', '01-test');
+      fs.mkdirSync(p1, { recursive: true });
+      fs.writeFileSync(path.join(p1, '01-01-PLAN.md'), '# Plan 1');
+      fs.writeFileSync(path.join(p1, '01-02-PLAN.md'), '# Plan 2');
+      fs.writeFileSync(path.join(p1, '01-01-SUMMARY.md'), '# Summary 1');
+
+      const { stdout, stderr } = captureCliIO(() => { roadmapLib.cmdRoadmapUpdatePlanProgress(tmpDir, '1', false); });
+      const out = JSON.parse(stdout);
+      assert.strictEqual(out.updated, true);
+      assert.strictEqual(stderr, '', 'a real change must not emit a decline disclosure');
+      const roadmapContent = fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+      assert.ok(roadmapContent.includes('1/2'), 'roadmap should contain updated plan count');
+    });
+
+    // Row 13 (helper adoption — same reason/computed values, stderr now emitted).
+    test('update-plan-progress: missing roadmap still discloses via stderr', () => {
+      // createTempProject() never writes a ROADMAP.md itself — no ROADMAP.md
+      // is created at all, which is the fixture this row needs.
+      tmpDir = createTempProject();
+      const p1 = path.join(tmpDir, '.planning', 'phases', '01-test');
+      fs.mkdirSync(p1, { recursive: true });
+      fs.writeFileSync(path.join(p1, '01-01-PLAN.md'), '# Plan 1');
+
+      const { stdout, stderr } = captureCliIO(() => { roadmapLib.cmdRoadmapUpdatePlanProgress(tmpDir, '1', false); });
+      const out = JSON.parse(stdout);
+      assert.strictEqual(out.updated, false);
+      assert.strictEqual(out.reason, 'ROADMAP.md not found');
+      assert.strictEqual(out.plan_count, 1);
+      assert.strictEqual(out.summary_count, 0);
+      assert.match(stderr, /^\[gsd-tools\] WARNING: roadmap update-plan-progress skipped — ROADMAP\.md not found\./);
+    });
+
+    // Row 14 (helper adoption — the issue's own cited "correct" example).
+    test('update-plan-progress: zero plans still discloses via stderr', () => {
+      tmpDir = createTempProject();
+      fs.writeFileSync(
+        path.join(tmpDir, '.planning', 'ROADMAP.md'),
+        ['# Roadmap', '', '### Phase 1: Test', '**Goal:** Test goal', ''].join('\n'),
+      );
+      const p1 = path.join(tmpDir, '.planning', 'phases', '01-test');
+      fs.mkdirSync(p1, { recursive: true });
+      fs.writeFileSync(path.join(p1, '01-CONTEXT.md'), '# Context');
+
+      const { stdout, stderr } = captureCliIO(() => { roadmapLib.cmdRoadmapUpdatePlanProgress(tmpDir, '1', false); });
+      const out = JSON.parse(stdout);
+      assert.strictEqual(out.updated, false);
+      assert.strictEqual(out.reason, 'No plans found');
+      assert.strictEqual(out.plan_count, 0);
+      assert.strictEqual(out.summary_count, 0);
+      assert.match(stderr, /^\[gsd-tools\] WARNING: roadmap update-plan-progress skipped — no plans found for this phase\./);
+    });
+  });
+
+  describe('cmdRoadmapAnnotateDependencies', () => {
+    let tmpDir;
+    afterEach(() => { if (tmpDir) cleanup(tmpDir); });
+
+    // Row 15 (signature A) — the phase number does not resolve to any phase
+    // directory at all (distinct from "resolves with zero plans", row 16).
+    test('annotate-dependencies: unresolvable phase reports phase-not-found', () => {
+      tmpDir = createTempProject();
+      fs.writeFileSync(
+        path.join(tmpDir, '.planning', 'ROADMAP.md'),
+        ['# Roadmap', '', '### Phase 1: Foundation', '**Goal:** Set up project', ''].join('\n'),
+      );
+      // No .planning/phases/* directory for phase 2 anywhere on disk.
+
+      const { stdout, stderr } = captureCliIO(() => { roadmapLib.cmdRoadmapAnnotateDependencies(tmpDir, '2', false); });
+      const out = JSON.parse(stdout);
+      assert.strictEqual(out.updated, false);
+      assert.strictEqual(out.reason, 'phase 2 not found');
+      assert.match(stderr, /^\[gsd-tools\] WARNING: roadmap annotate-dependencies skipped — phase "2" not found\./);
+    });
+
+    // Row 16 (boundary vs #15) — the phase resolves to a real directory, but
+    // that directory has zero plan files in it.
+    test('annotate-dependencies: phase with no plans reports no-plans, distinct from phase-not-found', () => {
+      tmpDir = createTempProject();
+      fs.writeFileSync(
+        path.join(tmpDir, '.planning', 'ROADMAP.md'),
+        ['# Roadmap', '', '### Phase 1: Foundation', '**Goal:** Set up project', ''].join('\n'),
+      );
+      fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '01-foundation'), { recursive: true });
+
+      const { stdout, stderr } = captureCliIO(() => { roadmapLib.cmdRoadmapAnnotateDependencies(tmpDir, '1', false); });
+      const out = JSON.parse(stdout);
+      assert.strictEqual(out.updated, false);
+      assert.strictEqual(out.reason, 'phase 1 has no plans');
+      assert.notStrictEqual(out.reason, 'phase 1 not found', 'must be a distinct string from the not-found case');
+      assert.match(stderr, /^\[gsd-tools\] WARNING: roadmap annotate-dependencies skipped — phase "1" has no plans\./);
+    });
+
+    // Row 17 (helper adoption).
+    test('annotate-dependencies: missing roadmap still discloses via stderr', () => {
+      // createTempProject() never writes a ROADMAP.md itself — no ROADMAP.md
+      // is created at all, which is the fixture this row needs.
+      tmpDir = createTempProject();
+
+      const { stdout, stderr } = captureCliIO(() => { roadmapLib.cmdRoadmapAnnotateDependencies(tmpDir, '1', false); });
+      const out = JSON.parse(stdout);
+      assert.strictEqual(out.updated, false);
+      assert.strictEqual(out.reason, 'ROADMAP.md not found');
+      assert.match(stderr, /^\[gsd-tools\] WARNING: roadmap annotate-dependencies skipped — ROADMAP\.md not found\./);
+    });
+
+    // Row 18 (helper adoption) — every plan file in the phase is unreadable.
+    // Method-monkeypatch fault injection (CONTRIBUTING's cross-platform IO
+    // rule) rather than chmod: a real PLAN.md exists and is discoverable by
+    // findPhaseInternal, but fs.readFileSync throws for that exact path,
+    // deterministically on every platform/CI user (root Docker included).
+    test('annotate-dependencies: unreadable plans still discloses via stderr', () => {
+      tmpDir = createTempProject();
+      fs.writeFileSync(
+        path.join(tmpDir, '.planning', 'ROADMAP.md'),
+        [
+          '# Roadmap', '',
+          '### Phase 1: Foundation', '**Goal:** Set up project', '**Plans:** 1 plan', '',
+          'Plans:', '- [ ] 01-01-PLAN.md — Set up DB', '',
+        ].join('\n'),
+      );
+      const p1 = path.join(tmpDir, '.planning', 'phases', '01-foundation');
+      fs.mkdirSync(p1, { recursive: true });
+      const planPath = path.join(p1, '01-01-PLAN.md');
+      // A minimal, well-formed PLAN.md — content is irrelevant since the
+      // injected fs.readFileSync failure below fires before it is ever read.
+      fs.writeFileSync(planPath, '---\nphase: "1"\nplan: "01-01"\nwave: 1\n---\n\n<objective>\nPlan 1\n</objective>\n');
+
+      const originalReadFileSync = fs.readFileSync;
+      fs.readFileSync = (filePath, ...rest) => {
+        if (filePath === planPath) throw new Error('simulated unreadable plan file (#3957 row 18)');
+        return originalReadFileSync(filePath, ...rest);
+      };
+      let stdout, stderr;
+      try {
+        ({ stdout, stderr } = captureCliIO(() => { roadmapLib.cmdRoadmapAnnotateDependencies(tmpDir, '1', false); }));
+      } finally {
+        fs.readFileSync = originalReadFileSync;
+      }
+
+      const out = JSON.parse(stdout);
+      assert.strictEqual(out.updated, false);
+      assert.strictEqual(out.reason, 'could not read plan frontmatter');
+      assert.match(stderr, /^\[gsd-tools\] WARNING: roadmap annotate-dependencies skipped — could not read plan frontmatter/);
+    });
   });
 });
