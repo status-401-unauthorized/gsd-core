@@ -89,6 +89,45 @@ describe('writeGrokHooksJson / removeGrokHooksJson', () => {
     assert.match(payload.hooks.PostToolUse[0].matcher, /run_terminal_command/);
   });
 
+  test('Grok hook commands avoid the #3662 ${n} chain token (Grok interpolates ${VAR})', (t) => {
+    const dir = createTempDir();
+    t.after(() => cleanup(dir));
+    seedHookScripts(dir);
+
+    writeGrokHooksJson(dir, { runtime: 'grok' });
+    const payload = JSON.parse(fs.readFileSync(path.join(dir, 'hooks', GSD_GROK_HOOKS_FILE), 'utf8'));
+    for (const event of ['SessionStart', 'PreToolUse', 'PostToolUse', 'Stop']) {
+      const command = payload.hooks[event][0].hooks[0].command;
+      assert.doesNotMatch(
+        command,
+        /\$\{n/,
+        `${event} must not embed \${n} — Grok treats it as a required env var: ${command}`,
+      );
+      assert.doesNotMatch(
+        command,
+        /"\$\(for n in /,
+        `${event} must not use the #3662 inline chain token: ${command}`,
+      );
+      assert.match(
+        command,
+        /gsd-node-runner\.sh/,
+        `${event} must route through gsd-node-runner.sh: ${command}`,
+      );
+    }
+  });
+
+  test('portableHooks grok commands still avoid ${n}', (t) => {
+    const dir = createTempDir();
+    t.after(() => cleanup(dir));
+    seedHookScripts(dir);
+
+    writeGrokHooksJson(dir, { runtime: 'grok', portableHooks: true });
+    const payload = JSON.parse(fs.readFileSync(path.join(dir, 'hooks', GSD_GROK_HOOKS_FILE), 'utf8'));
+    const command = payload.hooks.PreToolUse[0].hooks[0].command;
+    assert.doesNotMatch(command, /\$\{n/, `portable grok command must not embed \${n}: ${command}`);
+    assert.match(command, /gsd-node-runner\.sh/, `portable grok command must use the resolver: ${command}`);
+  });
+
   test('is idempotent when content unchanged', (t) => {
     const dir = createTempDir();
     t.after(() => cleanup(dir));
@@ -323,6 +362,17 @@ test('grok --global: writes gsd-lifecycle.json + skills/agents under config dir'
   }
 
   assert.match(stdout, /Grok lifecycle hook/i);
+
+  // Grok expands ${VAR} in hook commands; the #3662 chain token is unusable.
+  for (const event of ['SessionStart', 'PreToolUse', 'PostToolUse', 'Stop']) {
+    const command = payload.hooks[event][0].hooks[0].command;
+    assert.doesNotMatch(command, /\$\{n/, `${event} command must not embed \${n}: ${command}`);
+    assert.match(command, /gsd-node-runner\.sh/, `${event} must use gsd-node-runner.sh: ${command}`);
+  }
+  assert.ok(
+    fs.existsSync(path.join(configDir, 'hooks', 'gsd-node-runner.sh')),
+    'gsd-node-runner.sh must be staged with the shared hooks bundle',
+  );
 });
 
 test('grok --global: installed agent + ui-phase workflow use Grok tool names', (t) => {

@@ -1277,6 +1277,30 @@ function buildHookCommand(configDir: string, hookName: string, opts?: BuildHookC
     });
   }
 
+  // Grok interpolates $VAR / ${VAR} in hook `command` strings before spawn.
+  // The #3662 chain token uses ${n#/} and $n as POSIX parameter expansions;
+  // Grok treats ${n} as a required env var and skips the hook with
+  // "required env var(s) not set: ${n}" (fires on every PreToolUse match,
+  // including Search). Route grok JS hooks through gsd-node-runner.sh so
+  // those expansions live in the script body, not the command string.
+  if (runtime === 'grok') {
+    const bakedToken = buildBakedNodeToken(opts);
+    if (bakedToken === null) return null;
+    const hooksDir = shellCmdProjection.posixNormalize(configDir) + '/hooks';
+    const resolverRunner = resolveBashRunner(opts) || 'bash';
+    return shellCmdProjection.projectShellCommandText({
+      runnerToken: resolverRunner,
+      argTokens: [
+        JSON.stringify(`${hooksDir}/${NODE_RUNNER_RESOLVER_HOOK}`),
+        bakedToken,
+        JSON.stringify(`${hooksDir}/${hookName}`),
+      ],
+      runtime,
+      platform,
+      hookShell,
+    });
+  }
+
   const chainRunner = buildNodeRunnerChainToken(opts);
   if (chainRunner === null) return null;
   const hooksPath = shellCmdProjection.posixNormalize(configDir) + '/hooks/' + hookName;
