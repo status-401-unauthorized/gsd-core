@@ -24,13 +24,38 @@ cleanup_temp_files() {
 }
 trap cleanup_temp_files EXIT
 
+# The 10 built-in Conventional Commits types — the SINGLE declaration (#3811
+# review finding: this was previously hand-typed a second time inside the
+# node -e script below, a generative-fix-divergence risk per CLAUDE.md's
+# known-defect list). Threaded into node via an env var; reused directly by
+# bash below when building COMMIT_TYPES.
+BUILTIN_COMMIT_TYPES=(feat fix docs style refactor perf test build ci chore)
+
 # Check opt-in config — exit silently if not enabled
 if [ -f .planning/config.json ]; then
   ENABLED_ERR=$(mktemp)
-  ENABLED=$(node -e "
+  # Single node invocation reads BOTH hooks.community (line 1: '1'/'0') and
+  # hooks.commit_types (remaining lines: one sanitized extra type per line) —
+  # see #3811. Sanitizing here, not in bash, keeps the safe-token check in one
+  # place and guarantees only [a-z][a-z0-9-]* strings ever reach the regex
+  # built below, so a configured value can never alter the compiled pattern's
+  # structure.
+  BUILTIN_COMMIT_TYPES_CSV=$(IFS=,; echo "${BUILTIN_COMMIT_TYPES[*]}")
+  CONFIG_OUT=$(GSD_BUILTIN_COMMIT_TYPES="$BUILTIN_COMMIT_TYPES_CSV" node -e "
     try{
       const c=require('./.planning/config.json');
       process.stdout.write(c.hooks?.community===true?'1':'0');
+      process.stdout.write('\n');
+      const raw=c.hooks?.commit_types;
+      const list=Array.isArray(raw)?raw:[];
+      const seen=new Set((process.env.GSD_BUILTIN_COMMIT_TYPES||'').split(',').filter(Boolean));
+      for (const t of list){
+        if (typeof t!=='string') continue;
+        if (!/^[a-z][a-z0-9-]*\$/.test(t)) continue;
+        if (seen.has(t)) continue;
+        seen.add(t);
+        process.stdout.write(t+'\n');
+      }
     }catch(e){
       process.stderr.write('CONFIG_READ_FAILED: '+(e&&e.message?e.message:String(e)));
       process.exit(3);
@@ -44,7 +69,20 @@ if [ -f .planning/config.json ]; then
     echo "gsd-validate-commit.sh: could not read .planning/config.json (opt-in check) — validator disabled for this call. $(cat "$ENABLED_ERR")" >&2
     exit 0
   fi
+  # Pure parameter expansion, not `printf ... | head -1`: same SIGPIPE race
+  # class as the SUBJECT extraction below (`echo "$MSG" | head -1`) — CONFIG_OUT
+  # is multi-line whenever extra commit types are configured, and `head -1`
+  # closing early can SIGPIPE `printf` under `set -euo pipefail`.
+  ENABLED="${CONFIG_OUT%%$'\n'*}"
   if [ "$ENABLED" != "1" ]; then exit 0; fi
+  # Remaining lines (if any) are the sanitized, deduped configured commit
+  # types beyond the 10 built-ins (#3811). Read into a bash-3.2-safe array —
+  # `mapfile`/`readarray` are bash 4+ only and this hook is tested against
+  # bash 3.2.57 (macOS default).
+  EXTRA_COMMIT_TYPES=()
+  while IFS= read -r _extra_type; do
+    [ -n "$_extra_type" ] && EXTRA_COMMIT_TYPES+=("$_extra_type")
+  done < <(printf '%s\n' "$CONFIG_OUT" | tail -n +2)
 else
   exit 0
 fi
@@ -180,7 +218,24 @@ if [ "$CLASSIFY_STATUS" = "0" ]; then
       # the message — the window a guard must use when the token it scans for
       # is also legal English inside a commit message, but may legally appear
       # on EITHER side of the message on the command line.
-      MSG_SUFFIX="${CMD#*"$MSG_MATCH"}"
+      # Indexed, not searched (#4492). `${CMD#*"$MSG_MATCH"}` is quadratic in
+      # the message: bash walks every prefix length and compares the whole
+      # matched literal at each one, and MSG_MATCH is BASH_REMATCH[0] — the
+      # entire `-m "..."` — so the cost grows with the thing being scanned.
+      # Measured on the path EVERY commit takes (conforming and non-conforming
+      # cost the same): 10.0 s at a 64 KB message, 22.0 s at 96 KB, 30.2 s at
+      # 112 KB. Sizes stop there deliberately — a single argument above Linux's
+      # MAX_ARG_STRLEN (131072 on a 4 KB-page kernel) never reaches this code
+      # at all, because execve fails and the hook fails open, so a larger
+      # "measurement" would be timing the wrong thing.
+      #
+      # MSG_PREFIX above has already located the match, so the suffix is
+      # arithmetic rather than a search: skip the prefix and the match. This
+      # removes the quadratic SEARCH; the expansion still counts characters and
+      # materialises a substring, so it is linear in the command, not O(1).
+      # Same first-occurrence assumption both expansions here always made —
+      # MSG_MATCH is a literal substring of CMD by construction.
+      MSG_SUFFIX="${CMD:$(( ${#MSG_PREFIX} + ${#MSG_MATCH} ))}"
       # LINE CONTINUATIONS ARE NOT SEPARATORS (review of #3816, rounds 8 and 9).
       # `git commit \` newline `  -m "$(cat <<'EOF' …` is an ordinary way to
       # spread an invocation over lines, and every guard below reads a newline in
@@ -487,15 +542,50 @@ if [ "$CLASSIFY_STATUS" = "0" ]; then
       SUBJECT=$(GIT_CMD_LIB="$HOOK_DIR/lib/git-cmd.js" MSG="$MSG" node -e "
         const {resolveCommitSubject}=require(process.env.GIT_CMD_LIB);
         process.stdout.write(resolveCommitSubject(process.env.MSG));
-      " 2>/dev/null) || SUBJECT=$(echo "$MSG" | head -1)
+      " 2>/dev/null) || SUBJECT="${MSG%%$'\n'*}"
     else
-      SUBJECT=$(echo "$MSG" | head -1)
+      # Pure parameter expansion, not `echo "$MSG" | head -1`: that pipeline
+      # raced a SIGPIPE under `set -euo pipefail` whenever $MSG had a body
+      # (the common case) — `head -1` can close its read end as soon as it
+      # has the first line, and if `echo`'s write lands after that close,
+      # `echo` dies with signal 13 (exit 141), which is NOT suppressed by
+      # `set -e` and aborted the whole hook intermittently (observed in
+      # tests/hooks-opt-in.test.cjs's --fixup=HEAD "round 7" case). Zero
+      # subprocesses here means zero pipe/race surface. Equivalent to
+      # `head -1` for single-line, multi-line, and trailing-newline input.
+      SUBJECT="${MSG%%$'\n'*}"
     fi
+    # Single source of truth for the accepted commit-type list (#3811): the
+    # 10 built-ins plus whatever passed the safe-token filter above. Both the
+    # regex alternation and the human-readable error text below are derived
+    # from this ONE array — no hand-synced second copy.
+    #
+    # The `"${EXTRA_COMMIT_TYPES[@]+"${EXTRA_COMMIT_TYPES[@]}"}"` form (not
+    # plain `"${EXTRA_COMMIT_TYPES[@]}"`) is required: on bash 3.2.57 (this
+    # repo's macOS test target), expanding `[@]` on an array that is declared
+    # but has zero elements throws "unbound variable" under `set -u` (which
+    # this script has via `set -euo pipefail`). Verified directly against
+    # /bin/bash 3.2.57 on macOS. The `${arr[@]+word}` form is the
+    # nounset-safe idiom for "expand if set, empty otherwise" on empty arrays.
+    COMMIT_TYPES=("${BUILTIN_COMMIT_TYPES[@]}" "${EXTRA_COMMIT_TYPES[@]+"${EXTRA_COMMIT_TYPES[@]}"}")
+    COMMIT_TYPE_ALT=$(IFS='|'; echo "${COMMIT_TYPES[*]}")
+    COMMIT_TYPE_LIST=$(printf '%s, ' "${COMMIT_TYPES[@]}")
+    COMMIT_TYPE_LIST="${COMMIT_TYPE_LIST%, }"
+    # Typed `valid_types` array (#3811 review finding): CONTRIBUTING.md bans
+    # substring/prose matching on `reason` in tests — a test needing to
+    # verify the accepted-type set must have a typed field, not grep prose.
+    # Safe to build with a bare printf (no JSON-escaping needed): every
+    # element of COMMIT_TYPES has already passed the `^[a-z][a-z0-9-]*$`
+    # safe-token filter (or is a literal built-in), so none can contain `"`
+    # or `\`.
+    COMMIT_TYPES_JSON=$(printf '"%s",' "${COMMIT_TYPES[@]}")
+    COMMIT_TYPES_JSON="[${COMMIT_TYPES_JSON%,}]"
     # Validate Conventional Commits format
-    if ! [[ "$SUBJECT" =~ ^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\(.+\))?:[[:space:]].+ ]]; then
-      # Emit a typed `code` field alongside `reason` (#2974). Tests assert
-      # on the stable code string; the reason is the human-readable copy.
-      echo '{"decision": "block", "code": "CONVENTIONAL_COMMITS_VIOLATION", "reason": "Commit message must follow Conventional Commits: <type>(<scope>): <subject>. Valid types: feat, fix, docs, style, refactor, perf, test, build, ci, chore. Subject must be <=72 chars, lowercase, imperative mood, no trailing period."}'
+    if ! [[ "$SUBJECT" =~ ^($COMMIT_TYPE_ALT)(\(.+\))?:[[:space:]].+ ]]; then
+      # Emit typed `code` and `valid_types` fields alongside `reason` (#2974,
+      # #3811). Tests assert on the stable code string and the typed array;
+      # the reason is the human-readable copy, never grepped by tests.
+      echo "{\"decision\": \"block\", \"code\": \"CONVENTIONAL_COMMITS_VIOLATION\", \"valid_types\": $COMMIT_TYPES_JSON, \"reason\": \"Commit message must follow Conventional Commits: <type>(<scope>): <subject>. Valid types: $COMMIT_TYPE_LIST. Subject must be <=72 chars, lowercase, imperative mood, no trailing period.\"}"
       exit 2
     fi
     if [ ${#SUBJECT} -gt 72 ]; then

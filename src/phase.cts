@@ -59,6 +59,12 @@ const { findPhaseInternal, getArchivedPhaseDirs, listMilestonePhaseDirs } = phas
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- roadmap-parser.cjs is an export= CommonJS module
 import roadmapParserMod = require('./roadmap-parser.cjs');
 const { stripShippedMilestones, extractCurrentMilestone, currentMilestoneRawRanges, withPhaseSection, findMilestoneScopeHeadingLines } = roadmapParserMod;
+// #4129: the single owner of "count the ROADMAP's milestone Complete rows"
+// (pure computation, no I/O — no cycle on this path) for the intent-first
+// progress counters the phase-complete transaction passes downstream.
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- phase-lifecycle.cjs is an export= CommonJS module
+import phaseLifecycleMod = require('./phase-lifecycle.cjs');
+const { deriveProgressFromRoadmap: deriveProgressFromRoadmapForIntent, clampPercent: clampPercentForIntent } = phaseLifecycleMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- planning-workspace.cjs is an export= CommonJS module
 import planningWorkspace = require('./planning-workspace.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- frontmatter.cjs is an export= CommonJS module
@@ -1229,12 +1235,24 @@ function assertDescriptionPreservesMilestoneScope(cwd: string, description: stri
  * before any directory does; milestone-scoping is wrong here because a number
  * used under any milestone on another branch is still taken).
  *
+ * #4225 — the horizon must track the ALLOCATION scope. When the allocation is
+ * workstream-scoped (`--ws`/`GSD_WORKSTREAM`, resolved into the env before
+ * dispatch), the sibling's copy of the SAME workstream is what carries that
+ * scope's independent numbering; the sibling's ROOT roadmap and phases/
+ * belong to a different numbering universe (docs/FEATURES.md §51 REQ-WS-01 —
+ * workstream state is isolated in `.planning/workstreams/{name}/`) and must
+ * not contribute. `planningDir(wt, ws)` reuses the canonical resolver, so the
+ * sibling scope matches the local scope's own resolution (env workstream plus
+ * env project segment) by construction; `ws === null` (no workstream active)
+ * keeps the #3849 root-scope horizon byte-for-byte.
+ *
  * Widen, never refuse: a missing `.planning/`, an unreadable sibling, a
  * non-git cwd, or an unavailable git binary each leave `used` untouched —
  * allocation then behaves exactly as it did before this horizon existed.
- * Sentinels reuse the canonical `isSentinelPhaseId`; the dir pattern is the
- * same one the on-disk scan uses, so decimal sub-phases (`411.1-foo`) are
- * correctly not integers.
+ * A sibling that simply lacks the active workstream's directory is the same
+ * fail-open case: it contributes nothing. Sentinels reuse the canonical
+ * `isSentinelPhaseId`; the dir pattern is the same one the on-disk scan uses,
+ * so decimal sub-phases (`411.1-foo`) are correctly not integers.
  */
 function collectSiblingWorktreePhaseNums(cwd: string, used: Set<number>): void {
   let porcelain: string;
@@ -1251,6 +1269,13 @@ function collectSiblingWorktreePhaseNums(cwd: string, used: Set<number>): void {
   } catch {
     return; // not a git repo / git unavailable — unchanged behavior
   }
+  // #4225: the env workstream, read once with planningDir's own discriminator
+  // (`?? null` = deliberately no workstream — never re-derived per sibling).
+  // A poisoned value would already have thrown at the local `planningDir(cwd)`
+  // call every allocator makes before reaching this horizon; the per-sibling
+  // try/catch below still keeps any resolution failure fail-open.
+  const ws = process.env['GSD_WORKSTREAM'] ?? null;
+  const siblingPlanningDir = (wt: string): string => planningDir(wt, ws);
   const dirNumPattern = /^(?:[A-Z][A-Z0-9]*-)?(\d+)-/;
   // Same header shape the allocators scan locally (#1729 tag tolerance).
   const headerPattern = /#{2,4}\s*Phase\s+(\d+)[A-Z]?(?:\.\d+)*(?:\s*\([^)\n]{0,200}\))?:/gi;
@@ -1259,17 +1284,17 @@ function collectSiblingWorktreePhaseNums(cwd: string, used: Set<number>): void {
     const wt = line.slice('worktree '.length).trim();
     if (!wt || path.resolve(wt) === path.resolve(cwd)) continue;
     try {
-      for (const entry of fs.readdirSync(path.join(wt, '.planning', 'phases'))) {
+      for (const entry of fs.readdirSync(path.join(siblingPlanningDir(wt), 'phases'))) {
         const match = entry.match(dirNumPattern);
         if (!match) continue;
         const num = parseInt(match[1], 10);
         if (!isSentinelPhaseId(num)) used.add(num);
       }
     } catch {
-      /* worktree has no .planning — normal, contributes nothing */
+      /* worktree has no .planning (or no copy of this scope) — normal, contributes nothing */
     }
     try {
-      const content = fs.readFileSync(path.join(wt, '.planning', 'ROADMAP.md'), 'utf-8');
+      const content = fs.readFileSync(path.join(siblingPlanningDir(wt), 'ROADMAP.md'), 'utf-8');
       let m: RegExpExecArray | null;
       headerPattern.lastIndex = 0;
       while ((m = headerPattern.exec(content)) !== null) {
@@ -1277,7 +1302,7 @@ function collectSiblingWorktreePhaseNums(cwd: string, used: Set<number>): void {
         if (!isSentinelPhaseId(num)) used.add(num);
       }
     } catch {
-      /* no roadmap in that worktree — normal, contributes nothing */
+      /* no roadmap in that worktree (or scope) — normal, contributes nothing */
     }
   }
 }
@@ -4395,14 +4420,57 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
         const bodyHasPhaseField =
           stateExtractField(fmBody, 'Current Phase') != null ||
           stateExtractField(fmBody, 'Phase') != null;
-        const authoritativeFm: Record<string, string> | undefined = nextPhaseDisplayName
-          ? bodyHasPhaseField || !nextPhaseNum
-            ? { current_phase_name: nextPhaseDisplayName }
-            : {
-                current_phase: String(nextPhaseNum),
-                current_phase_name: nextPhaseDisplayName,
-              }
-          : undefined;
+        // #4129: the POST-completion progress counters, derived from the very
+        // ROADMAP this transaction just mutated (still in memory — it hits disk
+        // only at writePlanningFileSet, AFTER this content was assembled).
+        // buildStateFrontmatter's disk scan inside syncAndPreserveStateMd
+        // reads the PRE-completion ROADMAP (and any stale-dated sibling
+        // verification), so without this intent the persisted counter failed
+        // to increment on the completing phase's own transaction. Routed
+        // through the #2736 authoritativeFm seam's object direction: the
+        // pre-preservation merge makes it the derived truth the ratchet
+        // compares, and the post-preservation re-assert (completedOnlyRaise)
+        // is a floor no preservation branch can drop below. clampPercent is
+        // completePhaseCore's own percent formula (state-transition.cts),
+        // reused so the frontmatter and the body `Progress:` line agree.
+        const postCompletionRoadmapScope = roadmapContent !== null
+          ? extractCurrentMilestone(roadmapContent, cwd)
+          : null;
+        const postCompletionRoadmapProgress = postCompletionRoadmapScope !== null
+          ? deriveProgressFromRoadmapForIntent(postCompletionRoadmapScope)
+          : null;
+        const authoritativeProgress: Record<string, number> | undefined =
+          postCompletionRoadmapProgress && postCompletionRoadmapProgress.completedPhases !== null
+            ? postCompletionRoadmapProgress.totalPhases !== null && postCompletionRoadmapProgress.totalPhases > 0
+              ? {
+                  completed_phases: postCompletionRoadmapProgress.completedPhases,
+                  percent: clampPercentForIntent(
+                    postCompletionRoadmapProgress.completedPhases,
+                    postCompletionRoadmapProgress.totalPhases,
+                  ),
+                }
+              : { completed_phases: postCompletionRoadmapProgress.completedPhases }
+            : undefined;
+        const authoritativeFm: Record<string, unknown> | undefined = authoritativeProgress
+          ? {
+              ...(nextPhaseDisplayName
+                ? bodyHasPhaseField || !nextPhaseNum
+                  ? { current_phase_name: nextPhaseDisplayName }
+                  : {
+                      current_phase: String(nextPhaseNum),
+                      current_phase_name: nextPhaseDisplayName,
+                    }
+                : {}),
+              progress: authoritativeProgress,
+            }
+          : nextPhaseDisplayName
+            ? bodyHasPhaseField || !nextPhaseNum
+              ? { current_phase_name: nextPhaseDisplayName }
+              : {
+                  current_phase: String(nextPhaseNum),
+                  current_phase_name: nextPhaseDisplayName,
+                }
+            : undefined;
         // ADR-3408 §8.3 / #3469: this deliberately bypasses
         // readModifyWriteStateMd (STATE.md is committed atomically with
         // ROADMAP/REQUIREMENTS), so it calls the single write-seam

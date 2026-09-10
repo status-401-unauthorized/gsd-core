@@ -1415,6 +1415,38 @@ describe('resolve-model command', () => {
     assert.ok(output.model, 'should resolve a model');
   });
 
+  // #4192 (AC1, behavioral): a claude-runtime tier override must change the
+  // resolved output relative to the no-override control — the CLI surface the
+  // orchestrator reads is where the documented contract is observable.
+  test('claude-runtime tier override changes resolved output vs control (#4192)', () => {
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'config.json'), JSON.stringify({
+      model_profile: 'balanced',
+      model_profile_overrides: { claude: { opus: 'claude-opus-4-7' } },
+    }));
+    const pinned = runGsdTools('resolve-model gsd-planner', tmpDir);
+    assert.ok(pinned.success, `Command failed: ${pinned.error}`);
+    assert.strictEqual(JSON.parse(pinned.output).model, 'claude-opus-4-7');
+
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'config.json'), JSON.stringify({
+      model_profile: 'balanced',
+    }));
+    const control = runGsdTools('resolve-model gsd-planner', tmpDir);
+    assert.ok(control.success, `Command failed: ${control.error}`);
+    assert.strictEqual(JSON.parse(control.output).model, 'opus');
+  });
+
+  // #4192 (AC2, behavioral): a per-agent fully-qualified Claude model ID is
+  // resolved as configured through the CLI surface.
+  test('per-agent fully-qualified claude ID resolves as configured (#4192)', () => {
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'config.json'), JSON.stringify({
+      model_profile: 'balanced',
+      model_overrides: { 'gsd-debugger': 'claude-opus-4-7' },
+    }));
+    const result = runGsdTools('resolve-model gsd-debugger', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    assert.strictEqual(JSON.parse(result.output).model, 'claude-opus-4-7');
+  });
+
   // #443: resolve-model now emits unified `effort` instead of `reasoning_effort`.
   // reasoning_effort was flavor-text (resolved but consumed by nobody); effort is
   // the wired, config-driven universal effort string for all runtimes.
@@ -3037,15 +3069,57 @@ describe('check-commit command', () => {
 // `git config --get` returns any non-empty local value (same refusal), and an
 // empty local value makes rev-parse --git-path hooks resolve to `./` — not
 // `.git/hooks`. Returns a restore function for the suite's after().
+//
+// #4341: reference-counted, because three suites call this from their DESCRIBE
+// bodies and node:test evaluates every describe body during collection, before
+// any test runs. The previous version captured `prev` per call, so the three
+// calls chained (A captured undefined, B captured A's temp path, D captured
+// B's) and the FIRST after() to fire — A's — restored `undefined`, deleting
+// GIT_CONFIG_GLOBAL outright and dropping suites B and D onto the developer's
+// real ~/.gitconfig for the rest of the run. It also cleanup()'d A's dir while
+// B still pointed at it. That is the "passes alone, fails in the full run"
+// signature: 15/15 with --test-name-pattern, 8/15 in the whole file, on any
+// machine with a global core.hooksPath.
+//
+// One sandbox, the TRUE original captured once, released when the last holder
+// lets go. Each returned restorer is idempotent, so an extra call cannot
+// release someone else's hold.
+let _gitConfigIsolation = null;
+
 function isolateGlobalGitConfig() {
-  const dir = createTempDir('gsd-3901-gitconfig-');
-  const prev = process.env.GIT_CONFIG_GLOBAL;
-  process.env.GIT_CONFIG_GLOBAL = path.join(dir, 'global.gitconfig');
-  fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, '');
+  if (_gitConfigIsolation) {
+    _gitConfigIsolation.refs += 1;
+  } else {
+    const dir = createTempDir('gsd-3901-gitconfig-');
+    const file = path.join(dir, 'global.gitconfig');
+    fs.writeFileSync(file, '');
+    // A --test-name-pattern filter can collect a suite without running its
+    // tests/after hook, leaving one reference unreleased. Keep normal cleanup
+    // reference-counted, with a process-exit fallback for that filtered run.
+    const cleanupOnExit = () => cleanup(dir);
+    _gitConfigIsolation = {
+      dir,
+      file,
+      prev: process.env.GIT_CONFIG_GLOBAL,
+      refs: 1,
+      cleanupOnExit,
+    };
+    process.once('exit', cleanupOnExit);
+    process.env.GIT_CONFIG_GLOBAL = file;
+  }
+  let released = false;
   return () => {
+    if (released) return;
+    released = true;
+    if (!_gitConfigIsolation) return;
+    _gitConfigIsolation.refs -= 1;
+    if (_gitConfigIsolation.refs > 0) return;
+    const { prev, dir, cleanupOnExit } = _gitConfigIsolation;
+    _gitConfigIsolation = null;
     if (prev === undefined) delete process.env.GIT_CONFIG_GLOBAL;
     else process.env.GIT_CONFIG_GLOBAL = prev;
     cleanup(dir);
+    process.removeListener('exit', cleanupOnExit);
   };
 }
 
@@ -3351,6 +3425,27 @@ describe('commit-docs-guard real git commit wiring (#3588 D1-D3)', () => {
   // #3901: the D suite's premise is the hook firing from .git/hooks/pre-commit
   // — a hostile global core.hooksPath broke its beforeEach identically.
   const restoreGitConfigD = isolateGlobalGitConfig();
+
+  // #4341 regression guard, and deterministic on every lane: suite A's after()
+  // fires before this suite's tests, so on the pre-#4341 helper
+  // GIT_CONFIG_GLOBAL is already GONE by the time this runs — regardless of
+  // what the host's real git config happens to contain. That is what makes
+  // this catch the release-ordering defect on CI, where the core.hooksPath
+  // that exposed it is absent.
+  test('D0: the git-config sandbox is still in effect after the earlier suites released theirs (#4341)', () => {
+    assert.ok(
+      process.env.GIT_CONFIG_GLOBAL,
+      'GIT_CONFIG_GLOBAL must still be set — an earlier suite released the shared isolation',
+    );
+    assert.ok(
+      process.env.GIT_CONFIG_GLOBAL.includes('gsd-3901-gitconfig-'),
+      `GIT_CONFIG_GLOBAL must point into the sandbox, got: ${process.env.GIT_CONFIG_GLOBAL}`,
+    );
+    assert.ok(
+      fs.existsSync(process.env.GIT_CONFIG_GLOBAL),
+      'the sandbox file must still exist — an earlier suite cleaned up a directory it did not own',
+    );
+  });
   after(restoreGitConfigD);
 
   beforeEach(() => {

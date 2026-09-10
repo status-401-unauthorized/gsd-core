@@ -1958,6 +1958,11 @@ const KNOWN_HOST_BEHAVIORS = new Set([
   'sourceMarkerFile',
   'tomlConfigInstall',
   'trackCategoryDescription',
+  // #2586: declares runtime-level feature axes GSD does not/cannot support on
+  // this host (e.g. Codex's `["context-warnings","phase-lifecycle-display"]`)
+  // — present-and-populated / absent-is-unsupported-empty convention, so
+  // omitting the key on every other runtime carries no inverted meaning.
+  'unsupportedFeatures',
   'verificationStyle',
   'writeCategoryDescription',
 ]);
@@ -2948,6 +2953,14 @@ function validateStep(step, prefix, declaredSkills, declaredAgents) {
 
   if (step.pointFrom !== undefined && typeof step.pointFrom !== 'string') {
     errors.push(prefix + '.pointFrom must be a string if present');
+  }
+
+  // #4209 DISP-02: strict optional boolean opt-in trait. Absent or false is
+  // inert; only a literal `true` reaches the projected active hook. Reject
+  // every other type (including truthy non-boolean values) so a typo can
+  // never silently opt a step into reviewer-lane dispatch.
+  if (step.supportsReviewerLanes !== undefined && typeof step.supportsReviewerLanes !== 'boolean') {
+    errors.push(prefix + '.supportsReviewerLanes must be a boolean if present');
   }
 
   if (step.fragment !== undefined) {
