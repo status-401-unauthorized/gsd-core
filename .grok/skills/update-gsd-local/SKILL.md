@@ -80,7 +80,7 @@ this list when analysis shows upstream absorbed them or when new fork commits la
 | Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME`. Grok **is** a registry runtime — do **not** re-list it in `LEGACY_NON_REGISTRY_RUNTIME_IDS`. Adapt origin/next tests that still treat grok as a `#3024` `~/.agents` legacy id. |
 | Host-integration parity | `capabilities/grok/capability.json` → `runtime.hostIntegration` | Track upstream descriptor schema (`dispatch.isolation`, `dispatch.maxConcurrency`, `effortSurface`, …) so negotiation does not fail closed; see Step 4 |
 | Claude → Grok converters | `src/runtime-artifact-conversion.cts` → `gsd-core/bin/lib/runtime-artifact-conversion.cjs` | `convertClaudeCommandToGrokSkill`, `convertClaudeAgentToGrokAgent`, tool-name rewrites (`Task`→`spawn_subagent`, etc.) |
-| Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts |
+| Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts. JS hook commands go through `gsd-node-runner.sh` (not a raw `node` shebang) so Grok can execute them. |
 | Model tiers | `gsd-core/bin/shared/model-catalog.json` | Grok Build / Composer model ids for GSD model profiles |
 | Docs + tests | `docs/how-to/install-on-your-runtime.md`, `tests/grok-upgrades.test.cjs`, multi-runtime select tests | Document install path; regression cover for Grok surfaces |
 
@@ -151,6 +151,8 @@ fix(grok): declare RUNTIME_META.globalSuffix after #3547
 chore(grok): refresh update-gsd-local after origin/next (Node 24, #3547)
 chore(grok): document #2875 agents path + VALID_CONVERTER_NAMES in update-gsd-local
 fix(grok): declare dispatch.maxConcurrency undocumented after origin/next
+chore(grok): document #3673 maxConcurrency + recurring merge hunks
+fix(grok): route JS hooks through gsd-node-runner.sh
 ```
 
 Plus periodic `Merge origin/next into grok-build` commits.
