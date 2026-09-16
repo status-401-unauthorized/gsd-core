@@ -153,6 +153,7 @@ chore(grok): document #2875 agents path + VALID_CONVERTER_NAMES in update-gsd-lo
 fix(grok): declare dispatch.maxConcurrency undocumented after origin/next
 chore(grok): document #3673 maxConcurrency + recurring merge hunks
 fix(grok): route JS hooks through gsd-node-runner.sh
+chore(grok): document --relative-includes in update-gsd-local
 ```
 
 Plus periodic `Merge origin/next into grok-build` commits.
@@ -239,7 +240,7 @@ For each conflicted file:
    - `bin/install.js` (runtime flags, help text; after `#2875` do **not**
      re-add `_DESCRIPTOR_AGENTS_RUNTIMES`). Recurring help hunk: take
      origin/next’s new flags (e.g. `--kimi-code`, `--no-legacy-cleanup`,
-     `--reclaim-kimi-legacy`) then re-insert `--grok`.
+     `--reclaim-kimi-legacy`, `--relative-includes`) then re-insert `--grok`.
    - `src/runtime-*.cts` and generated `gsd-core/bin/lib/*.cjs`. Recurring
      `rewriteStagedSkillBodies` hunk: keep **both** `case 'grok'` (ours) and
      any new peer case (e.g. `case 'zcode'` from #4002) — do not drop one
