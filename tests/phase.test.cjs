@@ -19,6 +19,11 @@ const os = require('node:os');
 const { execFileSync } = require('node:child_process');
 const { runNode } = require('./helpers/process-seam.cjs');
 const { toLegacyResult } = require('./helpers/git-fixture.cjs');
+const {
+  GIT_TIMEOUT_MS,
+  LOOP_HOOK_POINT_CLI_TIMEOUT_MS,
+  PROBE_TIMEOUT_MS,
+} = require('./helpers/timeouts.cjs');
 
 // `phase complete` against a real STATE.md rewrite; matches the 60000ms bound
 // already used for the same CLI call elsewhere in this file (runPhaseComplete
@@ -526,6 +531,30 @@ describe('phase next-decimal command', () => {
     const output = JSON.parse(result.output);
     assert.strictEqual(output.found, false, 'base phase not found');
     assert.strictEqual(output.next, '06.1', 'should still suggest 06.1');
+  });
+
+  // #4569: cmdPhaseNextDecimal migrated to the shared scanExistingDecimalPhaseNumbers
+  // helper (also consumed by cmdPhaseInsert), which counts a checklist-only decimal
+  // bullet even when no heading and no on-disk directory exist for it yet.
+  test('#4569: sees a checklist-only decimal with no heading and no on-disk directory', () => {
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '03-something'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap
+
+### Phase 3: Something
+**Goal:** Setup
+
+- [ ] Phase 3.1: Something
+`
+    );
+
+    const result = runGsdTools('phase next-decimal 3', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.next, '03.2', 'checklist-only 3.1 must be counted, not just headings/dirs');
+    assert.deepStrictEqual(output.existing, ['03.1'], 'checklist-only decimal listed as existing');
   });
 });
 
@@ -2504,7 +2533,7 @@ describe('phase add allocation vs sibling git worktrees (#3849)', () => {
   const activeDirs = [];
 
   function git(args, cwd) {
-    return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 15_000 });
+    return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: GIT_TIMEOUT_MS });
   }
 
   function initRepo(repoDir) {
@@ -2676,7 +2705,7 @@ describe('phase add --ws workstream-scoped allocation vs sibling git worktrees (
   const activeDirs = [];
 
   function git(args, cwd) {
-    return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 15_000 });
+    return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: GIT_TIMEOUT_MS });
   }
 
   /**
@@ -2916,6 +2945,28 @@ describe('phase add --ws workstream-scoped allocation vs sibling git worktrees (
       output.phase_number,
       442,
       'no --ws: the sibling ROOT roadmap still widens the horizon exactly as #3849 shipped'
+    );
+  });
+
+  test('whitespace-only GSD_WORKSTREAM uses the root sibling horizon (#4462)', () => {
+    const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-4462-blank-ws-'));
+    activeDirs.push(repoDir);
+    initWsRepo(repoDir, 2, 'ws-alpha', 39);
+    addSiblingAtHead(repoDir);
+
+    const result = runGsdTools(
+      ['query', 'phase.add', 'Root next'],
+      repoDir,
+      { GSD_WORKSTREAM: '  ' },
+    );
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_number, 3);
+    assert.strictEqual(output.directory, '.planning/phases/03-root-next');
+    assert.ok(
+      !fs.existsSync(path.join(repoDir, '.planning', 'workstreams', '  ')),
+      'an effectively-empty env value must not mint a whitespace-named workstream',
     );
   });
 
@@ -3211,6 +3262,119 @@ describe('phase insert command', () => {
 
     const roadmap = fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
     assert.ok(roadmap.includes('Phase 05.1: Hotfix (INSERTED)'), 'roadmap should include inserted phase');
+  });
+
+  // #4569: cmdPhaseInsert's decimal allocation must count an existing decimal
+  // regardless of WHICH of the three representations (on-disk directory,
+  // `### Phase N.M:` heading, `- [ ] Phase N.M:` checklist bullet) carries it —
+  // via the shared scanExistingDecimalPhaseNumbers helper.
+  test('#4569 core regression: does not reallocate a decimal that exists only as a roadmap checklist bullet', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap
+
+### Phase 3: Something
+**Goal:** Setup
+
+- [ ] Phase 3.1: Something
+`
+    );
+
+    const result = runGsdTools('phase insert 3 New Thing', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_number, '03.2', 'checklist-only 3.1 must not be reallocated as 03.1');
+    assert.ok(
+      fs.existsSync(path.join(tmpDir, '.planning', 'phases', '03.2-new-thing')),
+      'new decimal phase directory should be 03.2, not a collision with the checklist-only 03.1'
+    );
+  });
+
+  test('#4569 independence check: a decimal present in heading, checklist, and on-disk directory simultaneously is counted once', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap
+
+### Phase 3: Something
+**Goal:** Setup
+
+### Phase 3.1: Existing Decimal
+**Goal:** Test
+
+- [ ] Phase 3.1: Existing Decimal
+`
+    );
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '03.1-existing-decimal'), { recursive: true });
+
+    const result = runGsdTools('phase insert 3 New Thing', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(
+      output.phase_number,
+      '03.2',
+      'triple-represented 03.1 must count once, not skip ahead or collide'
+    );
+  });
+
+  test('#4569 negative-space: a checklist bullet for an unrelated phase family does not pollute this phase\'s decimal allocation', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap
+
+### Phase 3: Something
+**Goal:** Setup
+
+### Phase 13: Unrelated
+**Goal:** Unrelated
+
+- [ ] Phase 13.2: Unrelated Decimal
+`
+    );
+
+    const result = runGsdTools('phase insert 3 New Thing', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(
+      output.phase_number,
+      '03.1',
+      'phase 13\'s checklist decimal must not cross-pollute phase 3\'s allocation'
+    );
+  });
+
+  test('#4569: --sibling flag inserts a sibling of a decimal phase via the real CLI', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap
+
+### Phase 3: Something
+**Goal:** Setup
+
+### Phase 3.2: Existing Decimal
+**Goal:** Test
+`
+    );
+    const result = runGsdTools('phase insert 3.2 New Thing --sibling', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_number, '03.3', 'sibling allocation must join phase 3\'s level, not nest under 3.2');
+  });
+
+  test('#4569: --sibling flag falls back to nested allocation when afterPhase has no decimal segment', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap
+
+### Phase 3: Something
+**Goal:** Setup
+`
+    );
+    const result = runGsdTools('phase insert 3 New --sibling', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phase_number, '03.1', '--sibling on a top-level phase must fall back to nested allocation');
   });
 });
 
@@ -6061,6 +6225,22 @@ describe('#2028 — phase complete milestone-end + workstream guard', () => {
     assert.match(result.error || '', /workstream|--ws/i, 'error should name the workstream requirement');
   });
 
+  test('refuses to write root when GSD_WORKSTREAM is whitespace only', (t) => {
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'workstreams', 'alpha'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), '# State\n');
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), '# Roadmap\n\n### Phase 1: A\n**Goal:** x\n');
+    const previous = process.env.GSD_WORKSTREAM;
+    t.after(() => {
+      if (previous === undefined) delete process.env.GSD_WORKSTREAM;
+      else process.env.GSD_WORKSTREAM = previous;
+    });
+    process.env.GSD_WORKSTREAM = ' \t ';
+
+    const result = runGsdTools('phase complete 1', tmpDir);
+    assert.equal(result.success, false, 'a whitespace workstream must not write the shared root');
+    assert.match(result.error || '', /workstream|--ws/i);
+  });
+
   // An explicit --ws satisfies the guard (it sets GSD_WORKSTREAM upstream) AND
   // targets that workstream — the write must land in the workstream's own
   // STATE.md/ROADMAP.md, leaving root untouched.
@@ -6440,7 +6620,7 @@ function runPhaseComplete(tmpDir, { phase = '1', tolerateExit = false } = {}) {
   try {
     return execFileSync('node', [GSD_TOOLS_BIN, 'phase', 'complete', phase], {
       cwd: tmpDir,
-      timeout: 60000,
+      timeout: LOOP_HOOK_POINT_CLI_TIMEOUT_MS,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -9242,7 +9422,7 @@ function run(args, cwd) {
     return {
       stdout: execFileSync('node', [gsdTools, ...args], {
         cwd,
-        timeout: 15000,
+        timeout: PROBE_TIMEOUT_MS,
         encoding: 'utf-8',
         stdio: ['pipe', 'pipe', 'pipe'],
       }),
@@ -9612,7 +9792,7 @@ function run2853(args, cwd) {
   try {
     return {
       stdout: execFileSync('node', [gsdTools2853, ...args], {
-        cwd, timeout: 15000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+        cwd, timeout: PROBE_TIMEOUT_MS, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
       }),
       ok: true,
     };

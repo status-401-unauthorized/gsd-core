@@ -466,9 +466,9 @@ only supported runtime.
 
 | Job | Lanes | Gated on | Purpose |
 |---|---|---|---|
-| `test` | `ubuntu-latest` (1 targeted + 3-shard full) + `windows-latest` (3-shard, Windows/path/shell-scoped) | `product_changed == 'true'` | The default, always-scoped PR signal — the full `unit`/`integration`/`security` suites run once, sharded, on Linux; Windows runs the Windows-sensitive subset plus every changed test file |
+| `test` | `ubuntu-latest` (1 targeted + 3-shard full) | `product_changed == 'true'` | The default, always-scoped PR signal — the full `unit`/`integration`/`security` suites run once, sharded, on Linux. **Linux only**: its three `scope: windows` shards were deleted in #4641 (ADR-4641), which found them a second, redundant Windows selector alongside `test-conformance` |
 | `test-inert` | `ubuntu-latest` | `code_changed == 'true' && product_changed != 'true'` | A lightweight lane for PRs that touch only administrative/policy workflow files (code changed, but nothing that needs the real matrix) |
-| `test-conformance` | `windows-latest` (3-shard) + `macos-latest` (unsharded) | `code_changed == 'true' && full_matrix == 'true'` | Runs only the **platform-conformance-tier** file list (`scripts/lib/platform-conformance-tier.generated.cjs`, epic #4589 Phase 2/#4591) on real Windows/macOS — the sole gating signal for real-OS coverage. Retired the parallel legacy full-suite matrix in #4603. |
+| `test-conformance` | `windows-latest` (3-shard) + `macos-latest` (unsharded) | `code_changed == 'true' && full_matrix == 'true'` | Runs only the **platform-conformance-tier** file list (`scripts/lib/platform-conformance-tier.generated.cjs`, epic #4589 Phase 2/#4591) on real Windows/macOS — since #4641 the **sole** Windows and macOS selector in CI, not merely the sole gating one. Retired the parallel legacy full-suite matrix in #4603; #4641 removed the second Windows selector in `test` and narrowed the tier from 548 to 266 of 932 eligible unit-suite files (58.8% → 28.5%, measured 2026-09-11; the absolute counts track `next`'s test count, the percentages are what the ceiling test binds on). |
 | `coverage-gate` | `ubuntu-latest` | `product_changed == 'true' && test.result == 'success'` | Merges every `test` shard's coverage dumps and evaluates the threshold once (sharding moved this out of the `test` job itself — #2952) |
 | `qa-loop-walk` | `ubuntu-latest` | `product_changed == 'true'` | The QA smell-ratchet scenario walk (see "The QA smell ratchet" below) |
 | `required-tests` | `ubuntu-latest` | `always()` | Aggregates every job above into the one branch-protection-required check |
@@ -515,15 +515,15 @@ mis-ranked files badly enough that the slowest chunk ran ~3.9x the lightest.
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `RUN_TESTS_MAX_FILES_PER_CHUNK` | `60` | Per-chunk weight budget. Weights are normalized so an **average-cost** file weighs 1, so this still reads as "about 60 average files". |
+| `RUN_TESTS_MAX_FILES_PER_CHUNK` | `60` (`22` on win32) | Per-chunk weight budget. Weights are normalized so an **average-cost** file weighs 1, so this still reads as "about 60 average files" (about 22 on win32). Windows gets a lower cap than Linux/macOS because the weight table's calibration does not transfer 1:1 to the Windows runner for install/subprocess-heavy work — see the derivation comment above `DEFAULT_MAX_FILES_PER_CHUNK` in `scripts/run-tests.cjs`. |
 | `RUN_TESTS_MAX_CMDLINE_CHARS` | `28000` | argv ceiling per chunk, with headroom under the Windows 32,767 limit. |
 | `RUN_TESTS_TIMINGS_FILE` | `tests/test-timings.json` | Path to the timing table. Tests override it to inject a synthetic cost profile. |
 | `RUN_TESTS_CHUNK_TIMEOUT_MS` | `600000` | Per-chunk timeout. |
 
 The timing table is **advisory and deliberately un-gated**. There is no `--check`
 mode and no CI lint that fails on staleness, because timing data legitimately
-varies run to run. A file missing from the table falls back to the table's median
-weight, and a missing or unparseable table falls back to uniform weight — so
+varies run to run. A file missing from the table falls back to the table's mean
+weight (1), and a missing or unparseable table falls back to uniform weight — so
 drift costs chunk *balance*, never a red build. A count-based floor additionally
 guarantees the packer never produces fewer chunks than plain count-based packing
 would, so a badly stale table cannot collapse the suite into a few fat chunks.
