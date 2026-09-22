@@ -77,7 +77,7 @@ this list when analysis shows upstream absorbed them or when new fork commits la
 | Theme | Primary paths | Intent |
 |-------|---------------|--------|
 | Grok as installable runtime | `capabilities/grok/capability.json`, `bin/install.js` (`--grok` / `--grok-build`), runtime lists | First-class Grok Build install target → `~/.grok` |
-| Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME`. Grok **is** a registry runtime — do **not** re-list it in `LEGACY_NON_REGISTRY_RUNTIME_IDS`. Adapt origin/next tests that still treat grok as a `#3024` `~/.agents` legacy id. |
+| Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME`. Grok **is** a registry runtime — do **not** re-list it in `LEGACY_NON_REGISTRY_RUNTIME_IDS`. Adapt origin/next tests that still treat grok as a `#3024` `~/.agents` legacy id, except the two test-locked strings in the #3024 trigger below. |
 | Host-integration parity | `capabilities/grok/capability.json` → `runtime.hostIntegration` | Track upstream descriptor schema (`dispatch.isolation`, `dispatch.maxConcurrency`, `effortSurface`, …) so negotiation does not fail closed; see Step 4 |
 | Claude → Grok converters | `src/runtime-artifact-conversion.cts` → `gsd-core/bin/lib/runtime-artifact-conversion.cjs` | `convertClaudeCommandToGrokSkill`, `convertClaudeAgentToGrokAgent`, tool-name rewrites (`Task`→`spawn_subagent`, etc.) |
 | Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts. JS hook commands go through `gsd-node-runner.sh` (not a raw `node` shebang) so Grok can execute them. |
@@ -97,6 +97,18 @@ leave Grok omitted while peers declare the axis.
   prose, `scripts/live-config-guard.cjs`). This fork’s grok is first-class
   `~/.grok` / `GROK_HOME`. After merge, re-point those tests/docs; keep the
   hardcoded `getGlobalConfigDir('grok')` fallback only for a missing registry.
+  The supported-runtimes sentence in `sync-skills.md` is already re-pointed —
+  keep it. **Do not rewrite** these two leftover upstream strings; tests still
+  require them, and they are not the install home (`GROK_HOME` / `~/.grok`):
+  - `gsd-core/workflows/_runtime-launcher.snippet.sh` probes
+    `${GROK_AGENTS_HOME:-$HOME/.agents}`. `tests/runtime-launcher-parity.test.cjs`
+    `EXPECTED_RUNTIME_PROBES.grok` requires `.agents}/gsd-core/bin/`. Do not
+    retarget the snippet or run `scripts/sync-runtime-launcher.cjs` to copy a
+    `~/.grok` probe into every workflow. It is a `gsd-tools` discovery fallback.
+  - The cross-runtime refuse parenthetical in `gsd-core/workflows/sync-skills.md`
+    (`grok has no dedicated installer flag`) is locked by
+    `tests/sync-skills-cross-runtime-refuse.test.cjs`. Do not “fix” it to
+    mention `--grok`.
 - `#3547` (`runMinimalInstall`) refuses to guess a global home without
   `RUNTIME_META[runtime].globalSuffix` in `tests/helpers/install-shared.cjs`.
   Declare `grok: { localDir: '.grok', globalSuffix: '.grok' }` or
@@ -154,6 +166,7 @@ fix(grok): declare dispatch.maxConcurrency undocumented after origin/next
 chore(grok): document #3673 maxConcurrency + recurring merge hunks
 fix(grok): route JS hooks through gsd-node-runner.sh
 chore(grok): document --relative-includes in update-gsd-local
+chore(grok): do not rewrite locked launcher probe or sync-skills refuse line
 ```
 
 Plus periodic `Merge origin/next into grok-build` commits.
@@ -248,6 +261,8 @@ For each conflicted file:
    - `capabilities/grok/**` (ours; may be untracked on upstream)
    - capability registry generators / `capability-registry.cjs`
    - tests that list runtimes or assume grok is a `~/.agents` legacy id
+     (do **not** retarget `_runtime-launcher.snippet.sh` or the sync-skills
+     refuse parenthetical — see the #3024 trigger)
    - `tests/helpers/install-shared.cjs` (`RUNTIME_META` / `MANIFEST_FAMILIES`).
      Recurring: origin/next deleted the unused `LOCAL_DIR_NAME` map — **drop
      it**; grok lives only on `RUNTIME_META` (`localDir` / `globalSuffix`).
