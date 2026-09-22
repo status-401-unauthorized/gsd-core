@@ -49,7 +49,7 @@ import { isContainedIn } from './security.cjs';
 
 const { output, error } = io;
 const { extractPhaseToken, scopeToPhase } = phaseId;
-const { extractFrontmatter } = frontmatterMod;
+const { extractFrontmatter, FRONTMATTER_UNPARSEABLE } = frontmatterMod;
 const { normalizeLineEndings } = coreUtilsMod;
 const { SCOPE } = planningScopeMod;
 type Scope = planningScopeMod.Scope;
@@ -112,8 +112,14 @@ const VERIFICATION_ROUTING_TABLE: Record<string, VerificationRoute> = {
   },
   stale: {
     status: 'stale',
-    next_action: 'Verification is stale. Re-run verify-work before transition.',
-    next_command: '',
+    // #4682: staleness means covered source files changed after the verifier
+    // last ran — the only remedy is re-running the verifier.
+    // /gsd-verify-work never rewrites VERIFICATION.md, so advising it from
+    // here was an advice loop. execute-phase resumes at the verification
+    // gates and re-runs the verifier (its resume tree routes a stale report
+    // to re-verification), which regenerates VERIFICATION.md and its digest.
+    next_action: 'Verification is stale — covered source files changed after the verifier last ran. Re-run execute-phase for this phase: it resumes at the verification gates and re-runs the verifier, regenerating VERIFICATION.md and its digest. verify-work alone cannot refresh a stale report.',
+    next_command: 'execute-phase',
   },
   // INTERNAL SENTINEL: constructed when no *-VERIFICATION.md file exists or when
   // the file has no parseable frontmatter status. Never emitted by the verifier.
@@ -121,6 +127,15 @@ const VERIFICATION_ROUTING_TABLE: Record<string, VerificationRoute> = {
     status: 'missing',
     next_action: 'No verification report found — the verify step never completed. Running execute-phase is safe here: it resumes at the verification gates and does not re-run plans that already have a SUMMARY.md (see #2868).',
     next_command: 'execute-phase',
+  },
+  // #4806: the report EXISTS but its frontmatter is not parseable YAML —
+  // fundamentally different from "missing" (the verify step DID run; re-running
+  // execute-phase cannot fix a YAML typo). Consumers treat any non-'passed'
+  // status as blocking, so this value fails safe while telling the truth.
+  unparseable: {
+    status: 'unparseable',
+    next_action: "The *-VERIFICATION.md frontmatter is not parseable YAML — fix the syntax error in the report itself. Re-running execute-phase cannot fix a YAML typo in an existing report.",
+    next_command: '',
   },
   // INTERNAL SENTINEL: constructed when the file has a status value not in
   // VERIFIER_STATUSES. Never emitted by the verifier.
@@ -1022,6 +1037,16 @@ function readVerificationStatus(
     // same root cause as the false-clean class fixed elsewhere in #3707-CR.
     const content = normalizeLineEndings(fsImpl.readFileSync(filePath, 'utf-8'));
     fm = extractFrontmatter(content, filePath);
+    // #4806: an unparseable frontmatter block is NOT "missing" — the file
+    // exists and verification ran. Report a distinct status so the caller is
+    // sent to fix the YAML, not to re-run execute-phase.
+    if ((fm as unknown as Record<symbol, unknown>)[FRONTMATTER_UNPARSEABLE] === true) {
+      return {
+        status: 'unparseable',
+        next_action: "The *-VERIFICATION.md frontmatter is not parseable YAML — fix the syntax error in the report itself. Re-running execute-phase cannot fix a YAML typo in an existing report.",
+        next_command: '',
+      };
+    }
     const statusVal = fm['status'];
     // status is always a scalar string in a well-formed VERIFICATION.md frontmatter;
     // only accept string values — arrays and objects are not valid status values.
@@ -1115,7 +1140,10 @@ function readVerificationStatus(
     return {
       status: entry.status,
       next_action: entry.next_action,
-      next_command: projectNextCommand('verify-work', runtime, phaseArg),
+      // #4682: execute-phase resumes at the verification gates and re-runs
+      // the verifier, regenerating VERIFICATION.md and its digest — the same
+      // routing the `missing` sentinel has used since #2868.
+      next_command: projectNextCommand('execute-phase', runtime, phaseArg),
     };
   }
 

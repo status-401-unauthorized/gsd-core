@@ -2825,7 +2825,7 @@ const capabilities = {
         "into": "verifier",
         "fragment": {
           "path": "fragments/capture-problems.md",
-          "inline": "<!--\n  MemPalace capability — contribution fragment.\n  Rendered into the execute:wave:post verifier prompt when `mempalace.capture_artifacts` is true.\n  Contributes DATA (capture instructions), not control flow. onError: skip — never fails a wave.\n-->\n### Capture problems → fixes (MemPalace)\n\n**Gate first.** Read `.planning/config.json`. If `mempalace.enabled` is not `true`, or `mempalace.capture_artifacts` is `false`, **skip this entire section** and let the wave complete unchanged. (This contribution is only injected when the capability is enabled; the `capture_artifacts` check lets you turn capture off without disabling the rest of the capability.)\n\nOtherwise — after verifying this wave, persist any *confirmed* problem→fix pairs into the palace so they are recalled in future phases. This is best-effort; if MemPalace is unreachable, skip silently — capture never fails a wave.\n\nFor each confirmed bug/issue resolved in this wave:\n\n1. **Resolve the wing** (`mempalace.wing`, else `project_code`, else project dir) and target `room: problems`.\n2. **Dedupe first.** Call `mempalace_check_duplicate` (interactive) before filing so re-runs don't create duplicate drawers.\n3. **File the drawer verbatim.** Store the problem statement and its fix as a drawer in `room: problems` — interactive: `mempalace_add_drawer`; headless: stage the artifact under the `problems/` folder and run `mempalace mine` (no `--room` flag — see [CLI reference](https://mempalaceofficial.com/reference/cli.html); room assignment is via `detect_room()` folder-path match per the [mining guide](https://mempalaceofficial.com/guide/mining.html); use the same staging pattern documented in `gsd-mempalace-capture` Step 3). Include provenance (`source_file`, phase id).\n4. **Mirror the KG fact** when `mempalace.mirror_kg` is on: add `(<bug>, fixed_by, <fix>)` with `valid_from` = the phase date via `mempalace_kg_add`.\n5. **Mode awareness** (`mempalace.memory_mode`). Under `augment` the fact is an *additive* mirror alongside `.planning/graphs/`. Under `kg_backend`/`replace` the palace is the *authoritative* store for the fact; GSD still writes `.planning/graphs/` through its normal graphify, so an unreachable palace never loses it.\n\nCaptures are idempotent: deterministic drawer IDs + `check_duplicate` mean re-running the wave re-files the same content without duplication. On any error, skip and let the wave complete normally.\n"
+          "inline": "<!--\n  MemPalace capability — contribution fragment.\n  Rendered into the execute:wave:post verifier prompt when `mempalace.capture_artifacts` is true.\n  Contributes DATA (capture instructions), not control flow. onError: skip — never fails a wave.\n-->\n### Capture problems → fixes (MemPalace)\n\n**Gate first.** Read `.planning/config.json`. If `mempalace.enabled` is not `true`, or `mempalace.capture_artifacts` is `false`, **skip this entire section** and let the wave complete unchanged. (This contribution is only injected when the capability is enabled; the `capture_artifacts` check lets you turn capture off without disabling the rest of the capability.)\n\nOtherwise — after verifying this wave, persist any *confirmed* problem→fix pairs into the palace so they are recalled in future phases. This is best-effort; if MemPalace is unreachable, skip silently — capture never fails a wave.\n\nFor each confirmed bug/issue resolved in this wave:\n\n1. **Resolve the wing** (`mempalace.wing`, else `project_code`, else project dir) and target `room: problems`.\n2. **Dedupe first.** Call `mempalace_check_duplicate` (interactive) before filing so re-runs don't create duplicate drawers.\n3. **File the drawer verbatim.** Store the problem statement and its fix as a drawer in `room: problems` — interactive: `mempalace_add_drawer`; headless: stage the artifact under the `problems/` folder and run `mempalace mine --daemon --background` (no `--room` flag; the background queue defers the write when another writer holds the palace lock, #4700 — see [CLI reference](https://mempalaceofficial.com/reference/cli.html); room assignment is via `detect_room()` folder-path match per the [mining guide](https://mempalaceofficial.com/guide/mining.html); use the same staging pattern documented in `gsd-mempalace-capture` Step 3). Include provenance (`source_file`, phase id).\n4. **Mirror the KG fact** when `mempalace.mirror_kg` is on: add `(<bug>, fixed_by, <fix>)` with `valid_from` = the phase date via `mempalace_kg_add`.\n5. **Mode awareness** (`mempalace.memory_mode`). Under `augment` the fact is an *additive* mirror alongside `.planning/graphs/`. Under `kg_backend`/`replace` the palace is the *authoritative* store for the fact; GSD still writes `.planning/graphs/` through its normal graphify, so an unreachable palace never loses it.\n\nCaptures are idempotent: deterministic drawer IDs + `check_duplicate` mean re-running the wave re-files the same content without duplication. On any error, skip and let the wave complete normally.\n"
         },
         "produces": [],
         "consumes": [],
@@ -3082,8 +3082,7 @@ const capabilities = {
         },
         "skipHomePrefixSubstitution": true,
         "skipSettingsUi": true,
-        "skipUpdateBannerCommand": true,
-        "skipCodexSkillsManifest": true
+        "skipUpdateBannerCommand": true
       }
     },
     "reviewer": {
@@ -3953,6 +3952,11 @@ const capabilities = {
         "type": "boolean",
         "default": true,
         "description": "Block execution on unmet UI-SPEC contracts."
+      },
+      "workflow.ui_interaction_capture": {
+        "type": "boolean",
+        "default": false,
+        "description": "Default-off. Let gsd-ui-auditor add post-interaction captures (hover, focus, open menus, filled forms) through the chrome-devtools CLI, driven from Bash — no MCP server and no tools: change (#4223). Requires an installed Chrome; when off, or when none resolves, the auditor's Playwright-only static capture is unchanged."
       }
     },
     "steps": [
@@ -4681,7 +4685,7 @@ const byLoopPoint = {
         "into": "verifier",
         "fragment": {
           "path": "fragments/capture-problems.md",
-          "inline": "<!--\n  MemPalace capability — contribution fragment.\n  Rendered into the execute:wave:post verifier prompt when `mempalace.capture_artifacts` is true.\n  Contributes DATA (capture instructions), not control flow. onError: skip — never fails a wave.\n-->\n### Capture problems → fixes (MemPalace)\n\n**Gate first.** Read `.planning/config.json`. If `mempalace.enabled` is not `true`, or `mempalace.capture_artifacts` is `false`, **skip this entire section** and let the wave complete unchanged. (This contribution is only injected when the capability is enabled; the `capture_artifacts` check lets you turn capture off without disabling the rest of the capability.)\n\nOtherwise — after verifying this wave, persist any *confirmed* problem→fix pairs into the palace so they are recalled in future phases. This is best-effort; if MemPalace is unreachable, skip silently — capture never fails a wave.\n\nFor each confirmed bug/issue resolved in this wave:\n\n1. **Resolve the wing** (`mempalace.wing`, else `project_code`, else project dir) and target `room: problems`.\n2. **Dedupe first.** Call `mempalace_check_duplicate` (interactive) before filing so re-runs don't create duplicate drawers.\n3. **File the drawer verbatim.** Store the problem statement and its fix as a drawer in `room: problems` — interactive: `mempalace_add_drawer`; headless: stage the artifact under the `problems/` folder and run `mempalace mine` (no `--room` flag — see [CLI reference](https://mempalaceofficial.com/reference/cli.html); room assignment is via `detect_room()` folder-path match per the [mining guide](https://mempalaceofficial.com/guide/mining.html); use the same staging pattern documented in `gsd-mempalace-capture` Step 3). Include provenance (`source_file`, phase id).\n4. **Mirror the KG fact** when `mempalace.mirror_kg` is on: add `(<bug>, fixed_by, <fix>)` with `valid_from` = the phase date via `mempalace_kg_add`.\n5. **Mode awareness** (`mempalace.memory_mode`). Under `augment` the fact is an *additive* mirror alongside `.planning/graphs/`. Under `kg_backend`/`replace` the palace is the *authoritative* store for the fact; GSD still writes `.planning/graphs/` through its normal graphify, so an unreachable palace never loses it.\n\nCaptures are idempotent: deterministic drawer IDs + `check_duplicate` mean re-running the wave re-files the same content without duplication. On any error, skip and let the wave complete normally.\n"
+          "inline": "<!--\n  MemPalace capability — contribution fragment.\n  Rendered into the execute:wave:post verifier prompt when `mempalace.capture_artifacts` is true.\n  Contributes DATA (capture instructions), not control flow. onError: skip — never fails a wave.\n-->\n### Capture problems → fixes (MemPalace)\n\n**Gate first.** Read `.planning/config.json`. If `mempalace.enabled` is not `true`, or `mempalace.capture_artifacts` is `false`, **skip this entire section** and let the wave complete unchanged. (This contribution is only injected when the capability is enabled; the `capture_artifacts` check lets you turn capture off without disabling the rest of the capability.)\n\nOtherwise — after verifying this wave, persist any *confirmed* problem→fix pairs into the palace so they are recalled in future phases. This is best-effort; if MemPalace is unreachable, skip silently — capture never fails a wave.\n\nFor each confirmed bug/issue resolved in this wave:\n\n1. **Resolve the wing** (`mempalace.wing`, else `project_code`, else project dir) and target `room: problems`.\n2. **Dedupe first.** Call `mempalace_check_duplicate` (interactive) before filing so re-runs don't create duplicate drawers.\n3. **File the drawer verbatim.** Store the problem statement and its fix as a drawer in `room: problems` — interactive: `mempalace_add_drawer`; headless: stage the artifact under the `problems/` folder and run `mempalace mine --daemon --background` (no `--room` flag; the background queue defers the write when another writer holds the palace lock, #4700 — see [CLI reference](https://mempalaceofficial.com/reference/cli.html); room assignment is via `detect_room()` folder-path match per the [mining guide](https://mempalaceofficial.com/guide/mining.html); use the same staging pattern documented in `gsd-mempalace-capture` Step 3). Include provenance (`source_file`, phase id).\n4. **Mirror the KG fact** when `mempalace.mirror_kg` is on: add `(<bug>, fixed_by, <fix>)` with `valid_from` = the phase date via `mempalace_kg_add`.\n5. **Mode awareness** (`mempalace.memory_mode`). Under `augment` the fact is an *additive* mirror alongside `.planning/graphs/`. Under `kg_backend`/`replace` the palace is the *authoritative* store for the fact; GSD still writes `.planning/graphs/` through its normal graphify, so an unreachable palace never loses it.\n\nCaptures are idempotent: deterministic drawer IDs + `check_duplicate` mean re-running the wave re-files the same content without duplication. On any error, skip and let the wave complete normally.\n"
         },
         "produces": [],
         "consumes": [],
@@ -4991,7 +4995,8 @@ const configKeys = {
   "workflow.tdd_mode": "tdd",
   "workflow.ui_phase": "ui",
   "workflow.ui_review": "ui",
-  "workflow.ui_safety_gate": "ui"
+  "workflow.ui_safety_gate": "ui",
+  "workflow.ui_interaction_capture": "ui"
 };
 
 const configSchema = {
@@ -5541,6 +5546,12 @@ const configSchema = {
     "type": "boolean",
     "default": true,
     "description": "Block execution on unmet UI-SPEC contracts."
+  },
+  "workflow.ui_interaction_capture": {
+    "owner": "ui",
+    "type": "boolean",
+    "default": false,
+    "description": "Default-off. Let gsd-ui-auditor add post-interaction captures (hover, focus, open menus, filled forms) through the chrome-devtools CLI, driven from Bash — no MCP server and no tools: change (#4223). Requires an installed Chrome; when off, or when none resolves, the auditor's Playwright-only static capture is unchanged."
   }
 };
 
@@ -7401,8 +7412,7 @@ const runtimes = {
         },
         "skipHomePrefixSubstitution": true,
         "skipSettingsUi": true,
-        "skipUpdateBannerCommand": true,
-        "skipCodexSkillsManifest": true
+        "skipUpdateBannerCommand": true
       }
     },
     "reviewer": {
