@@ -180,9 +180,11 @@ contains `gsd-core` does not find `~/.grok/gsd-core`. After merge, if the
 
 immediately **before** the `GROK_AGENTS_HOME` probe (first-class home first;
 keep the legacy probe) and run `npm run sync:launcher` so workflows and agents
-pick up the snippet. `GROK_HOME` is already in the registry-derived
-`TEST_ENV_BASE`, so `tests/runtime-launcher-parity.test.cjs` (A2) covers the
-new `${VAR:-default}` arm. `commands/gsd/*.md` still use an older resolver and
+pick up the snippet. `EXPECTED_RUNTIME_PROBES.grok` in
+`tests/runtime-launcher-parity.test.cjs` still requires the substring
+`.agents}/gsd-core/bin/`, so leave that arm in place. `GROK_HOME` is already
+in the registry-derived `TEST_ENV_BASE`, so the same test’s A2 covers the new
+`${VAR:-default}` arm. `commands/gsd/*.md` still use an older resolver and
 are outside `sync:launcher` — leave them unless a parity test starts requiring
 the snippet there.
 
@@ -205,12 +207,16 @@ fix(grok): declare dispatch.maxConcurrency undocumented after origin/next
 chore(grok): document #3673 maxConcurrency + recurring merge hunks
 fix(grok): route JS hooks through gsd-node-runner.sh
 chore(grok): document --relative-includes in update-gsd-local
+chore(grok): do not rewrite locked launcher probe or sync-skills refuse line
 fix(grok): correct sync-skills prose after open-gsd/next
 chore(grok): record upstream remote and launcher-home trigger in update-gsd-local
 ```
 
 Plus periodic `Merge open-gsd/next into grok-build` commits (older messages say
 `Merge origin/next` from when that label pointed at open-gsd).
+`chore(grok): do not rewrite locked launcher probe or sync-skills refuse line`
+predates the sync-skills test update. The #3024 refuse sentence and the #4834
+launcher trigger above are the current locks.
 
 ## Generated artifacts (do not confuse these)
 
