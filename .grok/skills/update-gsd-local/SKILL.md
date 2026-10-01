@@ -1,20 +1,21 @@
 ---
 name: update-gsd-local
 description: >
-  Sync this fork’s grok-build branch from upstream open-gsd (origin/next), resolve
-  and analyze merge conflicts for Grok-first-class runtime deltas, rebuild the
-  TypeScript lib + capability registry, reinstall GSD into ~/.grok, verify the
-  install, then self-review this skill and surface any vital updates to the user.
+  Sync this fork’s grok-build branch from upstream open-gsd next (resolve the
+  remote by URL — in this checkout `upstream/next`), resolve and analyze merge
+  conflicts for Grok-first-class runtime deltas, rebuild the TypeScript lib +
+  capability registry, reinstall GSD into ~/.grok, verify the install, then
+  self-review this skill and surface any vital updates to the user.
   Use when the user runs /update-gsd-local, says “update gsd-core”, “sync upstream
   into grok fork”, “refresh local gsd install”, “merge origin/next into grok-build”,
   or wants to pull open-gsd/gsd-core and reinstall for Grok Build.
 metadata:
-  short-description: "Sync origin/next → grok-build, reinstall ~/.grok"
+  short-description: "Sync open-gsd next → grok-build, reinstall ~/.grok"
 ---
 
 # /update-gsd-local — Sync upstream, preserve Grok deltas, reinstall
 
-End-to-end workflow to pull `origin/next` into this fork’s `grok-build` branch,
+End-to-end workflow to pull open-gsd `next` into this fork’s `grok-build` branch,
 keep or adapt fork-only **Grok Build** changes after conflict analysis, rebuild
 compiled libs and generated registries, reinstall into `~/.grok`, confirm the
 installed version and skill/agent surfaces match the tree, then **self-review
@@ -25,49 +26,70 @@ this skill** so it stays aligned with upstream and fork reality (Step 9).
 Run from the **gsd-core** repo root (the tree that contains `bin/install.js`,
 `capabilities/grok/`, and `package.json` name `@opengsd/gsd-core`).
 
-1. Confirm remotes (names may vary — detect, do not hard-fail on labels alone):
-   - **Upstream** (open-gsd): typically `origin` → `open-gsd/gsd-core`
-   - **Fork** (user’s remote): typically `fork` → `status-401-unauthorized/gsd-core`
+1. Confirm remotes by **fetch URL**, not by the remote’s name. Names in this
+   checkout differ from the labels older notes assumed. Run **Record state and
+   resolve remotes** before any fetch or merge. The table under **Remote /
+   branch model** is this checkout’s labels.
 2. Working tree should be clean enough to merge. If dirty:
    - Prefer stashing only if the user did not intentionally leave WIP.
    - If WIP looks intentional, **stop and ask** before discarding or stashing.
-3. Preferred branch: local `grok-build` tracking `fork/grok-build`. If on another
-   branch, tell the user and ask whether to switch to `grok-build` or update the
-   current branch instead.
+3. Preferred branch: local `grok-build` tracking `$FORK_REMOTE/grok-build`
+   (this checkout: `origin/grok-build`). If on another branch, tell the user
+   and ask whether to switch to `grok-build` or update the current branch instead.
 4. Node/npm must satisfy `package.json` engines. Prefer **nvm** + repo-root
    **`.nvmrc`** (read the file — currently major **24**; do not assume 22).
    `npm install` must be viable if `node_modules` is missing or stale. System
    Node below engines will fail — activate nvm before Step 6. If `nvm use`
    says the pin is missing, `nvm install` then `nvm use` again.
 
-Record before any mutation:
+Record state and resolve remotes before any other mutation. This block is the
+only assignment of `UPSTREAM_REMOTE` and `FORK_REMOTE`. `git remote add` runs
+only when no fetch URL matches `open-gsd/gsd-core`.
 
 ```bash
+UPSTREAM_REMOTE=$(git remote -v | awk '/open-gsd\/gsd-core(\.git)?[ \t].*\(fetch\)/ {print $1; exit}')
+FORK_REMOTE=$(git remote -v | awk '/status-401-unauthorized\/gsd-core(\.git)?[ \t].*\(fetch\)/ {print $1; exit}')
+if [ -z "$UPSTREAM_REMOTE" ]; then
+  git remote add upstream https://github.com/open-gsd/gsd-core.git
+  UPSTREAM_REMOTE=upstream
+fi
 git remote -v
 git status -sb
 git rev-parse --abbrev-ref HEAD
 git rev-parse --short HEAD
-git rev-parse --short origin/next 2>/dev/null || true
-git rev-parse --short fork/grok-build 2>/dev/null || true
+echo "UPSTREAM_REMOTE=$UPSTREAM_REMOTE FORK_REMOTE=$FORK_REMOTE"
+git rev-parse --short "$UPSTREAM_REMOTE/next" 2>/dev/null || true
+if [ -n "$FORK_REMOTE" ]; then
+  git rev-parse --short "$FORK_REMOTE/grok-build" 2>/dev/null || true
+fi
 ```
 
 ## Remote / branch model
 
-| Role | Typical remote | Branch |
-|------|----------------|--------|
-| Upstream source of truth (dev line) | `origin` | `next` |
-| Local integration branch (this fork) | (local) | `grok-build` |
-| Publish target for this fork | `fork` | `grok-build` |
+The names below are this checkout. Another clone can use different labels; the
+block above matches fetch URLs. Run it before Step 1.
+
+| Role | URL contains | This checkout | Branch |
+|------|----------------|---------------|--------|
+| Upstream source of truth (dev line) | `open-gsd/gsd-core` | `upstream` | `next` |
+| Local integration branch | (local) | `grok-build` | `grok-build` |
+| Publish target for this fork | `status-401-unauthorized/gsd-core` | `origin` | `grok-build` |
+
+There is no remote named `fork` here. `origin` is the fork. Its `next`
+(`origin/next`, last moved 2026-07-18 at `b2f4aa943`) is already contained in
+`grok-build`. A behind-count against `origin/next` is 0 and would skip the
+real upstream. Merge **`$UPSTREAM_REMOTE/next`** only.
 
 Notes:
 
 - Upstream’s day-to-day integration branch is **`next`**, not `main`. `main` is
-  often older/release-oriented; default merge source is **`origin/next`**.
-- If the user explicitly asks to merge `origin/main` (or a release tag), do that
+  often older/release-oriented. Default merge source is **`$UPSTREAM_REMOTE/next`**.
+- If the user explicitly asks to merge upstream `main` (or a release tag), do that
   instead and state the substitution in the completion report.
-- Merge **upstream into local `grok-build`**, then (only if user asks or skill is
-  run with push intent) update `fork/grok-build`. Default of this skill: **local
-  merge + build + reinstall**; do **not** `git push` without explicit approval.
+- Merge **upstream into local `grok-build`**, then (only if the user asks) update
+  `$FORK_REMOTE/grok-build`. Default of this skill: **local merge + build +
+  reinstall**; do **not** `git push` without explicit approval. The push command
+  in this checkout is `git push origin grok-build`.
 
 ## Known fork themes (Grok-first-class runtime)
 
@@ -93,10 +115,19 @@ leave Grok omitted while peers declare the axis.
 **#3024 / #3547 adapt triggers (homes + install harness):**
 
 - Upstream still documents grok as a non-registry `~/.agents` id
-  (`LEGACY_NON_REGISTRY_RUNTIME_IDS`, skills-root tests, `sync-skills.md`
-  prose, `scripts/live-config-guard.cjs`). This fork’s grok is first-class
+  (`LEGACY_NON_REGISTRY_RUNTIME_IDS`, skills-root tests,
+  `scripts/live-config-guard.cjs`). This fork’s grok is first-class
   `~/.grok` / `GROK_HOME`. After merge, re-point those tests/docs; keep the
   hardcoded `getGlobalConfigDir('grok')` fallback only for a missing registry.
+- `gsd-core/workflows/sync-skills.md` refusal parenthetical must stay
+  `grok installs with --grok into ~/.grok`, locked by
+  `tests/sync-skills-cross-runtime-refuse.test.cjs`
+  (`fix(grok): correct sync-skills prose after open-gsd/next`). Upstream’s
+  sentence (`grok has no dedicated installer flag` / `aliases the codex skills
+  root`) is false here: no two runtimes share a skills root (codex is
+  `~/.agents/skills`, grok is `~/.grok/skills`). If a merge restores the
+  upstream sentence, put the fork sentence back. The #3025 cross-runtime
+  refusal itself stays.
 - `#3547` (`runMinimalInstall`) refuses to guess a global home without
   `RUNTIME_META[runtime].globalSuffix` in `tests/helpers/install-shared.cjs`.
   Declare `grok: { localDir: '.grok', globalSuffix: '.grok' }` or
@@ -135,6 +166,26 @@ leave Grok omitted while peers declare the axis.
   the literal when origin/next restores “exactly 19”; do not drop grok from the
   registry to satisfy the upstream count.
 
+**#4834 launcher homes (`_gsd_homes`) adapt trigger:**
+
+`gsd-core/workflows/_runtime-launcher.snippet.sh` probes config homes inside
+`_gsd_homes()`. Upstream lists `${GROK_AGENTS_HOME:-$HOME/.agents}` and omits
+`${GROK_HOME:-$HOME/.grok}`, so a workflow run outside a checkout that already
+contains `gsd-core` does not find `~/.grok/gsd-core`. After merge, if the
+`GROK_HOME` probe is missing, insert
+
+```text
+"${GROK_HOME:-$HOME/.grok}/gsd-core/bin/${_GSD_SHIM_NAME}"
+```
+
+immediately **before** the `GROK_AGENTS_HOME` probe (first-class home first;
+keep the legacy probe) and run `npm run sync:launcher` so workflows and agents
+pick up the snippet. `GROK_HOME` is already in the registry-derived
+`TEST_ENV_BASE`, so `tests/runtime-launcher-parity.test.cjs` (A2) covers the
+new `${VAR:-default}` arm. `commands/gsd/*.md` still use an older resolver and
+are outside `sync:launcher` — leave them unless a parity test starts requiring
+the snippet there.
+
 Non-merge feature commits on the fork (historically):
 
 ```text
@@ -154,9 +205,12 @@ fix(grok): declare dispatch.maxConcurrency undocumented after origin/next
 chore(grok): document #3673 maxConcurrency + recurring merge hunks
 fix(grok): route JS hooks through gsd-node-runner.sh
 chore(grok): document --relative-includes in update-gsd-local
+fix(grok): correct sync-skills prose after open-gsd/next
+chore(grok): record upstream remote and launcher-home trigger in update-gsd-local
 ```
 
-Plus periodic `Merge origin/next into grok-build` commits.
+Plus periodic `Merge open-gsd/next into grok-build` commits (older messages say
+`Merge origin/next` from when that label pointed at open-gsd).
 
 ## Generated artifacts (do not confuse these)
 
@@ -178,43 +232,53 @@ generated output.
 
 ### 1. Fetch upstream
 
-```bash
-git fetch origin next
-# Optional but useful for comparison:
-git fetch fork grok-build
-```
-
-Show how far behind:
+`UPSTREAM_REMOTE` and `FORK_REMOTE` come from **Record state and resolve
+remotes**. Fetch open-gsd `next` from that remote. Also fetch the fork’s
+`grok-build` when the fork remote exists, for the ahead/behind line in the
+completion report.
 
 ```bash
-git log --oneline --left-right --cherry-pick HEAD...origin/next | head -40
-git rev-list --left-right --count HEAD...origin/next
+git fetch "$UPSTREAM_REMOTE" next
+# This checkout: git fetch upstream next
+if [ -n "$FORK_REMOTE" ]; then
+  git fetch "$FORK_REMOTE" grok-build
+fi
 ```
 
-If already up to date with `origin/next` (0 commits on the upstream side to merge),
-skip merge/conflict steps and jump to **Step 6 (build)** unless the user only
-wanted a reinstall of the current tree (then jump to Step 7).
+Show how far behind **`$UPSTREAM_REMOTE/next`** (never the fork’s `next`):
 
-### 2. Merge origin/next into local grok-build
+```bash
+git log --oneline --left-right --cherry-pick HEAD..."$UPSTREAM_REMOTE/next" | head -40
+git rev-list --left-right --count HEAD..."$UPSTREAM_REMOTE/next"
+```
+
+If already up to date with `$UPSTREAM_REMOTE/next` (0 commits on the upstream
+side to merge), skip merge/conflict steps and jump to **Step 6 (build)** unless
+the user only wanted a reinstall of the current tree (then jump to Step 7).
+
+### 2. Merge upstream `next` into local grok-build
 
 Ensure on the integration branch (default `grok-build`):
 
 ```bash
 git checkout grok-build
-git merge origin/next
+git merge "$UPSTREAM_REMOTE/next"
+# This checkout: git merge upstream/next
 ```
 
-Commit message style used in this repo when wrapping merges:
+Commit message style:
 
 ```text
-Merge origin/next into grok-build; keep Grok as first-class runtime
+Merge open-gsd/next into grok-build; keep Grok as first-class runtime
 ```
 
-Variants that match history:
+Variants that match history (older ones say `origin/next` from when that label
+was open-gsd):
 
 ```text
 Merge remote-tracking branch 'origin/next' into grok-build
 Merge origin/next into grok-build; <brief note of preserved Grok deltas>
+Merge open-gsd/next into grok-build; <brief note of preserved Grok deltas>
 ```
 
 If the merge completes cleanly, note “no conflicts” and continue to Step 4 with a
@@ -234,7 +298,7 @@ For each conflicted file:
 
 1. Read both sides (`git show :2:path`, `git show :3:path`, and the working tree
    conflict markers). Stage 2 = ours (`grok-build`), stage 3 = theirs
-   (`origin/next`).
+   (`$UPSTREAM_REMOTE/next`).
 2. Prefer **preserving intentional Grok fork behavior** unless upstream clearly
    supersedes it (see Step 4 criteria). Especially careful on:
    - `bin/install.js` (runtime flags, help text; after `#2875` do **not**
@@ -276,18 +340,18 @@ This step is mandatory even when Git auto-merged: Grok fork intent must still ho
 **Identify fork-only work** (commits on local/fork not in upstream):
 
 ```bash
-# Commits on HEAD that are not on origin/next (before merge: use pre-merge tip)
-git log --oneline origin/next..HEAD   # or: merge-base..fork-tip if mid-merge
-git log --oneline --no-merges origin/next..HEAD
+# Commits on HEAD that are not on upstream next (before merge: use pre-merge tip)
+git log --oneline "$UPSTREAM_REMOTE/next"..HEAD   # or: merge-base..fork-tip if mid-merge
+git log --oneline --no-merges "$UPSTREAM_REMOTE/next"..HEAD
 ```
 
 Also:
 
 ```bash
 # Files still differing after merge (sanity)
-git diff --stat origin/next...HEAD | head -50
+git diff --stat "$UPSTREAM_REMOTE/next"...HEAD | head -50
 # Search upstream tree for accidental absorption of Grok support
-git grep -n -- 'grok' origin/next -- 'capabilities' 'bin/install.js' 'src' 'docs' 2>/dev/null | head -40
+git grep -n -- 'grok' "$UPSTREAM_REMOTE/next" -- 'capabilities' 'bin/install.js' 'src' 'docs' 2>/dev/null | head -40
 ```
 
 For **each** conflicted path or non-trivial fork delta, write a short analysis
@@ -590,7 +654,7 @@ Hold the skill text next to facts from Steps 1–8:
 | Verify pass/fail | New install surfaces, count expectations, registry checks wrong? |
 | Historical commits | New non-merge fork commits worth listing? |
 | Safety / quick reference | Commands in happy path still match what worked? |
-| Remotes / branch model | Upstream default branch still `next`? Fork remote labels still valid? |
+| Remotes / branch model | Upstream branch still `next` on the open-gsd URL? Fork URL still `status-401-unauthorized/gsd-core`? Labels may differ from `upstream` / `origin`. |
 
 Also scan for **procedure gaps** discovered mid-run (wrong default command, missing
 timeouts, stale package version assumptions, skill living only under untracked
@@ -646,8 +710,9 @@ so the next agent does not re-litigate settled decisions.
 
 Summarize for the user:
 
-1. **Sync:** pre/post SHAs (`HEAD`, `origin/next`), commits merged count
-   (`git rev-list --count <pre>..HEAD` after merge).
+1. **Sync:** pre/post SHAs (`HEAD`, `$UPSTREAM_REMOTE/next`), commits merged count
+   (`git rev-list --count <pre>..HEAD` after merge). Name the remote URL, not
+   only the label.
 2. **Conflicts:** files (or “none”), resolution summary.
 3. **Fork analysis:** each Grok delta → keep / adapt / drop + one-line rationale;
    call out hostIntegration / isolation decision explicitly.
@@ -660,14 +725,15 @@ Summarize for the user:
    converter spot-check, installed registry `dispatch.isolation` when applicable.
 8. **Skill self-review (Step 9):** verdict + table of Vital/Useful suggestions (or
    “no changes needed”). Do not mark the run complete without this section.
-9. **Next steps (optional):** push to `fork/grok-build` only if user wants:
-   `git push fork grok-build` (require confirmation — shared remote).
-   Restart Grok Build / new session so skills reload; `grok inspect` if available.
-   Apply approved skill edits if any from Step 9.
+9. **Next steps (optional):** push to `$FORK_REMOTE` `grok-build` only if the
+   user wants it. This checkout: `git push origin grok-build` (require
+   confirmation — shared remote). Restart Grok Build / new session so skills
+   reload; `grok inspect` if available. Apply approved skill edits if any
+   from Step 9.
 
 ## Safety rules
 
-- Never force-push to `origin` or `fork` unless the user explicitly requests it.
+- Never force-push any remote (fork or upstream) unless the user explicitly requests it.
 - Never `git reset --hard` or discard uncommitted work without confirmation.
 - Prefer resolving conflicts over aborting; abort only on user request or
   unrecoverable state.
@@ -692,9 +758,11 @@ Summarize for the user:
 
 ```bash
 # Full happy path (agent expands conflict/analysis as needed)
-git fetch origin next
+# Assign UPSTREAM_REMOTE / FORK_REMOTE first (Record state and resolve remotes).
+# This checkout: UPSTREAM_REMOTE=upstream, FORK_REMOTE=origin.
+git fetch "$UPSTREAM_REMOTE" next
 git checkout grok-build
-git merge origin/next   # resolve + analyze Grok deltas + hostIntegration parity
+git merge "$UPSTREAM_REMOTE/next"   # resolve + analyze Grok deltas + hostIntegration parity
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}" && . "$NVM_DIR/nvm.sh" && nvm use
 npm install             # if lockfile / deps changed
 # If MODULE_NOT_FOUND on gitignored bin/lib after merge:
