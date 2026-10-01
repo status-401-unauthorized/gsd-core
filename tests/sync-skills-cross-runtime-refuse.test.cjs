@@ -49,16 +49,19 @@ describe('#3025: sync-skills refuses cross-runtime skill sync', () => {
 
   test('the refusal points the user at the installer (actionable, not a bare rejection)', () => {
     // Hyrum's Law: the narrowed vocabulary is a visible contract change; the error must
-    // hand the user a command that produces correctly converted skills. The pointer is
-    // generic (`--<runtime>`, not `--$DEST`) because grok has no dedicated flag. `gemini`
-    // was dropped from this sentence by #4709: that runtime was retired in 1.8.0 (#1928)
-    // and never aliased claude -- canonicalizeRuntimeName returns null for it and the
-    // caller's fail-closed default merely happens to be claude, so calling it an alias
-    // mischaracterised a deliberate unknown-id fallback as designed behavior.
+    // hand the user a command that produces correctly converted skills. The pointer stays
+    // generic (`--<runtime>`, not `--$DEST`) so one sentence covers every runtime. On this
+    // fork grok is first-class (`--grok` → ~/.grok / GROK_HOME), not a codex skills-root
+    // alias. `gemini` was dropped from this sentence by #4709: that runtime was retired
+    // in 1.8.0 (#1928) and never aliased claude -- canonicalizeRuntimeName returns null
+    // for it and the caller's fail-closed default merely happens to be claude, so calling
+    // it an alias mischaracterised a deliberate unknown-id fallback as designed behavior.
     assert.match(text, /cross-runtime skill sync is not supported/, 'names the unsupported operation');
     assert.match(text, /npx -y @opengsd\/gsd-core@latest --global --<runtime>/, 'prints the installer command');
     assert.match(text, /\$DEST/, 'names the refused destination runtime');
-    assert.match(text, /grok has no dedicated installer flag/, 'accurately notes grok aliasing rather than printing a wrong --grok flag');
+    assert.match(text, /grok installs with --grok into ~\/\.grok/, 'names the grok installer flag and home');
+    assert.doesNotMatch(text, /grok has no dedicated installer flag/, 'must not claim grok lacks an installer flag');
+    assert.doesNotMatch(text, /aliases the codex skills root/, 'must not claim grok aliases the codex skills root');
   });
 
   test('the guard runs BEFORE Step 5\'s verbatim cp -r copy (cross-runtime can never reach the copy)', () => {
