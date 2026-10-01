@@ -1663,16 +1663,17 @@ const claudeToOpencodeTools = {
 // Tool name mapping from Claude Code to Antigravity
 // Antigravity uses Gemini's snake_case built-in tool names
 const claudeToAntigravityTools = {
-  Read: 'read_file',
+  // #4705: Antigravity-NATIVE tool names (see src/runtime-artifact-conversion.cts)
+  Read: 'view_file',
   Write: 'write_file',
-  Edit: 'replace',
-  Bash: 'run_shell_command',
+  Edit: 'replace_file_content',
+  Bash: 'run_command',
   Glob: 'glob',
-  Grep: 'search_file_content',
+  Grep: 'grep_search',
   WebSearch: 'google_web_search',
   WebFetch: 'web_fetch',
   TodoWrite: 'write_todos',
-};
+}
 
 // Tool name mapping from Claude/GSD agents to Kimi CLI module paths.
 // Kimi custom agent YAML requires fully-qualified module paths.
@@ -2531,7 +2532,11 @@ function convertClaudeAgentToAntigravityAgent(content, isGlobal = false) {
   const mappedTools = claudeTools.map(t => convertAntigravityToolName(t)).filter(Boolean);
 
   // #2876: quote description for the same reason as the skill variant.
-  let fm = `---\nname: ${name}\ndescription: ${yamlQuote(description)}\ntools: ${mappedTools.join(', ')}\n`;
+  // #4705: tools is a YAML SEQUENCE of native names (see the src twin).
+  const toolsBlock = mappedTools.length > 0
+    ? `tools:\n${mappedTools.map((t) => `- ${t}`).join('\n')}\n`
+    : 'tools: []\n';
+  let fm = `---\nname: ${name}\ndescription: ${yamlQuote(description)}\n${toolsBlock}`;
   if (color) fm += `color: ${color}\n`;
   fm += '---';
 
@@ -2554,20 +2559,11 @@ function yamlIdentifier(value) {
   return yamlQuote(text);
 }
 
+// The frontmatter block is the one the one fence owner (`locateFrontmatterFence`) finds, read
+// through the conversion module's reader — never a local `indexOf('---', 3)` scan, which ended
+// the block at the first `---` anywhere, even inside a value (found while implementing #5105).
 function extractFrontmatterAndBody(content) {
-  if (!content.startsWith('---')) {
-    return { frontmatter: null, body: content };
-  }
-
-  const endIndex = content.indexOf('---', 3);
-  if (endIndex === -1) {
-    return { frontmatter: null, body: content };
-  }
-
-  return {
-    frontmatter: content.substring(3, endIndex).trim(),
-    body: content.substring(endIndex + 3),
-  };
+  return runtimeArtifactConversion.extractFrontmatterAndBody(content);
 }
 
 function extractFrontmatterField(frontmatter, fieldName) {
@@ -3963,6 +3959,22 @@ Typed mapping (agent_type-capable schema only):
   never fabricate a manual worktree protocol — route through the negotiated
   isolation adapter, which still fails closed for hosts declaring \`none\` (#3360).
 
+Foreground handoffs:
+- spawn_agent is asynchronous. When the source Agent(...) or Task(...) declares
+  run_in_background=false, call collaboration.wait_agent(timeout_ms=...) immediately after
+  spawn and keep the parent turn active until that child returns a terminal result.
+- collaboration.wait_agent is a mailbox wakeup, NOT a completion oracle: "Wait completed"
+  can mean only that a child sent an interim MESSAGE or status update. After every wakeup,
+  inspect the named child's update/status. Only a FINAL_ANSWER or a terminal agent status
+  (completed, failed, or cancelled) ends the foreground handoff.
+- On an interim MESSAGE or any non-terminal status, do not report an outcome, send a
+  continuation, start parent work, or end the parent turn. Call collaboration.wait_agent
+  again for the same child. If a terminal response is absent after an abnormal end, reconcile
+  the workflow's durable artifacts before classifying the child.
+- This applies to one foreground child as well as fan-out. The child retains its workflow's
+  own checkpoint loop; do not report an outcome or start any further parent work before its
+  terminal result is available.
+
 Generic-agent workaround (multi_agent_v1 schema — NO agent_type field):
 When only the generic \`multi_agent_v1\` schema is available, typed GSD agent dispatch
 (\`gsd-planner\`, \`gsd-executor\`, etc.) is NOT possible. This is a known Codex limitation
@@ -3990,6 +4002,9 @@ Spawn restriction:
   defaulting to inline execution.
 
 Parallel fan-out:
+- For each child, loop on collaboration.wait_agent(timeout_ms=...) until its own terminal
+  result is observed. A mailbox update from one child never completes another child, and an
+  interim MESSAGE never completes its sender.
 - Spawn multiple agents → collect agent IDs → \`collaboration.wait_agent(timeout_ms=...)\` for each to complete
 - Do NOT use \`functions.wait(cell_id=...)\` — that is an unrelated exec-cell tool, not the collaboration wait
 
@@ -7251,19 +7266,11 @@ function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOve
   // Runtime-neutral agent name replacement (#766)
   convertedContent = neutralizeAgentReferences(convertedContent, 'AGENTS.md');
 
-  // Check if content has frontmatter
-  if (!convertedContent.startsWith('---')) {
+  // The frontmatter block, as the one fence owner finds it (none → nothing to convert).
+  const { frontmatter, body } = extractFrontmatterAndBody(convertedContent);
+  if (frontmatter === null) {
     return convertedContent;
   }
-
-  // Find the end of frontmatter
-  const endIndex = convertedContent.indexOf('---', 3);
-  if (endIndex === -1) {
-    return convertedContent;
-  }
-
-  const frontmatter = convertedContent.substring(3, endIndex).trim();
-  const body = convertedContent.substring(endIndex + 3);
 
   // Parse frontmatter line by line (simple YAML parsing)
   const lines = frontmatter.split('\n');
@@ -7418,19 +7425,11 @@ function convertClaudeToKiloFrontmatter(content, { isAgent = false, modelOverrid
   // Runtime-neutral agent name replacement (#766)
   convertedContent = neutralizeAgentReferences(convertedContent, 'AGENTS.md');
 
-  // Check if content has frontmatter
-  if (!convertedContent.startsWith('---')) {
+  // The frontmatter block, as the one fence owner finds it (none → nothing to convert).
+  const { frontmatter, body } = extractFrontmatterAndBody(convertedContent);
+  if (frontmatter === null) {
     return convertedContent;
   }
-
-  // Find the end of frontmatter
-  const endIndex = convertedContent.indexOf('---', 3);
-  if (endIndex === -1) {
-    return convertedContent;
-  }
-
-  const frontmatter = convertedContent.substring(3, endIndex).trim();
-  const body = convertedContent.substring(endIndex + 3);
 
   // Parse frontmatter line by line (simple YAML parsing)
   const lines = frontmatter.split('\n');
@@ -12146,7 +12145,14 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
           console.log(`  ${green}✓${reset} Wrote ${sharedHooksDirName}/package.json (CommonJS mode)`);
           break;
         case 'preserved-foreign':
-          console.warn(`  ${yellow}⚠${reset}  Left existing ${sharedHooksDirName}/package.json untouched (not GSD's marker) — GSD hooks may not resolve as CommonJS`);
+          // #4759: the foreign file usually DOES declare "type": "commonjs" —
+          // any hand-written or formatter-touched package.json does — and Node
+          // then loads the staged .js hooks as CommonJS, so the old
+          // unconditional "may not resolve" claim was usually false. The
+          // sibling plugin path (src/install-engine.cts) words this same
+          // outcome conditionally; match it and keep will-not-load conditional
+          // on "type": "module", the only case where it is true.
+          console.warn(`  ${yellow}⚠${reset}  Left existing ${sharedHooksDirName}/package.json untouched (not GSD's marker). If it declares "type": "module", the staged hooks will not load.`);
           break;
         case 'failed':
           // Best-effort: a read-only or full config dir must not abort the
@@ -12378,6 +12384,42 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       manifestFiles = null;
     }
     if (manifestFiles !== null) {
+      // #4667: codex-installed artifacts must not keep `@~/.claude/gsd-core/…`
+      // include references — the `@` form resolves into the CLAUDE install
+      // (wrong copy on dual-runtime machines at divergent versions, nothing at
+      // all on codex-only ones; #570 cause 2 residue). Every target ships in
+      // the codex install, so rewriting the `@~/` include form to the codex
+      // root is mechanical and correct. This runs after all .md emitters
+      // (several bypass the per-runtime converters — that is how the leak
+      // survived the per-emitter fixes; the agent .tomls are generated later
+      // and prefix themselves), and before the scan below, which stays as the
+      // verification backstop. The `_GSD_RUNTIME_ROOT`/`$PREFERRED_CONFIG_DIR`
+      // fallback chains and prose `.claude` mentions carry no `@~/` prefix and
+      // are deliberately untouched, as is CHANGELOG.md.
+      if (runtime === 'codex') {
+        for (const relPath of manifestFiles) {
+          const fileName = path.basename(relPath);
+          if (!(fileName.endsWith('.md') || fileName.endsWith('.toml'))) continue;
+          if (fileName === 'CHANGELOG.md') continue;
+          const rewritePath = path.join(targetDir, relPath);
+          let rewriteContent;
+          try {
+            rewriteContent = fs.readFileSync(rewritePath, 'utf8');
+          } catch (rewriteErr) {
+            continue; // inaccessible or missing — the scan below reports or skips it
+          }
+          const rewritten = rewriteContent
+            .split('@~/.claude/gsd-core/').join('@~/.codex/gsd-core/')
+            .split('@$HOME/.claude/gsd-core/').join('@$HOME/.codex/gsd-core/');
+          if (rewritten !== rewriteContent) {
+            try {
+              fs.writeFileSync(rewritePath, rewritten);
+            } catch (writeErr) {
+              continue; // never fail the install over the rewrite; the scan still warns
+            }
+          }
+        }
+      }
       for (const relPath of manifestFiles) {
         const fileName = path.basename(relPath);
         if (!(fileName.endsWith('.md') || fileName.endsWith('.toml'))) continue;

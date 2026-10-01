@@ -30,7 +30,7 @@ import frontmatter = require('./frontmatter.cjs');
 // does not require this module, so the edge is acyclic.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import commandsModule = require('./commands.cjs');
-const { extractFrontmatter, spliceFrontmatter } = frontmatter;
+const { extractFrontmatter, frontmatterBlock, spliceFrontmatter, isFrontmatterWriteRefusal } = frontmatter;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import phaseIdMod = require('./phase-id.cjs');
 const { PHASE_NUMBER_TOKEN_SOURCE, scopeToPhase } = phaseIdMod;
@@ -43,6 +43,10 @@ import { platformWriteSync } from './shell-command-projection.cjs';
 import io = require('./io.cjs');
 const { output, error: ioError } = io;
 import { parseNamedArgsOrExit } from './command-arg-projection.cjs';
+// #5118: the verification-status owner's report reader and closed enum.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import verificationMod = require('./verification.cjs');
+const { reportStatusOf, VERIFICATION_STATUS, VerificationStatusError } = verificationMod;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -785,9 +789,11 @@ function scanTodos(todosBase: string): ScanOutcome<TodoItem> {
 
   const displayFiles = openFiles.slice(0, 5);
   for (const { entry, content, fm } of displayFiles) {
-    // Extract first line of body after frontmatter
-    const bodyMatch = content.replace(/^---[\s\S]*?---\r?\n?/, '');
-    const firstLine = splitLines(bodyMatch.trim())[0] || '';
+    // Extract first line of body after frontmatter — the block `extractFrontmatter` read above
+    // (the one fence owner), so a `---` inside a value cannot end it early.
+    const block = frontmatterBlock(content);
+    const todoBody = block ? block.rest : content;
+    const firstLine = splitLines(todoBody.trim())[0] || '';
     const summary = sanitizeForDisplay(firstLine.slice(0, 100));
 
     results.push({
@@ -1130,9 +1136,11 @@ function scanVerificationGaps(planDir: string, cwd: string): ScanOutcome<Verific
       const content = normalizeLineEndings(rawContent);
 
       const fm = extractFrontmatter(content, safeFilePath);
-      const status = ((fm.status as string) || 'unknown').toLowerCase();
+      // #5118: the owner's report reader judges `status` — exact match, no
+      // case folding; an out-of-set value throws VerificationStatusError.
+      const status = reportStatusOf(fm, safeFilePath);
 
-      if (status !== 'gaps_found' && status !== 'human_needed') continue;
+      if (status !== VERIFICATION_STATUS.GAPS_FOUND && status !== VERIFICATION_STATUS.HUMAN_NEEDED) continue;
 
       if (isAuditItemAcknowledged(fm, { snapshotKey: 'status', currentValue: status })) {
         acknowledged++;
@@ -1354,7 +1362,14 @@ function auditOpenArtifacts(cwd: string): AuditResult {
   })();
 
   const verificationGaps = (() => {
-    try { return scanVerificationGaps(planDir, cwd); } catch { return { items: [{ scan_error: true, phase: '', file: '', status: '' }], acknowledged: 0 }; }
+    try {
+      return scanVerificationGaps(planDir, cwd);
+    } catch (err) {
+      // #5118: an out-of-set report status is the owner's hard error, not a
+      // scan failure to fold into a sentinel — let it reach the CLI seam.
+      if (err instanceof VerificationStatusError) throw err;
+      return { items: [{ scan_error: true, phase: '', file: '', status: '' }], acknowledged: 0 };
+    }
   })();
 
   const contextQuestions = (() => {
@@ -1631,6 +1646,25 @@ function resolvePhaseTargetDir(planDir: string, cwd: string, phase: string, arch
  * artifact identifier that resolves outside the project is refused before
  * any read or write is attempted.
  */
+/**
+ * #4802: splice the acknowledgement marker, surfacing `spliceFrontmatter`'s
+ * write refusal (the one owner of that decision) as an `ioError` naming the
+ * file — an unparseable frontmatter block is NOT an empty one, and splicing
+ * over it would discard every field the author actually wrote.
+ */
+function spliceAcknowledgement(content: string, fm: Parameters<typeof spliceFrontmatter>[1], fileLabel: string): string {
+  try {
+    return spliceFrontmatter(content, fm);
+  } catch (err) {
+    if (!isFrontmatterWriteRefusal(err)) throw err;
+    if (err.code === 'FRONTMATTER_UNPARSEABLE') {
+      ioError(`refusing to acknowledge — the frontmatter of "${fileLabel}" is not parseable YAML (splicing would discard every other frontmatter field); fix the YAML syntax error first, then re-run`);
+    }
+    ioError(`refusing to acknowledge "${fileLabel}" — ${err.message}`);
+    throw err; // unreachable — ioError throws
+  }
+}
+
 function cmdAuditAcknowledge(cwd: string, args: string[], raw: boolean): void {
   // args already has the family + subcommand tokens stripped by the caller
   // (audit-command-router.cts:147 passes `hubArgs.slice(2)`), so validation
@@ -1739,7 +1773,7 @@ function cmdAuditAcknowledge(cwd: string, args: string[], raw: boolean): void {
       currentValue = deriveOpenQuestionsDigest(deriveOpenQuestions(normalizedContent, fm));
     }
     fm.audit_acknowledged = { ...markerBase, [snapshotKey]: currentValue };
-    const newContent = spliceFrontmatter(content, fm);
+    const newContent = spliceAcknowledgement(content, fm, file as string);
     platformWriteSync(safeFilePath, newContent);
     output({ acknowledged: true, category, phase, file, [snapshotKey]: currentValue }, raw, 'true');
     return;
@@ -1852,11 +1886,12 @@ function cmdAuditAcknowledge(cwd: string, args: string[], raw: boolean): void {
   }
 
   const presenceOnly = category === 'todos';
-  const fm = createIfMissing ? fmForCreate : extractFrontmatter(fs.readFileSync(safeFilePath, 'utf-8'), safeFilePath);
+  const existingContent = createIfMissing ? '' : fs.readFileSync(safeFilePath, 'utf-8');
+  const fm = createIfMissing ? fmForCreate : extractFrontmatter(existingContent, safeFilePath);
   fm.audit_acknowledged = presenceOnly ? { ...markerBase } : { ...markerBase, [snapshotKey]: currentValue };
-  const newContent = createIfMissing
-    ? spliceFrontmatter('', fm)
-    : spliceFrontmatter(fs.readFileSync(safeFilePath, 'utf-8'), fm);
+  // #4802: createIfMissing splices into '' (no block to refuse on); an existing
+  // file with broken YAML is refused by `spliceAcknowledgement`.
+  const newContent = spliceAcknowledgement(existingContent, fm, safeFilePath);
   platformWriteSync(safeFilePath, newContent);
   output({ acknowledged: true, category, ...(presenceOnly ? {} : { [snapshotKey]: currentValue }) }, raw, 'true');
 }

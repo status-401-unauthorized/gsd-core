@@ -66,6 +66,7 @@ const { buildPlanningSnapshot } = planningSnapshotMod;
 import onboardProjectionMod = require('./onboard-projection.cjs');
 const { REQUIRED_CODEBASE_MAP_FILES } = onboardProjectionMod;
 import { realClock } from './clock.cjs';
+import { readWorkflowConfigValue } from './gate-config.cjs';
 
 const { planningDir, planningRoot, withPlanningLock } = planningWorkspace;
 const { defaultPhaseCleanCommitTimesMs } = verificationMod;
@@ -922,8 +923,15 @@ function scanQuantitativeCriteria(content: string): { errors: string[]; warnings
       // Not a markdown table: the negated-pipe class matches a SHELL pipeline
       // stage boundary (git before the next `|`), the same shape the
       // #429/#968 scanners use; there is no table row to parse.
+      // #4774: the lookahead keeps `||` — a logical OR, the construct that
+      // HANDLES the failure (e.g. the `git cat-file -e <sha> || echo missing`
+      // ghost-control idiom, reachable here when prose apostrophes leave the
+      // segment's quote state unclosed) — quiet, while `|` and `|&` (a real
+      // pipeline stage, stderr-merged or not) still warn. Accepted trade-off:
+      // a QUOTED `||` literal ahead of a real pipe (``git grep 'a||b' f | wc -l``)
+      // also goes quiet — the lookahead cannot reach past the doubled pipe.
       // allow-adhoc-markdown: shell pipeline stage boundary, not a table cell (#4024)
-      if (/\bgit\s+[a-z][^\n|]*\|/.test(seg)) {
+      if (/\bgit\s+[a-z][^\n|]*\|(?!\|)/.test(seg)) {
         record(
           warnings,
           'R4',
@@ -1009,6 +1017,10 @@ interface PlanTaskInfo {
   // checkpoint:decision fields
   hasDecision: boolean;
   hasOptions: boolean;
+  /** `auto_select` attribute value from the opening `<task>` tag, or null if absent (#4095). */
+  autoSelect: string | null;
+  /** `id` attribute of every `<option id="…">` found inside `<options>…</options>`, in document order (#4095). */
+  optionIds: string[];
   // checkpoint:human-action fields
   hasInstructions: boolean;
   hasVerification: boolean;
@@ -1053,6 +1065,15 @@ function extractPlanTaskInfos(content: string): PlanTaskInfo[] {
     const hasName = nameArr.length > 0;
     const name = hasName ? nameArr[0].trim() : '';
 
+    // `(?:^|\s)` (not `\b`) so a hyphenated attribute ending in `auto_select`
+    // can never be mistaken for the real attribute — the same defensive
+    // anchor as extractOptionIds' `id` match below (#4095).
+    const autoSelectMatch = attrs.match(/(?:^|\s)auto_select\s*=\s*["']([^"']*)["']/);
+    const autoSelect = autoSelectMatch ? autoSelectMatch[1] : null;
+
+    const optionsArr = extractTaggedBlocks(body, 'options');
+    const optionIds = optionsArr.length > 0 ? extractOptionIds(optionsArr[0]) : [];
+
     infos.push({
       name,
       type,
@@ -1070,6 +1091,8 @@ function extractPlanTaskInfos(content: string): PlanTaskInfo[] {
       hasHowToVerify: /<how-to-verify[\s>]/.test(body),
       hasDecision: /<decision[\s>]/.test(body),
       hasOptions: /<options[\s>]/.test(body),
+      autoSelect,
+      optionIds,
       hasInstructions: /<instructions[\s>]/.test(body),
       hasVerification: /<verification[\s>]/.test(body),
       hasResumeSignal: /<resume-signal[\s>]/.test(body),
@@ -1081,6 +1104,36 @@ function extractPlanTaskInfos(content: string): PlanTaskInfo[] {
     }
   }
   return infos;
+}
+
+/**
+ * Extract the `id` attribute of every `<option id="…">` opening tag found in
+ * `optionsBody` (the inner text of one `<options>…</options>` block), in
+ * document order. Bounded attribute scan (`[^>]{0,500}`), mirroring the same
+ * ReDoS-safe idiom `extractPlanTaskInfos` uses for the `<task type="…">`
+ * attribute string — this file's established pattern for reading an
+ * attribute value without a general XML parser (#4095).
+ */
+function extractOptionIds(optionsBody: string): string[] {
+  const ids: string[] = [];
+  if (typeof optionsBody !== 'string' || optionsBody.length === 0) return ids;
+
+  const OPTION_OPEN_RE = /<option(\s[^>]{0,500})?>/g;
+  let match: RegExpExecArray | null;
+  while ((match = OPTION_OPEN_RE.exec(optionsBody)) !== null) {
+    const attrs = match[1] ?? '';
+    // `(?:^|\s)` (not `\b`) so a decoy attribute like `data-id="…"` inside
+    // the same opening tag cannot be mistaken for the real `id` — `\b`
+    // matches at the `-`→`i` boundary too, which `.match()`'s
+    // first-hit-wins semantics would then silently prefer (#4095).
+    const idMatch = attrs.match(/(?:^|\s)id\s*=\s*["']([^"']{1,200})["']/);
+    if (idMatch) ids.push(idMatch[1]);
+
+    if (match.index === OPTION_OPEN_RE.lastIndex) {
+      OPTION_OPEN_RE.lastIndex++;
+    }
+  }
+  return ids;
 }
 
 function isCheckpointType(type: string): boolean {
@@ -1124,6 +1177,16 @@ function validatePlanTaskStructure(task: PlanTaskInfo): { errors: string[]; warn
       case 'checkpoint:decision':
         if (!task.hasDecision) errors.push(`Task '${taskName}' missing <decision>`);
         if (!task.hasOptions) errors.push(`Task '${taskName}' missing <options>`);
+        if (task.autoSelect !== null) {
+          if (task.autoSelect.length === 0) {
+            errors.push(`Task '${taskName}' auto_select is empty — name an <option id="…">`);
+          } else if (task.hasOptions && !task.optionIds.includes(task.autoSelect)) {
+            errors.push(
+              `Task '${taskName}' auto_select="${task.autoSelect}" does not match any `
+                + `<option id="…"> (available: ${task.optionIds.join(', ') || 'none'})`,
+            );
+          }
+        }
         break;
       case 'checkpoint:human-action':
         if (!task.hasAction) errors.push(`Task '${taskName}' missing <action>`);
@@ -1930,6 +1993,9 @@ function cmdValidateHealth(
   // Diagnostic -> IssueEntry mapping contract this reproduces.
   const snapshot = buildPlanningSnapshot(cwd);
   const diagnostics = evaluateRules(snapshot);
+  // #5118: an out-of-set verification report status is carried by the
+  // snapshot (`verificationStatusError`) and reported as the W030 finding — a
+  // diagnostics surface survives the defect it diagnoses, so this run exits 0.
 
   const errors: IssueEntry[] = [];
   const warnings: IssueEntry[] = [];
@@ -2124,6 +2190,25 @@ function cmdVerifyContextDrift(cwd: string, phaseArg: string | undefined, raw: b
     return;
   }
 
+  // Non-blocking contract: a throw anywhere (an invalid GSD_WORKSTREAM, an unreadable file)
+  // yields the skip payload, exactly as cmdVerifyCodebaseDrift does.
+  try {
+    runVerifyContextDrift(cwd, phaseArg, raw);
+  } catch (err) {
+    output(
+      {
+        block: false,
+        skipped: true,
+        reason: 'exception: ' + (err instanceof Error ? err.message : String(err)),
+        stale_artifacts: [],
+        message: '',
+      },
+      raw,
+    );
+  }
+}
+
+function runVerifyContextDrift(cwd: string, phaseArg: string, raw: boolean): void {
   const pDir = planningDir(cwd);
   const phasesDir = path.join(pDir, 'phases');
   const emitSkip = (reason: string, message = ''): void => {
@@ -2183,14 +2268,9 @@ function cmdVerifyContextDrift(cwd: string, phaseArg: string | undefined, raw: b
   const driftEntries: ContextDriftEntry[] = upstreamFiles.map((f) => ({ file: f, effectiveMs: effectiveTimeMs(f) }));
   const staleArtifacts = computeContextDrift(contextMs, driftEntries);
 
-  let wf: Record<string, unknown> | undefined;
-  try {
-    const rawCfg = JSON.parse(fs.readFileSync(path.join(pDir, 'config.json'), 'utf-8')) as Record<string, unknown>;
-    wf = rawCfg['workflow'] as Record<string, unknown> | undefined;
-  } catch {
-    wf = undefined;
-  }
-  const action = wf?.context_drift_action === 'block' ? 'block' : 'warn';
+  // Through the quiet gate-config reader (workstream config first, then the project root's; a
+  // missing or malformed config is "key absent", nothing is printed).
+  const action = readWorkflowConfigValue(cwd, 'workflow.context_drift_action').value === 'block' ? 'block' : 'warn';
   const block = staleArtifacts.length > 0 && action === 'block';
   const message = staleArtifacts.length > 0 ? buildContextDriftMessage(staleArtifacts, phaseArg) : '';
 
@@ -2217,6 +2297,28 @@ function cmdVerifySchemaDrift(
     return;
   }
 
+  // Non-blocking contract: a throw anywhere yields a non-blocking payload, never a crash.
+  try {
+    runVerifySchemaDrift(cwd, phaseArg, skipFlag, raw);
+  } catch (err) {
+    output(
+      {
+        block: false,
+        drift_detected: false,
+        blocking: false,
+        message: 'exception: ' + (err instanceof Error ? err.message : String(err)),
+      },
+      raw,
+    );
+  }
+}
+
+function runVerifySchemaDrift(
+  cwd: string,
+  phaseArg: string,
+  skipFlag: boolean | undefined,
+  raw: boolean,
+): void {
   const pDir = planningDir(cwd);
   const phasesDir = path.join(pDir, 'phases');
   if (!fs.existsSync(phasesDir)) {
@@ -2413,23 +2515,33 @@ function cmdVerifyCodebaseDrift(cwd: string, raw: boolean): void {
   try {
     const codebaseDir = path.join(planningDir(cwd), 'codebase');
     const structurePath = path.join(codebaseDir, 'STRUCTURE.md');
-    if (!fs.existsSync(structurePath)) {
-      emit({
-        // Uniform gate contract: block = action_required (false when skipped).
-        block: false,
-        skipped: true,
-        reason: 'no-structure-md',
-        action_required: false,
-        directive: 'none',
-        elements: [],
-      });
-      return;
-    }
+    // A generated document is read only when it is a regular file (symlinks
+    // followed) no larger than this: a FIFO would block the gate forever and a
+    // huge file would exhaust memory.
+    const MAX_DOCUMENT_BYTES = 1048576;
+    const readDocument = (file: string): string => {
+      const st = fs.statSync(file);
+      if (!st.isFile()) throw new Error('not a regular file');
+      if (st.size > MAX_DOCUMENT_BYTES) throw new Error(`larger than ${MAX_DOCUMENT_BYTES} bytes`);
+      return fs.readFileSync(file, 'utf-8');
+    };
 
     let structureMd: string;
     try {
-      structureMd = fs.readFileSync(structurePath, 'utf-8');
+      structureMd = readDocument(structurePath);
     } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        emit({
+          // Uniform gate contract: block = action_required (false when skipped).
+          block: false,
+          skipped: true,
+          reason: 'no-structure-md',
+          action_required: false,
+          directive: 'none',
+          elements: [],
+        });
+        return;
+      }
       emit({
         block: false,
         skipped: true,
@@ -2548,42 +2660,73 @@ function cmdVerifyCodebaseDrift(cwd: string, raw: boolean): void {
       // git C-quote seam (worktree-safety.cjs); a non-quoted value — the plain
       // ASCII common case — passes through untouched. Both capture groups are
       // decoded: R/C lines carry old AND new paths, either may be quoted.
-      const file = decodeGitQuotedPath(m[3] || m[2]);
-      if (isPlanningArtifact(file)) continue;
-      if (status === 'A' || status === 'R' || status === 'C') added.push(file);
-      else if (status === 'M') modified.push(file);
-      else if (status === 'D') deleted.push(file);
+      // A rename is a deletion of the old path plus an addition of the new
+      // one; a copy leaves its source in place and adds only the new path.
+      const oldPath = decodeGitQuotedPath(m[2]);
+      const newPath = m[3] ? decodeGitQuotedPath(m[3]) : oldPath;
+      const put = (file: string, into: string[]) => {
+        if (!isPlanningArtifact(file)) into.push(file);
+      };
+      if (status === 'R') {
+        put(oldPath, deleted);
+        put(newPath, added);
+      } else if (status === 'C') put(newPath, added);
+      else if (status === 'A') put(newPath, added);
+      else if (status === 'M' || status === 'T') put(newPath, modified);
+      else if (status === 'D') put(newPath, deleted);
+    }
+
+    // Every generated document is territory the map describes, so all seven are
+    // read (the one owner of the names is REQUIRED_CODEBASE_MAP_FILES).
+    // STRUCTURE.md was read above; an unreadable other document is omitted and
+    // named rather than sinking the whole check, and an absent one is simply
+    // not part of this map (a `--fast` map writes four of the seven).
+    const documents: Record<string, string> = {};
+    const documentsRead: string[] = [];
+    const documentsUnreadable: string[] = [];
+    for (const name of REQUIRED_CODEBASE_MAP_FILES) {
+      if (name === 'STRUCTURE.md') {
+        documents[name] = structureMd;
+        documentsRead.push(name);
+        continue;
+      }
+      try {
+        documents[name] = readDocument(path.join(codebaseDir, name));
+        documentsRead.push(name);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') documentsUnreadable.push(name);
+      }
     }
 
     // loadConfig() returns a flattened object — there is no nested `workflow`
-    // key. Read the raw config.json directly to access workflow-scoped keys,
-    // matching the pattern used in check-command-router.cts:readWorkflowConfig.
-    let wf: Record<string, unknown> | undefined;
-    try {
-      const rawCfg = JSON.parse(
-        fs.readFileSync(path.join(planningDir(cwd), 'config.json'), 'utf-8'),
-      ) as Record<string, unknown>;
-      wf = rawCfg['workflow'] as Record<string, unknown> | undefined;
-    } catch {
-      wf = undefined;
-    }
+    // key. Read the workflow-scoped keys through the quiet gate-config reader (the dot-path
+    // resolver `config-get workflow.*` shares: workstream config first, then the project
+    // root's; a missing or malformed config is "key absent", nothing is printed).
+    const configuredThreshold = readWorkflowConfigValue(cwd, 'workflow.drift_threshold').value;
     const threshold =
-      Number.isInteger(wf?.drift_threshold) && (wf?.drift_threshold as number) >= 1
-        ? (wf?.drift_threshold as number)
+      Number.isInteger(configuredThreshold) && (configuredThreshold as number) >= 1
+        ? (configuredThreshold as number)
         : 3;
-    const action = wf?.drift_action === 'auto-remap' ? 'auto-remap' : 'warn';
+    const action = readWorkflowConfigValue(cwd, 'workflow.drift_action').value === 'auto-remap' ? 'auto-remap' : 'warn';
 
     const driftResult = (drift['detectDrift'] as (opts: unknown) => Record<string, unknown>)({
       addedFiles: added,
       modifiedFiles: modified,
       deletedFiles: deleted,
-      structureMd,
+      documents,
       threshold,
       action,
       runtime: resolveRuntime(cwd),
     });
 
     const actionRequired = !!driftResult['actionRequired'];
+    // Paths are attacker-controlled (they come from git); the raw values stay
+    // in the library result, the CLI JSON carries display-safe renderings and
+    // a bounded withheld list with its true size alongside.
+    const display = drift['displaySafePath'] as (p: string) => string;
+    const WITHHELD_LIST_CAP = 50;
+    const withheldAll = (driftResult['withheldPaths'] as string[] | undefined) || [];
+    const elementsRaw = (driftResult['elements'] as { category: string; path: string }[] | undefined) || [];
     emit({
       // Uniform gate contract: block = action_required.
       block: actionRequired,
@@ -2593,7 +2736,11 @@ function cmdVerifyCodebaseDrift(cwd: string, raw: boolean): void {
       directive: driftResult['directive'],
       spawn_mapper: !!driftResult['spawnMapper'],
       affected_paths: driftResult['affectedPaths'] || [],
-      elements: driftResult['elements'] || [],
+      withheld_paths: withheldAll.slice(0, WITHHELD_LIST_CAP).map((p) => display(p)),
+      withheld_count: withheldAll.length,
+      documents_read: documentsRead,
+      documents_unreadable: documentsUnreadable,
+      elements: elementsRaw.map((e) => ({ category: e.category, path: display(e.path) })),
       threshold,
       action,
       last_mapped_commit: lastMapped,

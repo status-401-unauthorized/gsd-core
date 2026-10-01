@@ -17,7 +17,7 @@ import cliExitMod = require('./cli-exit.cjs');
 const { ExitError } = cliExitMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import configLoader = require('./config-loader.cjs');
-const { CONFIG_DEFAULTS } = configLoader;
+const { CONFIG_DEFAULTS, resolvePlannerStallDetectionEnabled } = configLoader;
 import { platformWriteSync, platformEnsureDir } from './shell-command-projection.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspace = require('./planning-workspace.cjs');
@@ -107,6 +107,7 @@ const SCHEMA_DEFAULTS: Record<string, unknown> = {
   'context_window': 200000,
   'executor.stall_detect_interval_minutes': 5,
   'executor.stall_threshold_minutes': 10,
+  'planner.stall_detection_enabled': CONFIG_DEFAULTS.planner_stall_detection_enabled,
   'planner.stall_detect_interval_minutes': 5,
   'planner.stall_threshold_minutes': 10,
   'git.create_tag': true,
@@ -151,6 +152,19 @@ const SCHEMA_DEFAULTS: Record<string, unknown> = {
   // WARNING_THRESHOLD/CRITICAL_THRESHOLD so the copies cannot drift.
   'hooks.context_warning_threshold': 35,
   'hooks.context_critical_threshold': 25,
+  // #4974: gates.* confirmation toggles — an absent key must resolve to the
+  // documented default (true) rather than "Key not found", matching
+  // config-defaults.manifest.json's `gates` block. Literal here (like
+  // git.create_tag above) rather than derived from config-loader.cjs's flat
+  // CONFIG_DEFAULTS: that flat projection is enumerated 1:1 against
+  // gsd-core/references/planning-config.md by
+  // tests/config-field-docs.test.cjs, and these 3 keys are internal workflow
+  // wiring, not part of that public flat-key surface. Only the 3 keys
+  // actually read by workflow conditions are registered — see
+  // gsd-core/bin/shared/config-schema.manifest.json.
+  'gates.execute_next_plan': true,
+  'gates.confirm_transition': true,
+  'gates.confirm_milestone_scope': true,
 };
 
 /**
@@ -185,12 +199,15 @@ function resolveSchemaDefault(cwd: string, kp: string): { found: boolean; value:
  * Centralizing emission here means masking can't be missed at a call site.
  */
 function emitResolvedDefault(kp: string, value: unknown, raw: boolean): void {
+  const resolvedValue = kp === 'planner.stall_detection_enabled'
+    ? resolvePlannerStallDetectionEnabled(value)
+    : value;
   if (isSecretKey(kp)) {
-    const masked = maskSecret(value as Parameters<typeof maskSecret>[0]);
+    const masked = maskSecret(resolvedValue as Parameters<typeof maskSecret>[0]);
     output(masked, raw, masked);
     return;
   }
-  output(value, raw, String(value));
+  output(resolvedValue, raw, String(resolvedValue));
 }
 
 // ─── Validation helpers ───────────────────────────────────────────────────────
@@ -899,6 +916,13 @@ function cmdConfigSet(cwd: string, keyPath: string | undefined, value: string | 
   const VALID_CONTEXT_VALUES = ['dev', 'research', 'review'];
   if (kp === 'context') assertEnumValue(parsedValue, val, VALID_CONTEXT_VALUES, 'context value');
 
+  // #4974: `mode` was never enum-validated — `config-set mode custom` (or any
+  // other string) silently succeeded, even though only "interactive" and
+  // "yolo" are documented/read values (gsd-core/references/planning-config.md,
+  // docs/CONFIGURATION.md, pinned by tests/config-field-docs.test.cjs).
+  const VALID_MODE_VALUES = ['interactive', 'yolo'];
+  if (kp === 'mode') assertEnumValue(parsedValue, val, VALID_MODE_VALUES, 'mode');
+
   if (kp === 'phase_id_convention') {
     assertEnumValue(parsedValue, val, VALID_PHASE_ID_CONVENTIONS, 'phase_id_convention');
   }
@@ -952,6 +976,14 @@ function cmdConfigSet(cwd: string, keyPath: string | undefined, value: string | 
   if (kp === 'workflow.agent_hint_routing') {
     if (typeof parsedValue !== 'boolean') {
       error(`Invalid workflow.agent_hint_routing '${val}'. Must be a boolean (true or false).`);
+    }
+  }
+
+  // Planner watchdog opt-out (#4570) — only a real boolean may change the
+  // default-on policy. In particular, string "false" must not disable it.
+  if (kp === 'planner.stall_detection_enabled') {
+    if (typeof parsedValue !== 'boolean') {
+      error(`Invalid planner.stall_detection_enabled '${val}'. Must be a boolean (true or false).`);
     }
   }
 
@@ -1249,6 +1281,10 @@ function cmdConfigGet(cwd: string, keyPath: string | undefined, raw: boolean, de
     const sd = resolveSchemaDefault(cwd, kp);
     if (sd.found) { emitResolvedDefault(kp, sd.value, raw); return; }
     error(`Key not found: ${kp}`, ERROR_REASON.CONFIG_KEY_NOT_FOUND);
+  }
+
+  if (kp === 'planner.stall_detection_enabled') {
+    current = resolvePlannerStallDetectionEnabled(current);
   }
 
   // Never echo plaintext for sensitive keys via config-get. Plaintext lives

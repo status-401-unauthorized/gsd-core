@@ -24,6 +24,23 @@ const {
 } = require('../hooks/gsd-statusline.js');
 const { cleanup, saveSessionEnv, restoreSessionEnv, clearSessionEnv } = require('./helpers.cjs');
 
+// Found while implementing #5105: the statusline reads STATE.md's frontmatter from the block the
+// one fence owner finds. Its old regex missed a BOM block and closed on a `--- x` line, dropping
+// every key after it.
+describe('parseStateMd reads the frontmatter block the one fence owner finds', () => {
+  for (const [label, content] of [
+    ['a BOM before the block', '\uFEFF---\nstatus: executing\nmilestone: v1.2\n---\n\n# State\n'],
+    ['a `--- x` line before the keys', '---\nnote: x\n--- x\nstatus: executing\nmilestone: v1.2\n---\n\n# State\n'],
+    ['a block closed by the lenient `----`', '---\nstatus: executing\nmilestone: v1.2\n----\n\n# State\n'],
+  ]) {
+    test(`${label}`, () => {
+      const state = parseStateMd(content);
+      assert.strictEqual(state.status, 'executing');
+      assert.strictEqual(state.milestone, 'v1.2');
+    });
+  }
+});
+
 /**
  * A single hooks/gsd-statusline.js spawn, no fan-out -- the "long-lived
  * status renderer" class (renders context-window percentage, git
@@ -3236,16 +3253,25 @@ describe('evaluateUpdateCache lineage guard', () => {
       test('derivationIsNotMemoizedAcrossRenders', (t) => {
         const dir = createTempGitProject('gsd-freshness-no-memo-');
         t.after(() => cleanup(dir));
+        // This row asserts non-memoization, not the timeout degrade: keep the
+        // real git spawn, lift only the hook's 1500 ms production bound so
+        // runner load cannot turn its designed `null` into a red (#4850).
+        const realExec = childProcess.execFileSync;
+        const unbounded = (file, args, opts) => realExec(file, args, { ...opts, timeout: GIT_FIXTURE_TIMEOUT_MS });
+        const read = () => {
+          let state;
+          withSpawnSpy(unbounded, () => { state = readGsdState(dir, { stateFreshness: true }); });
+          return state;
+        };
+
         const stampA = commitN(dir, 5);
         writeStateHead(dir, stampA);
-
-        const first = readGsdState(dir, { stateFreshness: true });
+        const first = read();
         assert.equal(first.freshness.commits_behind, 5);
 
         const stampB = commitN(dir, 10);
         writeStateHead(dir, stampB);
-
-        const second = readGsdState(dir, { stateFreshness: true });
+        const second = read();
         assert.equal(second.freshness.commits_behind, 10);
         assert.notEqual(first.freshness.commits_behind, second.freshness.commits_behind);
       });

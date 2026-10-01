@@ -160,6 +160,26 @@ describe('init manager', () => {
     assert.strictEqual(output.phases[0].disk_status, 'partial');
   });
 
+  // #5060 (ADR-3180 §7.5, row 25): a stray unpaired *-SUMMARY.md that does
+  // not match any plan must not inflate summary_count — the raw summary-list
+  // length previously read the count too high and reported an in-progress
+  // disk_status for a phase with zero matched summaries.
+  test('#5060: a stray unpaired *-GAPCLOSURE-SUMMARY.md does not inflate summary_count or flip disk_status', () => {
+    writeState(tmpDir);
+    writeRoadmap(tmpDir, [
+      { number: '1', name: 'Stray Summary Phase' },
+    ]);
+    const phaseDir = scaffoldPhase(tmpDir, 1, { slug: 'stray-summary-phase', plans: 1 });
+    fs.writeFileSync(path.join(phaseDir, '01-GAPCLOSURE-SUMMARY.md'), '# gap closure summary');
+
+    const result = runGsdTools('init manager', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.phases[0].summary_count, 0, 'the unpaired stray summary must not be matched to the plan');
+    assert.strictEqual(output.phases[0].disk_status, 'planned', 'zero matched summaries against one plan is planned, not executed/partial');
+  });
+
   test('dependency satisfaction: deps on complete phases = satisfied', () => {
     writeState(tmpDir);
     writeRoadmap(tmpDir, [
@@ -372,7 +392,7 @@ describe('init manager', () => {
     assert.strictEqual(output.phases[0].phase_complete, false);
     assert.strictEqual(output.recommended_actions[0].action, 'verify');
     assert.match(output.recommended_actions[0].reason, /verification stale/);
-    assert.match(output.recommended_actions[0].command, /verify-work 1/);
+    assert.match(output.recommended_actions[0].command, /execute-phase 1/);
   });
 
   test('checked unpadded roadmap token does not satisfy padded unverified dependency', () => {
@@ -1646,3 +1666,311 @@ describe('bug-3584: validate health uses formatter for codex runtime too', () =>
 });
   });
 }
+
+// ─── #4764: dep_phases extracts only in-context phase references ────────────
+
+describe('#4764 dep_phases extracts only Phase-prefixed references', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  // The issue's measured phase-663 prose: dates, a round name, ledger ids and
+  // the row's own number, plus one genuine "Phase 654" mention.
+  const ISSUE_663_PROSE =
+    'Nothing. Round 663-DISPOSITION Q7 (3/3, 2026-09-14, ' +
+    '`.planning/decisions/663-CROSSAI-stream-consumer-failure-disposition.md`) moved the ' +
+    '"for retry" javadoc correction into this phase and dropped the dependency on Phase 654; ' +
+    'the defect is already recorded (WINDOWS #1843, #1977-#1985, #1992).';
+
+  test("#4764: dep_phases extracts only Phase-prefixed references from the issue's measured prose", () => {
+    writeState(tmpDir);
+    writeRoadmap(tmpDir, [
+      { number: '663', name: 'Disposition phase', depends_on: ISSUE_663_PROSE },
+      { number: '654', name: 'Prior phase' },
+    ]);
+
+    const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+    const row = output.phases.find((p) => p.number === '663');
+
+    assert.deepEqual(row.dep_phases, ['654']);
+    for (const junk of ['663', '2026', '09', '14', '7', '3', '1843', '1977', '1985', '1992']) {
+      assert.ok(!row.dep_phases.includes(junk), `must not scrape ${junk} as a dependency`);
+    }
+    assert.strictEqual(row.deps_satisfied, false, '654 is incomplete — the only real reference');
+  });
+
+  test('#4764: a date-only depends_on prose yields no dependencies and a satisfied row', () => {
+    writeState(tmpDir);
+    writeRoadmap(tmpDir, [
+      { number: '674', name: 'Ops current', depends_on: 'Nothing. Opened by the owner on 2026-09-15 after asking whether the operations app was current with the backend.' },
+    ]);
+
+    const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+    const row = output.phases.find((p) => p.number === '674');
+
+    assert.deepEqual(row.dep_phases, []);
+    assert.strictEqual(row.deps_satisfied, true);
+    assert.strictEqual(row.deps_display, '—');
+  });
+
+  test('#4764: sha-bearing prose contributes no dependency tokens', () => {
+    writeState(tmpDir);
+    writeRoadmap(tmpDir, [
+      { number: '607', name: 'Sha phase', depends_on: 'Landed in 8bf403100d and 9445745c08; follow-up 76aea5c36f tracked separately.' },
+    ]);
+
+    const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+    const row = output.phases.find((p) => p.number === '607');
+
+    assert.deepEqual(row.dep_phases, []);
+    assert.strictEqual(row.deps_satisfied, true);
+  });
+
+  test('#4764: Phase lists stay fully extracted (and/comma separators)', () => {
+    writeState(tmpDir);
+    writeRoadmap(tmpDir, [
+      { number: '1', name: 'A', complete: true },
+      { number: '2', name: 'B', complete: true },
+      { number: '3', name: 'C', depends_on: 'Phases 1 and 2' },
+      { number: '4', name: 'D', depends_on: 'Phase 1, Phase 2' },
+      { number: '5', name: 'E', depends_on: 'Phase 1 & 2' },
+      { number: '6', name: 'F', depends_on: 'Phase 1 to 2' },
+    ]);
+    // Completion is DISK-strict (ADR-3180): a ticked checkbox does not feed
+    // completedNums — the dep targets need real dirs + passed verifications.
+    for (const n of [1, 2]) {
+      writePassedVerification(scaffoldPhase(tmpDir, n, { plans: 1, summaries: 1 }), `0${n}`);
+    }
+
+    const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+    assert.deepEqual(output.phases.find((p) => p.number === '3').dep_phases, ['1', '2']);
+    assert.deepEqual(output.phases.find((p) => p.number === '4').dep_phases, ['1', '2']);
+    assert.deepEqual(output.phases.find((p) => p.number === '5').dep_phases, ['1', '2'], '& separator');
+    assert.deepEqual(output.phases.find((p) => p.number === '6').dep_phases, ['1', '2'], 'to-range separator');
+    assert.strictEqual(output.phases.find((p) => p.number === '3').deps_satisfied, true);
+    assert.strictEqual(output.phases.find((p) => p.number === '5').deps_satisfied, true);
+    assert.strictEqual(output.phases.find((p) => p.number === '6').deps_satisfied, true);
+  });
+
+  test('#4764: Oxford-comma lists stay fully extracted, and a missing member blocks', () => {
+    // Adversarial-review fold-in: "Phases 1, 2, and 3" is the most common
+    // English enumeration; the first grammar cut dropped 603-style tail
+    // members, silently clearing a real blocker (the dangerous direction).
+    writeState(tmpDir);
+    writeRoadmap(tmpDir, [
+      { number: '1', name: 'A', complete: true },
+      { number: '2', name: 'B', complete: true },
+      { number: '3', name: 'C', depends_on: 'Phases 1, 2, and 3' },
+    ]);
+    for (const n of [1, 2]) {
+      writePassedVerification(scaffoldPhase(tmpDir, n, { plans: 1, summaries: 1 }), `0${n}`);
+    }
+
+    const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+    const row = output.phases.find((p) => p.number === '3');
+    assert.deepEqual(row.dep_phases, ['1', '2']);
+    assert.strictEqual(row.deps_satisfied, true);
+  });
+
+  test('#4764: hyphen ranges extract both endpoints and a missing tail blocks', () => {
+    // House style writes ranges ("Phases 1-9"); endpoints are the written
+    // references (the pre-#4764 scrape also kept only endpoints).
+    writeState(tmpDir);
+    writeRoadmap(tmpDir, [
+      { number: '1', name: 'A', complete: true },
+      { number: '3', name: 'C' },
+      { number: '4', name: 'D', depends_on: 'Phases 1-3' },
+    ]);
+    writePassedVerification(scaffoldPhase(tmpDir, 1, { plans: 1, summaries: 1 }), '01');
+
+    const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+    const row = output.phases.find((p) => p.number === '4');
+    assert.deepEqual(row.dep_phases, ['1', '3']);
+    assert.strictEqual(row.deps_satisfied, false, '3 is incomplete — a real blocker must not be dropped');
+  });
+
+  test('#4764 property: extraction pulls exactly the Phase-prefixed references out of arbitrary prose', () => {
+    // House fast-check config (seed 42); per-call numRuns caps the cost — each
+    // run spawns the real CLI (runGsdTools), unlike the pure-function properties.
+    const fc = require('./helpers/fast-check-setup.cjs');
+    // Junk fragments whose digit runs the old whole-field scrape pulled in as
+    // "dependencies": calendar dates, git shas, ledger ids, counts, round names.
+    // (fc v4 has no hexaString — stringMatching is the legal sha generator.)
+    const junkFragments = [
+      fc.nat({ max: 28 }).map((d) => `2026-09-${String(d).padStart(2, '0')}`),
+      fc.stringMatching(/[0-9a-f]{8,10}/),
+      fc.nat({ max: 99999 }).map((n) => `WINDOWS #${n}`),
+      fc.nat({ max: 999 }).map((n) => `#${n}-#${n + 1}`),
+      fc.nat({ max: 9 }).map((n) => `round ${n}-DISPOSITION (${n}/3`),
+    ];
+    const refFragment = fc.nat({ max: 8 }).map((n) => `Phase ${n + 1}`);
+    const listFragment = fc.nat({ max: 7 }).map((n) => `Phases ${n + 1}, ${n + 2}, and ${n + 3}`);
+    const selfFragment = fc.constant('Phase 9');
+
+    // The phase under test is 9: any "Phase 9" mention in its own prose must be
+    // dropped as a self-reference.
+    fc.assert(
+      fc.property(
+        fc.array(fc.oneof(...junkFragments, refFragment, listFragment, selfFragment), { maxLength: 12 }),
+        (fragments) => {
+          writeState(tmpDir);
+          writeRoadmap(tmpDir, [
+            { number: '9', name: 'Property phase', depends_on: fragments.join('; ') + '.' },
+            { number: '1', name: 'Ref target', complete: true },
+          ]);
+          const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+          const row = output.phases.find((p) => p.number === '9');
+          const extracted = row.dep_phases.map((d) => String(d));
+
+          // Independent spec mirror: the expected set is every phase token a
+          // fragment references ("Phase N" or inside a "Phases …" list),
+          // minus the row's own number — junk never contributes.
+          const expected = new Set();
+          for (const f of fragments) {
+            const refMatch = /^phases?\s+(.*)$/i.exec(f);
+            if (!refMatch) continue;
+            for (const tok of refMatch[1].match(/\d+(?:\.\d+)*/g) || []) {
+              if (tok !== '9') expected.add(tok);
+            }
+          }
+          assert.deepEqual(
+            [...extracted].sort(),
+            [...expected].sort(),
+            `extraction must pull exactly the Phase-prefixed references from: ${fragments.join('; ')}`,
+          );
+        },
+      ),
+      { numRuns: 20 },
+    );
+  });
+
+  // #5060 review finding: buildPhaseCompletionProjection's own isPhaseComplete
+  // call used to omit `convention`, while `disk_status`/`status` already came
+  // from `phaseStatus(..., { convention })` — under the bracket convention the
+  // two owners could disagree (the completion read cannot resolve the phase's
+  // own bracket-qualified `-VERIFICATION.md`, so `phase_complete`/
+  // `completion_status` stay stuck below `disk_status`). Threading the same
+  // resolved convention into both calls makes them agree.
+  test('#5060: bracket convention — disk_status, phase_complete and completion_status agree on a passed report', () => {
+    const planning = path.join(tmpDir, '.planning');
+    fs.writeFileSync(
+      path.join(planning, 'config.json'),
+      JSON.stringify({ phase_id_convention: 'bracket', project_code: 'GSD' }),
+    );
+    fs.writeFileSync(
+      path.join(planning, 'ROADMAP.md'),
+      [
+        '# Roadmap',
+        '',
+        '## [GSD.02] v2.0: Verify',
+        '',
+        '- [ ] **[GSD.02] 01: Verify Fix**',
+        '',
+        '### [GSD.02] 01: Verify Fix',
+        '',
+        '**Goal:** Confirm the convention thread',
+        '',
+      ].join('\n'),
+    );
+    writeState(tmpDir);
+    const phaseDir = path.join(planning, 'phases', 'GSD.02-01-verify-fix');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(path.join(phaseDir, '01-01-PLAN.md'), '# Plan\n');
+    fs.writeFileSync(path.join(phaseDir, '01-01-SUMMARY.md'), '# Summary\n');
+    writePassedVerification(phaseDir, '01');
+
+    const result = runGsdTools('init manager', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    const row = output.phases.find((p) => p.number === '01');
+    assert.ok(row, 'the bracket phase must be reported');
+    assert.deepEqual(
+      {
+        disk_status: row.disk_status,
+        phase_complete: row.phase_complete,
+        completion_status: row.completion_status,
+      },
+      { disk_status: 'complete', phase_complete: true, completion_status: 'complete' },
+    );
+  });
+});
+
+// ─── #4982: cmdInitManager's `_cbPattern` checkbox->phase scan (feeds the
+// metadata-only `roadmap_complete` field, ADR-3180 §7.4) must be line-anchored
+// and resolve each phase from its own first anchored line, not the last one a
+// global scan happens to see (last-match-wins). Same defect class as the
+// `cbPattern` site in cmdInitProgress (tests/init.test.cjs), different
+// consumer/blast-radius (metadata only here, vs. status-gating there).
+describe('#4982: init manager ROADMAP checkbox projection anchoring (_cbPattern)', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  test('#4982: greedy binding — a checklist line does not inherit the phase mentioned last in its own prose', () => {
+    writeState(tmpDir);
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), [
+      '# Roadmap',
+      '',
+      '- [x] **Phase 1: Foundation** — extends the Phase 2 store',
+      '- [ ] **Phase 2: Hardening**',
+      '  - [x] 1-03-PLAN — scaffolding for Phase 2 hardening',
+      '',
+      '### Phase 1: Foundation',
+      '**Goal:** foundation',
+      '',
+      '### Phase 2: Hardening',
+      '**Goal:** hardening',
+      '',
+    ].join('\n'));
+    scaffoldPhase(tmpDir, 1, { plans: 1 });
+    scaffoldPhase(tmpDir, 2, { plans: 1 });
+
+    const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+    const one = output.phases.find((p) => p.number === '1');
+    const two = output.phases.find((p) => p.number === '2');
+    assert.ok(one, 'Phase 1 present');
+    assert.ok(two, 'Phase 2 present');
+    assert.strictEqual(one.roadmap_complete, true,
+      "Phase 1's own [x] must be attributed to Phase 1, not the 'Phase 2' mentioned in its prose");
+    assert.strictEqual(two.roadmap_complete, false,
+      "Phase 2's own [ ] must not be overwritten by a later line's incidental 'Phase 2' mention");
+  });
+
+  test('#4982: last-match-wins — a self-titled nested sub-entry must not overwrite its parent phase\'s own (first) checkbox', () => {
+    writeState(tmpDir);
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), [
+      '# Roadmap',
+      '',
+      '- [x] **Phase 3: Foo**',
+      '- [ ] **Phase 4: Bar**',
+      '  - [ ] Phase 3 regression sweep (extra verification pass)',
+      '',
+      '### Phase 3: Foo',
+      '**Goal:** foo',
+      '',
+      '### Phase 4: Bar',
+      '**Goal:** bar',
+      '',
+    ].join('\n'));
+    scaffoldPhase(tmpDir, 3, { plans: 1 });
+    scaffoldPhase(tmpDir, 4, { plans: 1 });
+
+    const output = JSON.parse(runGsdTools('init manager', tmpDir).output);
+    const three = output.phases.find((p) => p.number === '3');
+    assert.ok(three, 'Phase 3 present');
+    assert.strictEqual(three.roadmap_complete, true,
+      "Phase 3's own anchored [x] line must win even though a later anchored line ('Phase 3 regression sweep') also mentions Phase 3 — first anchored match wins, not last");
+  });
+});

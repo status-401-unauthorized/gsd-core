@@ -1949,7 +1949,6 @@ const KNOWN_HOST_BEHAVIORS = new Set([
   'skillPriorityFrontmatter',
   'skillsGlobalOnboarding',
   'skillsManifestPrefix',
-  'skipCodexSkillsManifest',
   'skipHomePrefixSubstitution',
   'skipSettingsUi',
   'skipSharedHooksInstall',
