@@ -99,10 +99,10 @@ this list when analysis shows upstream absorbed them or when new fork commits la
 | Theme | Primary paths | Intent |
 |-------|---------------|--------|
 | Grok as installable runtime | `capabilities/grok/capability.json`, `bin/install.js` (`--grok` / `--grok-build`), runtime lists | First-class Grok Build install target → `~/.grok` |
-| Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME`. Grok **is** a registry runtime — do **not** re-list it in `LEGACY_NON_REGISTRY_RUNTIME_IDS`. Adapt origin/next tests that still treat grok as a `#3024` `~/.agents` legacy id. |
+| Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME`. Grok is a registry runtime. Legacy home table and the ESLint legacy-id list stay empty. Procedure: **#5169** below. |
 | Host-integration parity | `capabilities/grok/capability.json` → `runtime.hostIntegration` | Track upstream descriptor schema (`dispatch.isolation`, `dispatch.maxConcurrency`, `effortSurface`, …) so negotiation does not fail closed; see Step 4 |
 | Claude → Grok converters | `src/runtime-artifact-conversion.cts` → `gsd-core/bin/lib/runtime-artifact-conversion.cjs` | `convertClaudeCommandToGrokSkill`, `convertClaudeAgentToGrokAgent`, tool-name rewrites (`Task`→`spawn_subagent`, etc.) |
-| Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts. JS hook commands go through `gsd-node-runner.sh` (not a raw `node` shebang) so Grok can execute them. |
+| Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts. `hostBehaviors.jsHookCommandsViaNodeRunner` routes JS hook commands through `gsd-node-runner.sh` so Grok can execute them. |
 | Model tiers | `gsd-core/bin/shared/model-catalog.json` | Grok Build / Composer model ids for GSD model profiles |
 | Docs + tests | `docs/how-to/install-on-your-runtime.md`, `tests/grok-upgrades.test.cjs`, multi-runtime select tests | Document install path; regression cover for Grok surfaces |
 
@@ -114,11 +114,12 @@ leave Grok omitted while peers declare the axis.
 
 **#3024 / #3547 adapt triggers (homes + install harness):**
 
-- Upstream still documents grok as a non-registry `~/.agents` id
-  (`LEGACY_NON_REGISTRY_RUNTIME_IDS`, skills-root tests,
-  `scripts/live-config-guard.cjs`). This fork’s grok is first-class
-  `~/.grok` / `GROK_HOME`. After merge, re-point those tests/docs; keep the
-  hardcoded `getGlobalConfigDir('grok')` fallback only for a missing registry.
+- Upstream still documents grok as a non-registry `~/.agents` id.
+  This fork’s grok is first-class `~/.grok` / `GROK_HOME`. After merge,
+  re-point tests and docs that still say so. The legacy-table, ESLint
+  list, config-home fragment, and `getGlobalConfigDir('grok')` fallback
+  (only when the registry entry has no `configHome`) are specified under
+  **#5169**.
 - `gsd-core/workflows/sync-skills.md` refusal parenthetical must stay
   `grok installs with --grok into ~/.grok`, locked by
   `tests/sync-skills-cross-runtime-refuse.test.cjs`
@@ -166,27 +167,64 @@ leave Grok omitted while peers declare the axis.
   the literal when origin/next restores “exactly 19”; do not drop grok from the
   registry to satisfy the upstream count.
 
-**#4834 launcher homes (`_gsd_homes`) adapt trigger:**
+**#5169 descriptor ownership (homes, rewrites, hook commands):**
 
-`gsd-core/workflows/_runtime-launcher.snippet.sh` probes config homes inside
-`_gsd_homes()`. Upstream lists `${GROK_AGENTS_HOME:-$HOME/.agents}` and omits
-`${GROK_HOME:-$HOME/.grok}`, so a workflow run outside a checkout that already
-contains `gsd-core` does not find `~/.grok/gsd-core`. After merge, if the
-`GROK_HOME` probe is missing, insert
+`#5169` makes `capabilities/<runtime>/capability.json` the owner of
+runtime-specific facts. `hostBehaviorsFor` is the accessor. An unknown id
+throws `UnknownRuntimeError` (`assertKnownRuntime`) instead of falling
+through to Claude. On this fork the legacy table stays empty. The old
+`#4834` hand-insert of `${GROK_HOME:-$HOME/.grok}` ahead of a
+`${GROK_AGENTS_HOME:-$HOME/.agents}` probe is retired: `npm run
+sync:launcher` renders `_gsd_homes()` from the registry plus that table,
+and a hand-edited snippet fails
+`tests/launcher-homes-derivation.test.cjs`.
 
-```text
-"${GROK_HOME:-$HOME/.grok}/gsd-core/bin/${_GSD_SHIM_NAME}"
-```
-
-immediately **before** the `GROK_AGENTS_HOME` probe (first-class home first;
-keep the legacy probe) and run `npm run sync:launcher` so workflows and agents
-pick up the snippet. `EXPECTED_RUNTIME_PROBES.grok` in
-`tests/runtime-launcher-parity.test.cjs` still requires the substring
-`.agents}/gsd-core/bin/`, so leave that arm in place. `GROK_HOME` is already
-in the registry-derived `TEST_ENV_BASE`, so the same test’s A2 covers the new
-`${VAR:-default}` arm. `commands/gsd/*.md` still use an older resolver and
-are outside `sync:launcher` — leave them unless a parity test starts requiring
-the snippet there.
+- `LEGACY_NON_REGISTRY_RUNTIME_HOMES` in `src/runtime-name-policy.cts` is
+  `Object.freeze({})`. `LEGACY_NON_REGISTRY_RUNTIME_IDS` is that table's
+  keys. `getGlobalConfigDir` reads the table before the registry, so
+  restoring upstream's `grok` row (`GROK_AGENTS_HOME`, `~/.agents`) resolves
+  Grok to `~/.agents`. `eslint-rules/no-runtime-name-literal.cjs` hardcodes
+  the same list — keep it `Object.freeze([])` so it matches the policy set
+  (`tests/eslint-no-runtime-name-literal.test.cjs`).
+- `GLOBAL_CONFIG_HOME_FRAGMENTS` in `src/runtime-name-policy.cts` and
+  `GOLDEN_FRAGMENT_MAP` in `tests/global-config-home-fragment.test.cjs`
+  include `grok: "'.grok'"`. A missing entry fails the drift guard, and
+  hook codegen falls through to `.claude`.
+- Content rewrites switch on `hostBehaviors.contentRewriteProfile`. Grok
+  declares `contentRewriteProfile: "branded-lookahead-own-derived"` and
+  `brandingRewrites` `{ "CLAUDE.md": "AGENTS.md", "Claude Code": "Grok Build", ".claude/": ".grok/" }`.
+  On a `rewriteStagedSkillBodies` conflict, drop `case 'grok'` and
+  `case 'zcode'` (`zcode` shares `slash-tilde-restore` with claude).
+  `local/no-runtime-name-literal` flags `runtime === '<id>'` and
+  `switch (runtime) case '<id>'` in install and hook surfaces.
+  Tool-name rewrites stay in `convertClaudeToGrokMarkdown`.
+- JS hooks: `buildHookCommand` in `src/runtime-hooks-surface.cts` routes
+  through `hooks/gsd-node-runner.sh` when
+  `hostBehaviorsFor(runtime).jsHookCommandsViaNodeRunner === true`. Add
+  `'jsHookCommandsViaNodeRunner'` to `KNOWN_HOST_BEHAVIORS` in
+  `gsd-core/bin/lib/capability-validator.cjs` (sorted).
+  `tests/reviewer-manifest-body.test.cjs` requires that set to equal the
+  keys shipped `capabilities/*/capability.json` files declare.
+- Launcher homes: run `npm run sync:launcher` after `build:lib` and
+  `gen:capability-registry` (it loads the compiled registry and policy).
+  Grok's probe is `"${GROK_HOME:-$HOME/.grok}"`.
+  `EXPECTED_RUNTIME_PROBES.grok` in `tests/runtime-launcher-parity.test.cjs`
+  is the substring `GROK_HOME:-$HOME/.grok}"`. The sync also rewrites
+  `commands/**/*.md`, `agents/*.md`, workflows, and
+  `gsd-core/references/gsd-run-resolver.md`. Then run
+  `npm run gen:plugin-skills`. `npm run build` generates `skills/` from the
+  snippet it sees at that moment, so a later `sync:launcher` leaves
+  `skills/gsd-*/SKILL.md` on the previous preamble until plugin skills are
+  regenerated.
+- When a merge restores the `CONTEXT.md` sentence that the legacy set is
+  "currently `grok`", rewrite it: the set is empty and grok's home is
+  `~/.grok` / `GROK_HOME`. `docs/reference/capability-manifest.md` prose
+  counts (vocabulary size, single-capability keys, `contentRewriteProfile`
+  declarers, role counts, reviewer lanes) are not test-locked. Re-count
+  from `KNOWN_HOST_BEHAVIORS` and `capabilities/*/capability.json` when a
+  merge resets them. As of the `943dc11ac` merge: 76 keys, 53 set by one
+  capability, `contentRewriteProfile` on 15 runtimes, roles feature 22 /
+  runtime 20 / reviewer 4, 11 reviewer lanes.
 
 Non-merge feature commits on the fork (historically):
 
@@ -210,13 +248,14 @@ chore(grok): document --relative-includes in update-gsd-local
 chore(grok): do not rewrite locked launcher probe or sync-skills refuse line
 fix(grok): correct sync-skills prose after open-gsd/next
 chore(grok): record upstream remote and launcher-home trigger in update-gsd-local
+chore(grok): record #5169 descriptor-owned homes in update-gsd-local
 ```
 
 Plus periodic `Merge open-gsd/next into grok-build` commits (older messages say
 `Merge origin/next` from when that label pointed at open-gsd).
 `chore(grok): do not rewrite locked launcher probe or sync-skills refuse line`
-predates the sync-skills test update. The #3024 refuse sentence and the #4834
-launcher trigger above are the current locks.
+predates the sync-skills test update and the #5169 launcher generator.
+The #3024 refuse sentence and the **#5169** section above are the current locks.
 
 ## Generated artifacts (do not confuse these)
 
@@ -227,7 +266,9 @@ launcher trigger above are the current locks.
 | Loop host contract, plugin skills, package identity | `gen:loop-host-contract`, `gen:plugin-skills`, `generate:identity` | `build:lib` alone |
 | Section manifest, CONTEXT-INDEX | `gen:section-manifest`, `gen:context-index` | `build:lib` alone |
 | Hook scripts under pack | `npm run build:hooks` | `build:lib` alone |
-| Full release-shaped pipeline | `npm run build` (= identity + lib + **section-manifest** + **context-index** + plugin-skills + loop-host-contract + **capability-registry** + hooks) | partial steps only |
+| Launcher `_gsd_homes` (snippet, workflows, agents, `commands/`, resolver reference) | `npm run sync:launcher` after `build:lib` + `gen:capability-registry` | hand-edit; `build:lib` alone |
+| Plugin `skills/gsd-*/SKILL.md` preambles | `npm run gen:plugin-skills` **after** `sync:launcher` | the `gen:plugin-skills` step inside `npm run build` when sync runs later |
+| Full release-shaped pipeline | `npm run build` (= identity + lib + **section-manifest** + **context-index** + plugin-skills + loop-host-contract + **capability-registry** + hooks), then `sync:launcher` and `gen:plugin-skills` again | partial steps only |
 
 Editing `capabilities/grok/**` **without** `gen:capability-registry` leaves a
 stale registry (install and negotiation read the generated file). Prefer
@@ -311,10 +352,13 @@ For each conflicted file:
      re-add `_DESCRIPTOR_AGENTS_RUNTIMES`). Recurring help hunk: take
      origin/next’s new flags (e.g. `--kimi-code`, `--no-legacy-cleanup`,
      `--reclaim-kimi-legacy`, `--relative-includes`) then re-insert `--grok`.
-   - `src/runtime-*.cts` and generated `gsd-core/bin/lib/*.cjs`. Recurring
-     `rewriteStagedSkillBodies` hunk: keep **both** `case 'grok'` (ours) and
-     any new peer case (e.g. `case 'zcode'` from #4002) — do not drop one
-     to resolve the other.
+   - `src/runtime-*.cts` and generated `gsd-core/bin/lib/*.cjs`. `#5169`
+     keys content rewrites by `hostBehaviors.contentRewriteProfile`. On a
+     `rewriteStagedSkillBodies` conflict, drop `case 'grok'` and
+     `case 'zcode'` and declare Grok's
+     `branded-lookahead-own-derived` profile plus `brandingRewrites`
+     (see **#5169**). `local/no-runtime-name-literal` flags a runtime-id
+     comparison in install and hook code.
    - `capabilities/grok/**` (ours; may be untracked on upstream)
    - capability registry generators / `capability-registry.cjs`
    - tests that list runtimes or assume grok is a `~/.agents` legacy id
@@ -468,15 +512,22 @@ npm install
 
 npm run build:lib
 npm run gen:capability-registry
+npm run sync:launcher          # after the two above; see #5169
+npm run gen:plugin-skills      # skills/ preambles follow the refreshed snippet
 npm run build:hooks
 ```
 
 When unsure what drifted (capability registry, loop-host contract, plugin skills,
-section-manifest, CONTEXT-INDEX, hooks), prefer the full pipeline:
+section-manifest, CONTEXT-INDEX, hooks, launcher homes), prefer the full
+pipeline, then refresh homes and plugin-skill preambles. `npm run build`
+runs `gen:plugin-skills` before `sync:launcher` exists in that script, so
+the follow-up pair is required either way:
 
 ```bash
 # After nvm use (required):
 npm run build
+npm run sync:launcher
+npm run gen:plugin-skills
 ```
 
 Use a generous timeout on cold `npm install` / full `build` (several minutes is
@@ -724,7 +775,8 @@ Summarize for the user:
    call out hostIntegration / isolation decision explicitly.
 4. **Code adjustments:** what was implemented after analysis (or “none”).
 5. **Build:** success/fail, note `nvm use` / Node+npm versions, then commands
-   (`build:lib` / `gen:capability-registry` / `build:hooks` / full `build`).
+   (`build:lib` / `gen:capability-registry` / `sync:launcher` /
+   `gen:plugin-skills` / `build:hooks` / full `build`).
 6. **Install:** success/fail, command `node bin/install.js --grok --global`, target
    home, VERSION match.
 7. **Verify:** VERSION, runtime marker, skill/agent counts, hooks presence,
@@ -754,6 +806,8 @@ Summarize for the user:
 - Prefer regenerating artifacts correctly:
   - `src/*.cts` → `npm run build:lib`
   - `capabilities/**` → `npm run gen:capability-registry`
+  - launcher homes → `npm run sync:launcher` after those two, then
+    `npm run gen:plugin-skills` (see **#5169**)
   - never long-lived hand merges of generated files
 - Do not treat `build:lib` as sufficient for descriptor/registry changes.
 - Do not run `npm install` / `build:lib` / `gen:capability-registry` / tests /
@@ -775,8 +829,10 @@ npm install             # if lockfile / deps changed
 #   rm -f tsconfig.build.tsbuildinfo && npm run build:lib
 npm run build:lib
 npm run gen:capability-registry   # required; not covered by build:lib
+npm run sync:launcher             # #5169: after lib + registry
+npm run gen:plugin-skills         # skills/ preambles follow the snippet
 npm run build:hooks
-# or: npm run build
+# or: npm run build && npm run sync:launcher && npm run gen:plugin-skills
 node --test tests/grok-upgrades.test.cjs   # focused regression
 node bin/install.js --grok --global
 cat ~/.grok/gsd-core/VERSION
