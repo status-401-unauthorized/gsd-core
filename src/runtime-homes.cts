@@ -34,7 +34,12 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 
-import { assertNotRetiredRuntime } from './runtime-name-policy.cjs';
+import {
+  assertKnownRuntime,
+  isKnownRuntimeId,
+  LEGACY_NON_REGISTRY_RUNTIME_HOMES,
+  LEGACY_NON_REGISTRY_RUNTIME_IDS as POLICY_LEGACY_NON_REGISTRY_RUNTIME_IDS,
+} from './runtime-name-policy.cjs';
 
 /**
  * Expand a leading ~ to the given home directory (defaults to os.homedir()).
@@ -204,27 +209,27 @@ function getRegistry(): { runtimes: Record<string, { runtime?: RuntimeDescriptor
  * `isRegisteredRuntimeId`'s real contract is "does this id resolve to a
  * real, runtime-specific path?", not "is it a key in the registry map".
  *
- * On this fork, `grok` is a first-class registry runtime
- * (`capabilities/grok/capability.json` → `~/.grok` / `GROK_HOME`). It must
- * not appear here: install/sync-skills parity tests fail if a registry id
- * is re-listed. A hardcoded `getGlobalConfigDir('grok')` fallback remains
- * below only for the case where the generated registry is missing (early
- * local Grok experiments also honored `GROK_AGENTS_HOME` → `~/.agents`).
+ * On this fork the set is empty: `grok` is a first-class registry runtime
+ * (`capabilities/grok/capability.json` → `~/.grok` / `GROK_HOME`) and must
+ * not be re-listed. Upstream's #5169 table row (`GROK_AGENTS_HOME` /
+ * `~/.agents`) is the open-gsd shape for a runtime with no descriptor.
+ * Re-listing grok resolves `getGlobalConfigDir` to `~/.agents` before the
+ * descriptor. The id set is the key set of `LEGACY_NON_REGISTRY_RUNTIME_HOMES`
+ * (`POLICY_LEGACY_NON_REGISTRY_RUNTIME_IDS`), not a second hand-kept Set.
  *
- * This set is enumerated by hand. Add an id only after confirming
- * `getGlobalConfigDir` has a real dedicated branch for it AND it is not
- * already a registry key. Empty is valid when every dedicated branch is
- * also a registry runtime.
+ * A `runtime === 'grok'` fallback remains below only when the registry
+ * entry has no `configHome`. `assertKnownRuntime` already refuses an id
+ * the registry does not know, so a missing registry entry does not reach it.
  */
-export const LEGACY_NON_REGISTRY_RUNTIME_IDS: ReadonlySet<string> = new Set();
+export const LEGACY_NON_REGISTRY_RUNTIME_IDS: ReadonlySet<string> = POLICY_LEGACY_NON_REGISTRY_RUNTIME_IDS;
 
 /**
  * True when `runtime` is a real runtime id with a genuine, runtime-specific
  * resolution path — either a registered id in the capability registry
  * (`capability-registry.cjs`'s `runtimes` object) or one of the small,
- * explicitly named `LEGACY_NON_REGISTRY_RUNTIME_IDS` set (currently empty
- * on this fork; `grok` is a registry runtime) that resolves via a dedicated
- * hardcoded branch instead of a registry descriptor.
+ * explicitly named `LEGACY_NON_REGISTRY_RUNTIME_IDS` set (empty on this
+ * fork; `grok` is a registry runtime) that resolves via the legacy home
+ * table instead of a registry descriptor.
  *
  * Guarded with an own-property lookup — never a bare index — so a
  * prototype-chain id (`__proto__`, `constructor`, `prototype`, `toString`,
@@ -243,8 +248,7 @@ export function isRegisteredRuntimeId(runtime: unknown): boolean {
   if (typeof runtime !== 'string') return false;
   const trimmed = runtime.trim();
   if (!trimmed) return false;
-  if (Object.prototype.hasOwnProperty.call(getRegistry().runtimes, trimmed)) return true;
-  return LEGACY_NON_REGISTRY_RUNTIME_IDS.has(trimmed);
+  return isKnownRuntimeId(trimmed);
 }
 
 /**
@@ -598,10 +602,22 @@ export function resolveKimiHooksTomlDir(opts: ResolveKimiHooksTomlOpts = {}): st
  *   the behaviour of bin/install.js getGlobalDir(runtime, explicitDir).
  */
 export function getGlobalConfigDir(runtime: string, explicitDir?: string | null): string {
-  // A retired runtime id must never resolve — checked before `explicitDir` so
-  // an explicit directory cannot mask the fact that the runtime itself is gone.
-  assertNotRetiredRuntime(runtime);
+  // A retired or unknown runtime id must never resolve — checked before
+  // `explicitDir` so an explicit directory cannot mask the fact that the runtime
+  // itself is gone (retired) or was never registered (#5169). An absent id
+  // (`''`) is the generic "no runtime" path and still reaches the default.
+  assertKnownRuntime(runtime);
   if (explicitDir) return expandTilde(explicitDir);
+
+  // ── Legacy non-registry runtimes: table-driven, not registry-backed ─────
+  // Empty on this fork (grok is a registry runtime). Consulted before the
+  // descriptor, so a registry id must never be a key.
+  if (Object.prototype.hasOwnProperty.call(LEGACY_NON_REGISTRY_RUNTIME_HOMES, runtime)) {
+    const legacy = LEGACY_NON_REGISTRY_RUNTIME_HOMES[runtime];
+    const env = process.env as Record<string, string | undefined>;
+    const override = env[legacy.env];
+    return override ? expandTilde(override) : path.join(os.homedir(), ...legacy.dir);
+  }
 
   // ── Descriptor-driven: look up in capability-registry ────────────────────
   const { runtimes } = getRegistry();
@@ -611,9 +627,9 @@ export function getGlobalConfigDir(runtime: string, explicitDir?: string | null)
     return resolveDescriptorWithOptions(runtimeEntry.runtime.configHome);
   }
 
-  // Legacy alias: GROK_AGENTS_HOME was used by early local Grok experiments that
-  // mapped GSD into ~/.agents. Prefer GROK_HOME / ~/.grok via the descriptor when
-  // present; fall back here only when the registry entry is missing.
+  // Registry entry present but without configHome. The live grok descriptor
+  // declares configHome, so this does not run for a current install.
+  // GROK_AGENTS_HOME remains the pre-descriptor alias from early experiments.
   if (runtime === 'grok') {
     const env = process.env as Record<string, string | undefined>;
     if (env['GROK_HOME']) return expandTilde(env['GROK_HOME']);
@@ -642,6 +658,7 @@ export function resolveSkillsBaseFromDescriptor(
 }
 
 export function getGlobalSkillsBase(runtime: string): string | null {
+  assertKnownRuntime(runtime);
   const runtimeEntry = getRegistry().runtimes[runtime];
   const descriptor = runtimeEntry?.runtime;
   // #2103: a runtime with `configHome.kind === 'none'` (e.g. vscode —

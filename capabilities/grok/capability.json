@@ -89,6 +89,15 @@
       "transport": "mcp",
       "runtime": "node",
       "effortSurface": "undocumented"
+    },
+    "hostBehaviors": {
+      "brandingRewrites": {
+        "CLAUDE.md": "AGENTS.md",
+        "Claude Code": "Grok Build",
+        ".claude/": ".grok/"
+      },
+      "contentRewriteProfile": "branded-lookahead-own-derived",
+      "jsHookCommandsViaNodeRunner": true
     }
   }
 }
