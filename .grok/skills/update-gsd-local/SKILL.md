@@ -2,7 +2,8 @@
 name: update-gsd-local
 description: >
   Sync this fork’s grok-build branch from upstream open-gsd next (resolve the
-  remote by URL — in this checkout `upstream/next`), resolve and analyze merge
+  remote by URL — in this checkout `origin` is open-gsd and `fork` is the
+  publish remote), resolve and analyze merge
   conflicts for Grok-first-class runtime deltas, rebuild the TypeScript lib +
   capability registry, reinstall GSD into ~/.grok, verify the install, then
   self-review this skill and surface any vital updates to the user.
@@ -34,7 +35,7 @@ Run from the **gsd-core** repo root (the tree that contains `bin/install.js`,
    - Prefer stashing only if the user did not intentionally leave WIP.
    - If WIP looks intentional, **stop and ask** before discarding or stashing.
 3. Preferred branch: local `grok-build` tracking `$FORK_REMOTE/grok-build`
-   (this checkout: `origin/grok-build`). If on another branch, tell the user
+   (this checkout: `fork/grok-build`). If on another branch, tell the user
    and ask whether to switch to `grok-build` or update the current branch instead.
 4. Node/npm must satisfy `package.json` engines. Prefer **nvm** + repo-root
    **`.nvmrc`** (read the file — currently major **24**; do not assume 22).
@@ -71,14 +72,16 @@ block above matches fetch URLs. Run it before Step 1.
 
 | Role | URL contains | This checkout | Branch |
 |------|----------------|---------------|--------|
-| Upstream source of truth (dev line) | `open-gsd/gsd-core` | `upstream` | `next` |
+| Upstream source of truth (dev line) | `open-gsd/gsd-core` | `origin` | `next` |
 | Local integration branch | (local) | `grok-build` | `grok-build` |
-| Publish target for this fork | `status-401-unauthorized/gsd-core` | `origin` | `grok-build` |
+| Publish target for this fork | `status-401-unauthorized/gsd-core` | `fork` | `grok-build` |
 
-There is no remote named `fork` here. `origin` is the fork. Its `next`
-(`origin/next`, last moved 2026-07-18 at `b2f4aa943`) is already contained in
-`grok-build`. A behind-count against `origin/next` is 0 and would skip the
-real upstream. Merge **`$UPSTREAM_REMOTE/next`** only.
+This checkout's labels are `origin` (open-gsd) and `fork`
+(status-401-unauthorized). There is no remote named `upstream`. Do not merge
+or push using a name from an older note that swapped those labels. Here
+`origin/next` is open-gsd `next`. Merge **`$UPSTREAM_REMOTE/next`** only
+(this checkout: `origin/next`). The fork's own `next`, if it exists, is not
+the upstream line.
 
 Notes:
 
@@ -89,7 +92,8 @@ Notes:
 - Merge **upstream into local `grok-build`**, then (only if the user asks) update
   `$FORK_REMOTE/grok-build`. Default of this skill: **local merge + build +
   reinstall**; do **not** `git push` without explicit approval. The push command
-  in this checkout is `git push origin grok-build`.
+  in this checkout is `git push fork grok-build`. `origin` is open-gsd — do
+  not `git push origin grok-build`.
 
 ## Known fork themes (Grok-first-class runtime)
 
@@ -102,7 +106,7 @@ this list when analysis shows upstream absorbed them or when new fork commits la
 | Capability registry + homes | `gsd-core/bin/lib/capability-registry.cjs` (**generated**), `src/runtime-homes.cts`, `src/runtime-name-policy.cts`, aliases/catalog JSON | Descriptor-driven config home `.grok` / `GROK_HOME`. Grok is a registry runtime. Legacy home table and the ESLint legacy-id list stay empty. Procedure: **#5169** below. |
 | Host-integration parity | `capabilities/grok/capability.json` → `runtime.hostIntegration` | Track upstream descriptor schema (`dispatch.isolation`, `dispatch.maxConcurrency`, `effortSurface`, …) so negotiation does not fail closed; see Step 4 |
 | Claude → Grok converters | `src/runtime-artifact-conversion.cts` → `gsd-core/bin/lib/runtime-artifact-conversion.cjs` | `convertClaudeCommandToGrokSkill`, `convertClaudeAgentToGrokAgent`, tool-name rewrites (`Task`→`spawn_subagent`, etc.) |
-| Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts. `hostBehaviors.jsHookCommandsViaNodeRunner` routes JS hook commands through `gsd-node-runner.sh` so Grok can execute them. |
+| Native Grok hooks | `src/runtime-hooks-surface.cts`, install plan `hooksSurface: grok-hooks-json` | Managed `~/.grok/hooks/gsd-lifecycle.json` + shared hook scripts. `hostBehaviors.jsHookCommandsViaNodeRunner` routes JS hook commands through `gsd-node-runner.sh` so Grok can execute them. `#5207` settings.json registration returns early for `grok-hooks-json` (below). |
 | Model tiers | `gsd-core/bin/shared/model-catalog.json` | Grok Build / Composer model ids for GSD model profiles |
 | Docs + tests | `docs/how-to/install-on-your-runtime.md`, `tests/grok-upgrades.test.cjs`, multi-runtime select tests | Document install path; regression cover for Grok surfaces |
 
@@ -224,7 +228,27 @@ and a hand-edited snippet fails
   from `KNOWN_HOST_BEHAVIORS` and `capabilities/*/capability.json` when a
   merge resets them. As of the `943dc11ac` merge: 76 keys, 53 set by one
   capability, `contentRewriteProfile` on 15 runtimes, roles feature 22 /
-  runtime 20 / reviewer 4, 11 reviewer lanes.
+  runtime 20 / reviewer 4, 11 reviewer lanes. Re-count at `ed0f3fd55` still
+  matched the behavior-key figures (76 / 53 / 15) and 20 registry runtimes.
+
+**#5207 settings-json early return (native hook surfaces):**
+
+`#5207` drives settings.json hook registration from a table
+(`applySettingsJsonHookTables` in `src/runtime-hooks-surface.cts`). The
+function returns immediately for surfaces that must not touch `settings.hooks`:
+
+```text
+if (hooksSurface === 'none' || hooksSurface === 'kimi-hooks-toml' || hooksSurface === 'grok-hooks-json') return;
+```
+
+Upstream's return names only `none` and `kimi-hooks-toml`. Grok's
+`writesSharedSettings` is false and its hooks go to `~/.grok/hooks/gsd-lifecycle.json`
+via `writeGrokHooksJson`. Leaving `grok-hooks-json` off the return logs
+"Configured …" for a settings object `finishInstall()` never persists.
+`tests/hook-registration-table.test.cjs` lists `'grok-hooks-json'` beside
+`'none'` and `'kimi-hooks-toml'` in the silent-surface loop. Do not widen the
+return to every non-`settings-json` surface — cursor, codex, and windsurf
+still fall through on purpose.
 
 Non-merge feature commits on the fork (historically):
 
@@ -249,13 +273,18 @@ chore(grok): do not rewrite locked launcher probe or sync-skills refuse line
 fix(grok): correct sync-skills prose after open-gsd/next
 chore(grok): record upstream remote and launcher-home trigger in update-gsd-local
 chore(grok): record #5169 descriptor-owned homes in update-gsd-local
+chore(grok): correct update-gsd-local remotes, fork fast-forward, and #5207 hook skip
 ```
 
 Plus periodic `Merge open-gsd/next into grok-build` commits (older messages say
 `Merge origin/next` from when that label pointed at open-gsd).
 `chore(grok): do not rewrite locked launcher probe or sync-skills refuse line`
 predates the sync-skills test update and the #5169 launcher generator.
-The #3024 refuse sentence and the **#5169** section above are the current locks.
+`chore(grok): record upstream remote and launcher-home trigger in update-gsd-local`
+named this checkout's remotes backwards (`upstream` / `origin`). The correction
+above is the lock: `origin` is open-gsd, `fork` is the publish remote.
+The #3024 refuse sentence, the **#5169** section, and the **#5207** early
+return are the current locks.
 
 ## Generated artifacts (do not confuse these)
 
@@ -286,13 +315,37 @@ completion report.
 
 ```bash
 git fetch "$UPSTREAM_REMOTE" next
-# This checkout: git fetch upstream next
+# This checkout: git fetch origin next
 if [ -n "$FORK_REMOTE" ]; then
   git fetch "$FORK_REMOTE" grok-build
 fi
 ```
 
-Show how far behind **`$UPSTREAM_REMOTE/next`** (never the fork’s `next`):
+If `$FORK_REMOTE/grok-build` exists and local `HEAD` is a strict ancestor of
+it, fast-forward **before** measuring or merging upstream. This checkout was
+169 commits behind `fork/grok-build` while that tip already contained an
+upstream merge; merging `$UPSTREAM_REMOTE/next` into the stale tip would have
+redone conflicts the published branch had already resolved.
+
+```bash
+if [ -n "$FORK_REMOTE" ] && git rev-parse --verify --quiet "$FORK_REMOTE/grok-build" >/dev/null; then
+  if git merge-base --is-ancestor HEAD "$FORK_REMOTE/grok-build"; then
+    if [ "$(git rev-parse HEAD)" != "$(git rev-parse "$FORK_REMOTE/grok-build")" ]; then
+      git merge --ff-only "$FORK_REMOTE/grok-build"
+    fi
+  else
+    echo "local grok-build and $FORK_REMOTE/grok-build have diverged; stop before merging upstream"
+    git rev-list --left-right --count HEAD..."$FORK_REMOTE/grok-build"
+    exit 1
+  fi
+fi
+```
+
+On divergence, stop and show both sides. Do not merge upstream until the user
+picks the base.
+
+Show how far behind **`$UPSTREAM_REMOTE/next`** only after that fast-forward
+(never the fork’s `next`):
 
 ```bash
 git log --oneline --left-right --cherry-pick HEAD..."$UPSTREAM_REMOTE/next" | head -40
@@ -310,7 +363,7 @@ Ensure on the integration branch (default `grok-build`):
 ```bash
 git checkout grok-build
 git merge "$UPSTREAM_REMOTE/next"
-# This checkout: git merge upstream/next
+# This checkout: git merge origin/next
 ```
 
 Commit message style:
@@ -359,6 +412,10 @@ For each conflicted file:
      `branded-lookahead-own-derived` profile plus `brandingRewrites`
      (see **#5169**). `local/no-runtime-name-literal` flags a runtime-id
      comparison in install and hook code.
+   - `src/runtime-hooks-surface.cts` `applySettingsJsonHookTables` (#5207):
+     keep `grok-hooks-json` on the early return with `none` and
+     `kimi-hooks-toml`. See **#5207** above. The silent-surface loop in
+     `tests/hook-registration-table.test.cjs` must list `'grok-hooks-json'`.
    - `capabilities/grok/**` (ours; may be untracked on upstream)
    - capability registry generators / `capability-registry.cjs`
    - tests that list runtimes or assume grok is a `~/.agents` legacy id
@@ -473,7 +530,7 @@ If Step 4 requires code changes beyond pure conflict resolution:
 
 ```bash
 # After build:lib (+ gen:capability-registry if descriptors changed)
-node --test tests/grok-upgrades.test.cjs
+node --test tests/grok-upgrades.test.cjs tests/hook-registration-table.test.cjs
 # Optional broader runtime install coverage when install paths changed:
 # node scripts/run-tests.cjs --suite install   # can be slow
 ```
@@ -664,7 +721,14 @@ if (d.maxConcurrency !== "undocumented") {
 - When isolation is kept as harness-worktree: installed registry
   `capabilities.grok.runtime.hostIntegration.dispatch.isolation` is
   `harness-worktree` (catches skipped `gen:capability-registry`).
-- Optional: `node --test tests/grok-upgrades.test.cjs` still green post-merge.
+- Optional: `node --test tests/grok-upgrades.test.cjs tests/hook-registration-table.test.cjs` still green post-merge.
+
+The installer's "unreplaced .claude path reference(s)" warning is not a failed
+install when VERSION, the runtime marker, Grok-native skill tools, and the
+registry dispatch checks pass. The scanner walks the shipped `gsd-core/` pack.
+Leftovers in installed agents are `.claude/worktrees`, `.claudeignore`, and the
+env name `CLAUDE_CONFIG_DIR` on a probe whose fallback path is already
+`$HOME/.grok`. `${GROK_HOME:-$HOME/.grok}` is still in that home list.
 
 **Fail if:**
 
@@ -711,7 +775,7 @@ Hold the skill text next to facts from Steps 1–8:
 | Verify pass/fail | New install surfaces, count expectations, registry checks wrong? |
 | Historical commits | New non-merge fork commits worth listing? |
 | Safety / quick reference | Commands in happy path still match what worked? |
-| Remotes / branch model | Upstream branch still `next` on the open-gsd URL? Fork URL still `status-401-unauthorized/gsd-core`? Labels may differ from `upstream` / `origin`. |
+| Remotes / branch model | Upstream branch still `next` on the open-gsd URL? Fork URL still `status-401-unauthorized/gsd-core`? This checkout: `origin` is open-gsd, `fork` is the publish remote. There is no remote named `upstream`. Trust the URL block over any older label. |
 
 Also scan for **procedure gaps** discovered mid-run (wrong default command, missing
 timeouts, stale package version assumptions, skill living only under untracked
@@ -784,8 +848,9 @@ Summarize for the user:
 8. **Skill self-review (Step 9):** verdict + table of Vital/Useful suggestions (or
    “no changes needed”). Do not mark the run complete without this section.
 9. **Next steps (optional):** push to `$FORK_REMOTE` `grok-build` only if the
-   user wants it. This checkout: `git push origin grok-build` (require
-   confirmation — shared remote). Restart Grok Build / new session so skills
+   user wants it. This checkout: `git push fork grok-build` (require
+   confirmation — shared remote). Do not `git push origin grok-build`:
+   `origin` is open-gsd. Restart Grok Build / new session so skills
    reload; `grok inspect` if available. Apply approved skill edits if any
    from Step 9.
 
@@ -819,10 +884,11 @@ Summarize for the user:
 ```bash
 # Full happy path (agent expands conflict/analysis as needed)
 # Assign UPSTREAM_REMOTE / FORK_REMOTE first (Record state and resolve remotes).
-# This checkout: UPSTREAM_REMOTE=upstream, FORK_REMOTE=origin.
+# This checkout: UPSTREAM_REMOTE=origin, FORK_REMOTE=fork.
 git fetch "$UPSTREAM_REMOTE" next
+# Fast-forward to $FORK_REMOTE/grok-build when HEAD is a strict ancestor (Step 1).
 git checkout grok-build
-git merge "$UPSTREAM_REMOTE/next"   # resolve + analyze Grok deltas + hostIntegration parity
+git merge "$UPSTREAM_REMOTE/next"   # this checkout: origin/next; resolve + analyze Grok deltas + hostIntegration parity
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}" && . "$NVM_DIR/nvm.sh" && nvm use
 npm install             # if lockfile / deps changed
 # If MODULE_NOT_FOUND on gitignored bin/lib after merge:
@@ -833,7 +899,7 @@ npm run sync:launcher             # #5169: after lib + registry
 npm run gen:plugin-skills         # skills/ preambles follow the snippet
 npm run build:hooks
 # or: npm run build && npm run sync:launcher && npm run gen:plugin-skills
-node --test tests/grok-upgrades.test.cjs   # focused regression
+node --test tests/grok-upgrades.test.cjs tests/hook-registration-table.test.cjs   # focused regression
 node bin/install.js --grok --global
 cat ~/.grok/gsd-core/VERSION
 cat ~/.grok/gsd-core/.gsd-runtime
